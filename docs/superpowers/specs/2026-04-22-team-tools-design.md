@@ -10,14 +10,14 @@ The `/team-start` command and auto-team feature are broken. The prompts tell the
 
 ## Solution
 
-Create 8 team tools that bridge the Effect services to LLM-callable tools, enabling functional multi-agent team orchestration.
+Create 10 team tools that bridge the Effect services to LLM-callable tools, enabling functional multi-agent team orchestration.
 
 ## Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Tool structure | Separate tools (not unified) | Matches existing patterns (bash, read, write) |
-| Tool count | 8 tools (full set) | Complete coverage of team functionality |
+| Tool count | 10 tools (full set) | Complete coverage of team functionality |
 | Engineer execution | Autonomous sessions | True parallel agents that can communicate |
 | Message delivery | Priority-based injection | Urgent interrupts, normal injects next turn, low batched |
 | Failure handling | 2 retries + escalate | Balance autonomy with oversight |
@@ -34,6 +34,8 @@ Create 8 team tools that bridge the Effect services to LLM-callable tools, enabl
 | `team_spawn` | ✅ | ❌ | Create engineer session, start with task |
 | `team_decompose` | ✅ | ❌ | Break goal into subtasks with file scopes |
 | `team_assign` | ✅ | ❌ | Auto-assign pending tasks to idle engineers |
+| `team_reassign` | ✅ | ❌ | Move task from one engineer to another |
+| `team_kill` | ✅ | ❌ | Terminate a single engineer session |
 | `team_monitor` | ✅ | ✅ | Get progress report |
 | `team_message` | ✅ | ✅ | Send message to another session |
 | `team_status` | ❌ | ✅ | Report state and progress |
@@ -78,7 +80,27 @@ Create 8 team tools that bridge the Effect services to LLM-callable tools, enabl
 {
   teamID: z.string()
 }
+// Internally calls SessionCoordinator.listTeamEngineers() to get available engineers
 // Returns: { assigned: Task[], pending: Task[], engineers: EngineerSummary[] }
+```
+
+#### `team_reassign`
+```typescript
+{
+  taskID: z.string().describe("Task ID to reassign"),
+  toEngineerID: z.string().describe("Target engineer ID")
+}
+// Uses LeadCoordinator.reassign with file-scope conflict checking
+// Returns: { task: Task, fromEngineer: string | null, toEngineer: string }
+```
+
+#### `team_kill`
+```typescript
+{
+  engineerID: z.string().describe("Engineer ID to terminate")
+}
+// Uses SessionCoordinator.killEngineer
+// Returns: { killed: true, engineerID, tasksReassigned: number }
 ```
 
 #### `team_monitor`
@@ -86,7 +108,7 @@ Create 8 team tools that bridge the Effect services to LLM-callable tools, enabl
 {
   teamID: z.string()
 }
-// Returns: ProgressReport { total, pending, inProgress, completed, failed, blocked, engineers[], blockers[] }
+// Returns: ProgressReport { totalTasks, pending, inProgress, completed, failed, blocked, engineers[], blockers[] }
 ```
 
 #### `team_message`
@@ -116,6 +138,81 @@ Create 8 team tools that bridge the Effect services to LLM-callable tools, enabl
   force: z.boolean().optional().default(false)
 }
 // Returns: { dissolved: true, engineersTerminated: number }
+```
+
+## Implementation Details
+
+### Session Context Injection
+
+Tools need the caller's session ID. The existing `Tool.Context` already carries `sessionID: SessionID`. Tools access it via `ctx.sessionID`:
+
+```typescript
+// In team_create
+const leadSessionID = ctx.sessionID
+yield* coordinator.createTeam({ teamID, leadSessionID, goal })
+```
+
+### Engineer Prompt Driver
+
+When `team_spawn` creates an engineer session, it must trigger the prompt loop. Implementation approach:
+
+```typescript
+// In team_spawn tool
+const engineerSlot = yield* coordinator.spawnEngineer({ teamID, leadSessionID, name })
+const task = yield* taskBoard.create({ ... })
+
+// Update engineer's currentTask
+yield* coordinator.updateEngineer(engineerSlot.engineerID, { currentTask: task.id })
+
+// Fire event that session runner listens for
+yield* bus.publish(Event.EngineerSpawned, {
+  engineerID: engineerSlot.engineerID,
+  sessionID: engineerSlot.sessionID,
+  taskPrompt: buildEngineerPrompt(task)
+})
+```
+
+The session runner subscribes to `Event.EngineerSpawned` and starts the prompt loop for that session.
+
+### Priority Translation Layer
+
+The spec uses 4-tier priority (`low`, `normal`, `high`, `urgent`) but `Mailbox` uses 3-tier (`urgent`, `inbox`, `queue`). Translation in `team_message`:
+
+| Tool Priority | Mailbox Priority | Behavior |
+|---------------|------------------|----------|
+| `urgent` | `urgent` | Immediate injection |
+| `high` | `inbox` | Next turn injection |
+| `normal` | `inbox` | Next turn injection |
+| `low` | `queue` | Batched/summarized |
+
+### team_decompose LLM Invocation
+
+`team_decompose` invokes an inner LLM call to generate subtasks:
+
+```typescript
+// In team_decompose tool
+const subtaskPrompt = buildDecomposePrompt(goal, maxTasks)
+const llmResponse = yield* ctx.extra.promptOps.prompt({ ... })
+const subtasks = parseSubtasksFromResponse(llmResponse)
+
+// Validate and persist via LeadCoordinator
+const tasks = yield* leadCoordinator.decompose({ teamId, subtasks, request: goal })
+```
+
+### team_status Task Lookup
+
+`team_status` looks up the caller's current task from `EngineerSlot.currentTask`:
+
+```typescript
+// In team_status tool
+const engineer = yield* coordinator.getEngineerBySession(ctx.sessionID)
+if (!engineer) throw new Error("Not an engineer session")
+
+const taskId = engineer.currentTask
+if (state === "completed" && taskId) {
+  yield* taskBoard.update(taskId, { status: "completed", completed_at: Date.now() })
+}
+yield* coordinator.updateEngineer(engineer.engineerID, { state })
 ```
 
 ## Engineer Lifecycle
@@ -196,7 +293,7 @@ Messages with `priority: "low"` accumulate and are summarized every 5 turns usin
 
 ### New Files
 ```
-src/tool/team.ts                    — 8 team tools
+src/tool/team.ts                    — 10 team tools
 src/tool/team.txt                   — Tool descriptions
 src/team/index.ts                   — Barrel export (missing today)
 ```
@@ -223,15 +320,51 @@ Add to `SessionCoordinator`:
 ```typescript
 isLead(sessionID: SessionID): boolean
 isEngineer(sessionID: SessionID): boolean
+getEngineerBySession(sessionID: SessionID): EngineerSlot | null
+updateEngineer(engineerID: EngineerID, updates: Partial<EngineerSlot>): void
 ```
 
 Tools check role before executing.
+
+## Edge Cases
+
+### Duplicate team_create
+If team already exists, return user-friendly error: `"Team {teamID} already exists. Use team_monitor to check its status."`
+
+### Engineer Dies Without Calling team_status
+Heartbeat system detects stale engineers:
+- `lastHeartbeat` updated on every tool call from engineer session
+- Watchdog runs every `HEARTBEAT_INTERVAL` (30s)
+- If `lastHeartbeat` older than `ENGINEER_MAX_IDLE` (5 min), mark engineer as `failed`
+- Notify lead via urgent message: `"Engineer {name} unresponsive, task {taskID} needs reassignment"`
+
+### team_assign with File Conflicts
+If all pending tasks conflict with available engineers' file scopes:
+- Return explicit message: `"No tasks assignable: {N} pending tasks have file conflicts with available engineers"`
+- Include conflict details in response
+
+### team_dissolve with force=false
+When `force: false` (default) and tasks are in-progress:
+- Return error: `"Cannot dissolve: {N} tasks in progress. Use force=true to terminate immediately."`
+- When `force: true`: kill all engineers, mark tasks as `failed`, dissolve team
+
+### Mailbox Overflow
+When queue exceeds `MAILBOX_QUEUE_DEPTH`:
+- Drop oldest messages of EQUAL OR LOWER priority first
+- Never drop `urgent` messages unless queue is all urgent
+- Log dropped messages for debugging
+
+### Cross-Team Messaging
+`team_message` validates recipient belongs to same team:
+- Look up recipient's team via `EngineerSlot.teamID`
+- If different team or not found: `"Cannot message {recipientID}: not in your team"`
 
 ## Constants
 
 ```typescript
 ENGINEER_MAX_RETRIES = 2        // Retries before escalating to lead
 LOW_PRIORITY_BATCH_INTERVAL = 5 // Turns between low-priority message summaries
+HEARTBEAT_STALE_THRESHOLD = 5 * 60 * 1000  // 5 minutes before marking engineer stale
 ```
 
 ## Feature Flag
