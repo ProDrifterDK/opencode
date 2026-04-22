@@ -346,5 +346,5 @@ const baseRegistryLayer = Layer.suspend(() =>
 )
 
 export const defaultLayer = Flag.OPENCODE_TEAM_ENABLED
-  ? baseRegistryLayer.pipe(Layer.provide(SessionCoordinator.defaultLayer))
+  ? baseRegistryLayer.pipe(Layer.provide(Layer.suspend(() => SessionCoordinator.defaultLayer)))
   : baseRegistryLayer
