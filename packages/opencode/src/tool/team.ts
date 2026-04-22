@@ -620,3 +620,21 @@ export const TeamDissolveTool = Tool.define(
     }
   }),
 )
+
+// ─── Export all tools ───────────────────────────────────────────────────────
+
+export const TeamTools = Effect.gen(function* () {
+  const tools = yield* Effect.all([
+    Tool.init(TeamCreateTool),
+    Tool.init(TeamSpawnTool),
+    Tool.init(TeamDecomposeTool),
+    Tool.init(TeamAssignTool),
+    Tool.init(TeamReassignTool),
+    Tool.init(TeamKillTool),
+    Tool.init(TeamMonitorTool),
+    Tool.init(TeamMessageTool),
+    Tool.init(TeamStatusTool),
+    Tool.init(TeamDissolveTool),
+  ])
+  return tools
+})
