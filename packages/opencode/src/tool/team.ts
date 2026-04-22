@@ -236,5 +236,171 @@ export const TeamAssignTool = Tool.define(
   }),
 )
 
+const teamDecomposeParams = z.object({
+  teamID: z.string().describe("Team ID"),
+  subtasks: z
+    .array(
+      z.object({
+        title: z.string(),
+        description: z.string(),
+        files: z.array(z.string()).default([]),
+      }),
+    )
+    .describe("Subtasks to create (pre-parsed by LLM)"),
+})
+
+export const TeamDecomposeTool = Tool.define(
+  "team_decompose",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const lead = yield* LeadCoordinator.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamDecomposeParams,
+      execute: (params: z.infer<typeof teamDecomposeParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can decompose tasks"))
+          }
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const tasks = yield* lead.decompose({
+            teamId: teamID,
+            subtasks: params.subtasks,
+            request: `Decomposed into ${params.subtasks.length} subtasks`,
+          })
+
+          const output = [
+            `Tasks created: ${tasks.length}`,
+            ...tasks.map((t) => `  - ${t.title}`),
+          ].join("\n")
+
+          return {
+            title: `Decompose team ${params.teamID}`,
+            output,
+            metadata: {
+              taskCount: tasks.length,
+              tasks: tasks.map((t) => ({ taskID: t.id, title: t.title })),
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+const teamReassignParams = z.object({
+  taskID: z.string().describe("Task ID to reassign"),
+  toEngineerID: z.string().describe("Target engineer ID"),
+})
+
+export const TeamReassignTool = Tool.define(
+  "team_reassign",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const lead = yield* LeadCoordinator.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamReassignParams,
+      execute: (params: z.infer<typeof teamReassignParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can reassign tasks"))
+          }
+
+          const task = yield* lead.reassign({
+            taskId: params.taskID as import("../team/task-board.sql").TaskBoardID,
+            toEngineer: params.toEngineerID as import("../team/types").EngineerID,
+          })
+
+          yield* coordinator.updateEngineer(
+            params.toEngineerID as import("../team/types").EngineerID,
+            { state: "working", currentTask: task.id },
+          )
+
+          const output = [
+            `Task reassigned successfully.`,
+            `Task ID: ${task.id}`,
+            `Task: ${task.title}`,
+            `Assigned to engineer: ${params.toEngineerID}`,
+          ].join("\n")
+
+          return {
+            title: `Reassign task ${params.taskID}`,
+            output,
+            metadata: {
+              taskID: task.id,
+              title: task.title,
+              toEngineerID: params.toEngineerID,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+const teamKillParams = z.object({
+  engineerID: z.string().describe("Engineer ID to terminate"),
+})
+
+export const TeamKillTool = Tool.define(
+  "team_kill",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamKillParams,
+      execute: (params: z.infer<typeof teamKillParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can kill engineers"))
+          }
+
+          const engineerID = params.engineerID as import("../team/types").EngineerID
+          const engineer = yield* coordinator.getEngineer(engineerID)
+          if (!engineer) {
+            return yield* Effect.fail(new Error(`Engineer ${params.engineerID} not found`))
+          }
+
+          const teamID = engineer.teamID as ReturnType<typeof TeamID.ascending>
+          const tasks = yield* taskBoard.list({
+            team_id: teamID,
+            assigned_engineer_id: engineerID,
+          })
+
+          const inProgressTasks = tasks.filter((t) => t.status === "in-progress")
+          for (const task of inProgressTasks) {
+            yield* taskBoard.update(task.id, {
+              status: "pending",
+              assigned_engineer_id: null,
+            })
+          }
+
+          yield* coordinator.killEngineer({ engineerID, teamID })
+
+          const output = [
+            `Engineer ${params.engineerID} terminated.`,
+            `Tasks returned to pending: ${inProgressTasks.length}`,
+          ].join("\n")
+
+          return {
+            title: `Kill engineer ${params.engineerID}`,
+            output,
+            metadata: {
+              engineerID: params.engineerID,
+              tasksReassigned: inProgressTasks.length,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
 // Suppress unused warning for translatePriority (reserved for mailbox priority mapping)
 void (translatePriority as unknown)
