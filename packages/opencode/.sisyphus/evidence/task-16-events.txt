@@ -1,0 +1,28 @@
+Task 16 Evidence — Plugin Hooks for Team Events
+================================================
+
+Test Results: bun test src/team/events.test.ts
+  8 pass
+  0 fail
+  Ran 8 tests across 1 file.
+
+Scenarios Verified:
+1. Event definitions have correct types
+2. Event definitions use BusEvent.define correctly
+3. Event definitions are registered in BusEvent registry
+4. Event payloads validate against their schemas
+5. Event payloads reject invalid data
+6. EngineerSpawned accepts nullable taskId
+7. publishTeamEvent and subscribeTeamEvent are callable functions
+8. Event object has all 8 event types
+
+Event Types Defined:
+- team.created, team.dissolved
+- engineer.spawned, engineer.completed, engineer.failed
+- task.assigned, task.updated, task.completed
+
+Files:
+- src/team/events.ts (81 lines)
+- src/team/events.test.ts (112 lines)
+
+Timestamp: 2026-04-22

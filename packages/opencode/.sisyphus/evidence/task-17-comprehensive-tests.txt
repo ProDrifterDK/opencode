@@ -1,0 +1,31 @@
+Task 17 Evidence — Comprehensive Test Suite
+============================================
+
+Test Results: bun test src/team/lifecycle-integration.test.ts
+  16 pass
+  0 fail
+  88 expect() calls
+  Ran 16 tests across 1 file. [1085.00ms]
+
+Scenarios Verified:
+1. Full lifecycle: team created → engineers spawned → tasks assigned → work completed → team dissolved
+2. Circular dependency detection in task assignments (DFS cycle detection)
+3. All engineers fail → lead receives all-failed notification
+4. Mailbox overflow: depth limit 50 enforced, oldest messages dropped
+5. Concurrent task operations: 5 concurrent creates/updates/completes — no corruption
+6. File scope conflict detection prevents overlapping assignments
+7. Task reassignment: engineer fails, task reassigned to idle engineer
+8. Rate limit queue: 6th request queued when max concurrent = 4 and 2 in queue
+9. Orphan detection: lead dies → engineers self-terminate
+10. Team dissolution cleanup: all mailboxes purged, all engineers killed, tasks removed
+11. Performance: 5 engineers created and operate concurrently
+12. Heartbeat: rate limit backoff clears on successful heartbeat
+13. Circuit breaker: triggers after 3 consecutive 429s and blocks new requests
+14. Mailbox priority ordering: urgent before inbox before queue
+15. Mailbox markRead updates read status and hasUnread reflects correctly
+16. Team state transitions: idle → active → dissolving → cleaned
+
+Files:
+- src/team/lifecycle-integration.test.ts (957 lines)
+
+Timestamp: 2026-04-22

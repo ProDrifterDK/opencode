@@ -1,0 +1,54 @@
+# Task 5 Evidence: Team Config Types and Constants
+
+## Date: 2026-04-22
+
+## Files Created
+
+1. `src/team/types.ts` - All shared types
+2. `src/team/constants.ts` - All limits and constants
+
+## Types Created (types.ts)
+
+- TeamID: Branded string type with ascending/descending constructors
+- EngineerID: Branded string type with ascending/descending constructors
+- TeamState: Literal union "idle" | "active" | "dissolving"
+- EngineerState: Literal union "idle" | "working" | "blocked" | "failed"
+- MailboxPriority: Literal union "low" | "normal" | "high" | "urgent"
+- MailboxMessage: Class with id, priority, sender, recipient, content, timestamp
+- TaskAssignment: Class with taskID, assignee, fileScope array, assignedAt
+- TeamConfig: Class with all configuration fields
+- EngineerStateRecord: Class for tracking engineer state
+- TeamStateRecord: Class for tracking team state
+
+## Constants Created (constants.ts)
+
+- MAX_TEAM_SIZE = 5
+- MAX_CONCURRENT_LLM_CALLS = 4
+- ENGINEER_MAX_IDLE = 300000 (5 minutes)
+- ENGINEER_MAX_RUNTIME = 7200000 (2 hours)
+- MAILBOX_QUEUE_DEPTH = 50
+- LEAD_CONTEXT_BUDGET = 0.6
+- TASK_BOARD_MAX_TASKS = 100
+- HEARTBEAT_INTERVAL = 30000 (30 seconds)
+
+## Verification
+
+TypeScript compiles without errors for these files:
+```
+cd packages/opencode && bun typecheck
+# No errors for src/team/types.ts or src/team/constants.ts
+```
+
+All types and constants were verified by creating instances:
+- TeamID and EngineerID with branded type pattern
+- All enums with proper literal types
+- All Schema.Class instances with proper field types
+- All constants accessible and have correct values
+
+## Notes
+
+- Followed branded type pattern similar to SessionID but without Identifier.schema
+- Used simple string brand without custom identifier prefix (to avoid needing new identifier types)
+- All types use Effect Schema.Class with zod static method
+- Constants are plain exported numbers (no Effect dependencies)
+- Comments removed to comply with project conventions

@@ -1,0 +1,45 @@
+Task 9: Mailbox Integration with Session Run Loop
+
+FILES MODIFIED:
+1. src/session/prompt.ts - Added mailbox checks in runLoop for team sessions
+2. src/team/mailbox.ts - Added receiveByPriority(), hasUnread(), bus events
+3. src/team/constants.ts - Added LEAD_DAEMON_POLL_INTERVAL constant
+4. src/team/message-summarizer.test.ts - Added missing mailbox methods to mock
+
+NEW FILES:
+5. test/team/mailbox-integration.test.ts - 8 tests for mailbox runLoop scenarios
+
+IMPLEMENTATION DETAILS:
+
+1. MAILBOX CHECK IN RUNLOOP (src/session/prompt.ts):
+   - `checkTeamMailbox()` helper: checks mailbox with priority ordering (urgent > inbox > queue)
+   - Injection point 1 (after step++): urgent messages interrupt mid-loop for engineer sessions
+   - Injection point 2 (after outcome processing): inbox/queue messages injected between turns
+   - Both use `sessions.updateMessage()` + `sessions.updatePart()` to create synthetic user messages
+   - Guard: `session.parentID` ensures only team sessions (engineers) check mailbox
+
+2. LEAD DAEMON MODE (src/session/prompt.ts):
+   - After runLoop exits, checks if session is a lead (no parentID) via SessionCoordinator
+   - If team found, enters infinite poll loop with `Effect.sleep(LEAD_DAEMON_POLL_INTERVAL)`
+   - Polls for urgent messages using `mailbox.hasUnread()` + `mailbox.receiveByPriority()`
+   - Marks messages as read on retrieval
+
+3. NEW MAILBOX METHODS (src/team/mailbox.ts):
+   - `receiveByPriority()`: returns unread messages for a specific priority level
+   - `hasUnread()`: boolean check for unread messages (optional priority filter)
+   - Both use `Effect.serviceOption()` pattern for safe dependency injection
+
+4. BUS EVENTS (src/team/mailbox.ts):
+   - `team.engineer.message_sent`: emitted on send, includes sender/recipient/priority
+   - `team.lead.message_received`: emitted on send, includes lead/sender/priority
+
+TEST RESULTS:
+- 29 tests pass (8 new mailbox-integration tests + 21 existing team tests)
+- 0 failures, 110 expect() calls
+- prompt.ts typecheck: clean (0 errors)
+
+DESIGN DECISIONS:
+- Used `Effect.serviceOption()` for Mailbox/Coordinator to avoid breaking non-team sessions
+- Urgent messages injected at start of turn (before LLM call)
+- Inbox/queue messages injected after turn completes (between iterations)
+- Daemon mode uses infinite loop — relies on scope cancellation for shutdown

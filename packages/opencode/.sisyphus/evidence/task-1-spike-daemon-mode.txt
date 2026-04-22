@@ -1,0 +1,78 @@
+SPIKE EVIDENCE: Team Lead Daemon Mode Validation
+================================================
+Date: 2026-04-22
+Branch: spike/team-daemon
+Test file: packages/opencode/spike/team-lead-daemon.test.ts
+
+RESULT: ALL 9 TESTS PASS (45 expect() calls, 1.2s execution)
+
+Architecture Findings
+=====================
+
+1. RUNNER IS PER-SESSION (Map<SessionID, Runner>)
+   - Source: src/session/run-state.ts
+   - Each session gets its own Runner instance stored in a Map
+   - Runners are INDEPENDENT — no shared lock between sessions
+   - VALIDATED: 3 runners (lead + 2 children) run concurrently without blocking
+
+2. BUSYERROR ONLY THROWN WITHIN SAME SESSION
+   - Source: src/session/run-state.ts:62-64
+   - The `busy` callback in Runner.make throws BusyError
+   - This only fires when startShell() is called on an already-busy runner
+   - ensureRunning() does NOT throw BusyError — it shares the Deferred
+   - VALIDATED: Concurrent callers to same runner share result (executed once)
+
+3. CONCURRENT CHILDREN DON'T BLOCK EACH OTHER
+   - Each child session has its own Runner
+   - Multiple children can execute simultaneously
+   - VALIDATED: lead + child1 + child2 all run concurrently
+
+4. LEAD CAN MONITOR CHILDREN NON-BLOCKING
+   - Promise.all() or Effect.all({ concurrency: "unbounded" }) works
+   - Results arrive in completion order naturally
+   - VALIDATED: Fast child completes before slow child
+
+5. CANCELLATION PROPAGATES WITHOUT DEADLOCK
+   - runner.cancel interrupts the fiber and cleans up
+   - Multiple runners can be cancelled concurrently
+   - VALIDATED: Both children cancelled simultaneously, no deadlock
+
+SQLite WAL Mode
+===============
+Source: src/storage/db.ts:89-94
+
+PRAGMA journal_mode = WAL         ✓ Confirmed
+PRAGMA synchronous = NORMAL       ✓ Confirmed
+PRAGMA busy_timeout = 5000        ✓ Confirmed
+PRAGMA cache_size = -64000        ✓ Confirmed
+PRAGMA foreign_keys = ON          ✓ Confirmed
+PRAGMA wal_checkpoint(PASSIVE)    ✓ Confirmed
+
+VALIDATED: 5 concurrent writers (simulating lead + 4 children) write successfully
+busy_timeout=5000ms handles contention, WAL allows concurrent readers
+
+task_id Resumption
+==================
+Source: src/tool/task.ts:63-67
+
+The task tool implements resumption as:
+  1. Try sessions.get(taskID) with catchCause → if found, reuse
+  2. If not found (catchCause returns undefined) → sessions.create()
+
+VALIDATED:
+- Runner can be reused across sequential tasks (3 invocations on same runner)
+- After cancellation + onInterrupt fallback, runner accepts new work
+- This maps directly to "resume a session by task_id" pattern
+
+Key Architectural Insight
+=========================
+The current Runner design is ACTUALLY COMPATIBLE with daemon mode because:
+- Per-session Runners mean no cross-session blocking
+- ensureRunning() deduplicates concurrent callers (shares Deferred)
+- The runner Map is managed per-instance (InstanceState)
+
+What's needed for full daemon mode:
+- A "lead" session that stays in a loop calling task() for children
+- The lead's own Runner stays busy while the runLoop is active
+- Children are spawned via task() which creates new sessions + new Runners
+- No core Runner changes needed — just orchestration at the prompt/tool level

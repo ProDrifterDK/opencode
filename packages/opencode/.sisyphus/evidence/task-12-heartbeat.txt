@@ -1,0 +1,30 @@
+Task 12 Evidence — Heartbeat and Error Handling
+================================================
+
+Test Results: bun test src/team/heartbeat.test.ts
+  14 pass
+  0 fail
+  38 expect() calls
+  Ran 14 tests across 1 file. [773.00ms]
+
+Scenarios Verified:
+1. recordHeartbeat updates health state (clears stuck/dead/backoff)
+2. checkHealth detects stuck engineer after ENGINEER_MAX_IDLE (5min)
+3. checkHealth marks engineer dead after 3 stuck cycles
+4. runDiagnostic kills dead engineer and reassigns task to idle engineer
+5. runDiagnostic sends all-failed message when no engineers remain
+6. runDiagnostic returns healthy for responsive engineer (mailbox ping)
+7. handleRateLimit applies exponential backoff (30s * 2^n)
+8. handleRateLimit circuit breaker after 3 consecutive 429s (5min max)
+9. recordHeartbeat clears rate limit state
+10. handleCrash marks engineer dead and triggers diagnostic + reassignment
+11. detectOrphans returns healthy when lead is alive
+12. detectOrphans terminates engineers when lead is dead
+13. detectOrphans terminates engineers when team is dissolving
+14. checkHealth skips engineers in backoff period
+
+Files:
+- src/team/heartbeat.ts (395 lines)
+- src/team/heartbeat.test.ts (401 lines)
+
+Timestamp: 2026-04-22

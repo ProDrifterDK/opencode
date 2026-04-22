@@ -1,0 +1,6 @@
+bun test v1.3.11 (af24e281)
+---
+Files created:
+-rw-rw-r-- 1 prodrifterdk prodrifterdk  2136 abr 22 01:16 src/team/session-coordinator.sql.ts
+-rw-rw-r-- 1 prodrifterdk prodrifterdk 11078 abr 22 01:10 src/team/session-coordinator.ts
+-rw-rw-r-- 1 prodrifterdk prodrifterdk 13326 abr 22 01:13 test/team/session-coordinator.test.ts

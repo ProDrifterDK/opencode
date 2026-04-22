@@ -1,0 +1,54 @@
+---
+description: Show the current status of all active teams — task board progress, engineer states, and blockers.
+subtask: false
+---
+
+# Team Status
+
+Retrieve and display the current status of the active team.
+
+## Step 1: Gather Data
+
+If `$ARGUMENTS` contains a team ID, use that specific team. Otherwise, find the active team by querying `SessionCoordinator.getTeam()` for known team IDs.
+
+For the active team:
+1. Use `LeadCoordinator.monitor(teamId)` to get a `ProgressReport` containing:
+   - Total tasks, pending, in-progress, completed, failed, blocked counts
+   - Engineer summaries (ID, state, current task)
+   - Blocked tasks and their blockers
+2. Use `SessionCoordinator.listTeamEngineers(teamId)` to get full engineer slot details including:
+   - Engineer ID, name, state
+   - Session ID
+   - Current task
+   - Last heartbeat timestamp
+
+## Step 2: Format Output
+
+Use `LeadCoordinator.formatStatus(report)` for the base status text, then augment with engineer session details.
+
+Display a formatted table:
+
+```
+╔══════════════════════════════════════════╗
+║ Team Status: <teamID>                   ║
+╠══════════════════════════════════════════╣
+║ Tasks: <completed>/<total> completed    ║
+║ Pending: <n> | In Progress: <n>         ║
+║ Failed: <n> | Blocked: <n>              ║
+╠══════════════════════════════════════════╣
+║ Engineers:                               ║
+║   <name> [<state>] — <task or idle>     ║
+║   ...                                    ║
+╠══════════════════════════════════════════╣
+║ Blockers:                                ║
+║   <task> blocked by <blocking task>      ║
+║   ...                                    ║
+╚══════════════════════════════════════════╝
+```
+
+If no active team exists, display: "No active team found. Use `/team-start <description>` to start one."
+
+## Error Handling
+
+- If the team ID is not found, report: "Team not found: <teamID>"
+- If monitoring fails, show the error message from `LeadCoordinatorError`

@@ -1,0 +1,38 @@
+Task 10: Slash Commands — /team start, /team status, /team stop
+=====================================================================
+Date: 2026-04-22
+
+FILES CREATED:
+- .opencode/command/team-start.md  — Lead decomposes → coordinator spawns → tasks assigned → daemon mode
+- .opencode/command/team-status.md — Shows task board summary + engineer states + blockers
+- .opencode/command/team-stop.md   — Dissolves entire team or kills specific engineer
+- src/team/team-commands.test.ts   — 6 tests validating frontmatter, template content, and file existence
+
+COMMAND REGISTRATION:
+Commands are auto-loaded by ConfigCommand.load() which scans .opencode/command/**/*.md files.
+YAML frontmatter is parsed via gray-matter. The markdown body becomes the command template.
+Command names are derived from filename (without .md): team-start, team-status, team-stop.
+
+FRONTMATTER SCHEMA (from src/config/command.ts):
+- description: string (optional) — shown in command list
+- agent: string (optional) — target agent override
+- model: string (optional) — target model override
+- subtask: boolean (optional) — whether command runs as subtask
+
+TEAM SERVICES REFERENCED IN TEMPLATES:
+- LeadCoordinator: decompose, assign, monitor, reassign, formatStatus
+- SessionCoordinator: spawnEngineer, killEngineer, dissolveTeam, getTeam, listTeamEngineers
+- TaskBoardService: listByEngineer, listByStatus, listBlocked
+
+TEMPLATE PARAMETERS:
+- $ARGUMENTS — used in team-start (goal description) and team-stop (engineer ID)
+- team-status accepts optional team ID via $ARGUMENTS
+
+TEST RESULTS:
+  6 pass, 0 fail, 34 expect() calls
+  - all three team command files exist
+  - team-start: correct frontmatter, references LeadCoordinator/SessionCoordinator
+  - team-status: correct frontmatter, references monitor/formatStatus
+  - team-stop: correct frontmatter, references killEngineer/dissolveTeam
+  - all commands have non-empty templates
+  - frontmatter only contains valid schema fields

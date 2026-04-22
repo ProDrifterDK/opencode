@@ -1,0 +1,11 @@
+bun test v1.3.11 (af24e281)
+---
+Files created:
+-rw-rw-r-- 1 prodrifterdk prodrifterdk 1459 abr 22 00:41 src/team/mailbox.sql.ts
+-rw-rw-r-- 1 prodrifterdk prodrifterdk 6156 abr 22 00:48 src/team/mailbox.ts
+-rw-rw-r-- 1 prodrifterdk prodrifterdk 9403 abr 22 00:49 test/team/mailbox.test.ts
+---
+  200 src/team/mailbox.ts
+   43 src/team/mailbox.sql.ts
+  268 test/team/mailbox.test.ts
+  511 total

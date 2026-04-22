@@ -1,0 +1,28 @@
+Task 14 Evidence — LLM Rate Limit Throttling
+=============================================
+
+Test Results: bun test src/team/rate-limiter.test.ts
+  12 pass
+  0 fail
+  Ran 12 tests across 1 file.
+
+Scenarios Verified:
+1. acquire proceeds immediately when under budget
+2. 5 concurrent requests — 4 proceed, 1 queued
+3. priority ordering — lead goes before engineer
+4. circuit breaker triggers after 3 consecutive 429s
+5. acquire fails with CircuitBreakerOpenError when breaker is open
+6. resetCircuitBreaker clears breaker state
+7. release processes queued requests
+8. report429 with <3 failures does not disrupt queued requests
+9. getStats returns correct snapshot
+10. fair scheduling within same priority — FIFO order
+11. exponential backoff — consecutive 429 tracking
+12. circuit breaker fails all queued requests
+
+Files:
+- src/team/rate-limiter.ts (208 lines)
+- src/team/rate-limiter.test.ts (302 lines)
+- src/team/constants.ts updated with RATE_LIMIT_* constants
+
+Timestamp: 2026-04-22

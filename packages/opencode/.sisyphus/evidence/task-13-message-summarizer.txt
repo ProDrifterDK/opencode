@@ -1,0 +1,39 @@
+Task 13: Lead Message Summarization
+=====================================
+
+Files created:
+- src/team/message-summarizer.ts (207 lines)
+- src/team/message-summarizer.test.ts (380 lines)
+
+Test results:
+  10 pass, 0 fail, 33 expect() calls [749ms]
+
+Typecheck: clean (0 errors in message-summarizer files)
+
+Tests:
+1. shouldSummarize returns false below threshold — PASS
+2. shouldSummarize returns true at threshold — PASS
+3. shouldSummarize respects custom threshold — PASS
+4. batchByType groups messages by type — PASS
+5. 15 msgs → 1 summary, urgent preserved — PASS
+6. urgent messages bypass summarization — PASS
+7. replaceWithSummary replaces batched with summary and keeps urgent — PASS
+8. defaultSummarizeFn produces valid summary from batches — PASS
+9. custom summarizeFn is used when provided — PASS
+10. full flow: 15 msgs → summarize → replace — PASS
+
+Key design decisions:
+- Service yields Bus.Service at layer build time (not in Effect.fn methods)
+- Mailbox.Service yielded at runtime via Effect.fn (like lead-coordinator pattern)
+- Urgent messages (priority === "urgent") always bypass summarization
+- Default threshold: 10 messages, configurable via SummarizerConfig
+- defaultSummarizeFn: synchronous text summary from MessageBatch[]
+- Custom summarizeFn injection point for future LLM integration
+- BusEvent.Summarized published with metrics (originalCount, summaryCount, preservedUrgent)
+- SummarizerError tagged error for typed error handling
+
+Layer wiring fix (critical):
+- Layer.mergeAll alone doesn't satisfy build-time dependencies
+- Must provide Bus TO summarizerLayer first: summarizerLayer.pipe(Layer.provide(mockBusLayer))
+- Then merge with mailbox: Layer.mergeAll(summarizerWithBus, getMailboxLayer())
+- This mirrors lead-coordinator.test.ts pattern: leadLayer.pipe(Layer.provide(testTaskBoardLayer))

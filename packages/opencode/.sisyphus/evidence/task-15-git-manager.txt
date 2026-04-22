@@ -1,0 +1,29 @@
+Task 15 Evidence — Git Branch Management for File Conflicts
+============================================================
+
+Test Results: bun test src/team/git-manager.test.ts
+  16 pass
+  0 fail
+  Ran 16 tests across 1 file.
+
+Scenarios Verified:
+1. detectOverlap returns true for identical scopes
+2. detectOverlap returns true for overlapping glob patterns
+3. detectOverlap returns false for disjoint scopes
+4. detectOverlap returns true for wildcard-only patterns
+5. detectOverlap returns true when one scope is prefix of other
+6. createBranch creates branch with correct name
+7. createBranch creates separate branches for different engineers
+8. commitWork commits changes to engineer branch
+9. mergeBranch merges engineer branch into main
+10. mergeBranch throws MergeConflictError on conflicts
+11. cleanupBranches removes all team branches
+12. getBranchStatus returns ahead/behind counts
+13. getBranchStatus shows behind when main is ahead
+
+Files:
+- src/team/git-manager.ts (222 lines)
+- src/team/git-manager.test.ts (278 lines)
+- src/team/constants.ts updated with GIT_BRANCH_PREFIX
+
+Timestamp: 2026-04-22

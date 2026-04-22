@@ -10,6 +10,9 @@ import { MCP } from "../mcp"
 import { Skill } from "../skill"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
+import PROMPT_TEAM_START from "./template/team-start.txt"
+import PROMPT_TEAM_STATUS from "./template/team-status.txt"
+import PROMPT_TEAM_STOP from "./template/team-stop.txt"
 
 type State = {
   commands: Record<string, Info>
@@ -99,6 +102,36 @@ export const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands["team-start"] = {
+        name: "team-start",
+        description: "Start a team of engineers to work on a complex task",
+        source: "command",
+        get template() {
+          return PROMPT_TEAM_START
+        },
+        subtask: false,
+        hints: ["$ARGUMENTS"],
+      }
+      commands["team-status"] = {
+        name: "team-status",
+        description: "Check the status of the current team",
+        source: "command",
+        get template() {
+          return PROMPT_TEAM_STATUS
+        },
+        subtask: false,
+        hints: [],
+      }
+      commands["team-stop"] = {
+        name: "team-stop",
+        description: "Stop and dissolve the current team",
+        source: "command",
+        get template() {
+          return PROMPT_TEAM_STOP
+        },
+        subtask: false,
+        hints: [],
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

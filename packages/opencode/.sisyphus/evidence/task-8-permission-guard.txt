@@ -1,0 +1,54 @@
+Task 8: Permission Enforcement for Engineers
+=============================================
+
+## Files Created
+- src/team/permission-guard.ts  (158 lines)
+- src/team/permission-guard.test.ts  (319 lines)
+
+## Implementation Summary
+
+### FileScopeGuard Service
+- `FileScopeEntry` schema: binds sessionID + engineerID + file scopes (glob patterns)
+- `ScopeDeniedError`: tagged error raised when engineer edits out-of-scope files
+- `Service` (Context.Service pattern with `@opencode/FileScopeGuard` tag):
+  - `register(entry)`: registers an engineer session with file scopes
+  - `unregister(sessionID)`: removes engineer scope restrictions
+  - `check(sessionID, filePath)`: validates file access, notifies lead on violation
+  - `isEngineer(sessionID)`: synchronous check if session is a registered engineer
+
+### Scope Matching
+- Uses `Wildcard.match` from existing `@/util` (same as permission system)
+- Patterns like `src/auth/**` match all files under src/auth/
+- Pattern `src/**` matches everything under src/
+
+### Hook Integration
+- `beforeToolExecute(getSessionID, getService)`: returns a `(toolID, args) => Effect` function
+- Guards edit, write, bash tools only
+- Extracts file path from tool args (filePath or path property)
+- Skips non-engineer sessions and non-guarded tools silently
+- Denies with ScopeDeniedError on out-of-scope access
+
+### Mailbox Notification
+- On violation: sends urgent "scope_violation" message to lead mailbox
+- Uses `Effect.catch` to gracefully handle mailbox failures
+
+## Test Results
+```
+22 pass, 0 fail, 36 expect() calls (750ms)
+```
+
+### Test Coverage
+- Pure functions: matchesScope (7 tests), extractFilePath (5 tests)
+- Service: edit inside scope allowed, edit outside scope denied + lead notified
+- Service: non-engineer sessions unrestricted
+- Service: isEngineer/unregister lifecycle
+- Hook: denies edit outside scope, allows inside scope, skips non-guarded tools, skips non-engineer sessions
+
+## Type Check
+- `bun typecheck`: 0 errors in permission-guard files
+
+## Patterns Used
+- Effect Context.Service with `@opencode/FileScopeGuard` tag
+- Schema.Class for FileScopeEntry, Schema.TaggedErrorClass for ScopeDeniedError
+- Self-reexport: `export * as PermissionGuard from "./permission-guard"`
+- `Effect.fn` for traced operations, plain function returning Effect.gen for typed error channels

@@ -1,0 +1,31 @@
+Task 7: Lead Coordinator Service — Evidence
+============================================
+
+Files created:
+  - src/team/lead-coordinator.ts (~361 lines)
+  - src/team/lead-coordinator.test.ts (12 tests, 35 assertions)
+
+Typecheck: 0 errors in lead-coordinator.ts
+  $ bun typecheck 2>&1 | grep "lead-coordinator" | wc -l → 0
+
+Tests: 12/12 pass, 35 expect() calls
+  $ bun test src/team/lead-coordinator.test.ts
+  12 pass
+  0 fail
+  35 expect() calls
+  Ran 12 tests across 1 file. [781.00ms]
+
+Methods implemented:
+  - decompose(input) → Task[] — creates tasks with exclusive file scopes
+  - assign(input) → Task[] — distributes pending tasks to idle engineers
+  - monitor(teamId) → ProgressReport — progress counts, engineer states, blockers
+  - reassign(input) → Task — moves task between engineers with file conflict check
+  - validateFileScopes(tasks) → boolean — pure overlap detection
+  - formatStatus(report) → string — human-readable report
+
+Key design decisions:
+  - Error type: union of LeadCoordinatorError | FileScopeConflictError | TaskBoardRepoError
+  - file_scope stored as JSON string array in SQLite text field
+  - Layer depends on TaskBoardRepo.Service
+  - Effect.fn generators have no explicit return types (Effect v4 inference)
+  - task! non-null assertion after null check + error yield (TypeScript narrowing gap)

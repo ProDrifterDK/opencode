@@ -49,6 +49,11 @@ import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { EffectBridge } from "@/effect"
+import { Mailbox } from "@/team/mailbox"
+import { SessionCoordinator } from "@/team/session-coordinator"
+import { AutoTeam } from "@/team/auto-team"
+import { TeamID } from "@/team/types"
+import { LEAD_DAEMON_POLL_INTERVAL } from "@/team/constants"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1302,6 +1307,41 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       throw new Error("Impossible")
     })
 
+    type MailboxPriority = "urgent" | "inbox" | "queue"
+
+    const checkTeamMailbox = Effect.fn("SessionPrompt.checkTeamMailbox")(
+      function* (input: {
+        sessionID: SessionID
+        slog: typeof elog extends { with: (a: any) => infer R } ? R : never
+        step: number
+      }) {
+        const mailbox = yield* Effect.serviceOption(Mailbox.Service)
+        if (Option.isNone(mailbox)) return null
+
+        const priorities: MailboxPriority[] = ["urgent", "inbox", "queue"]
+        for (const priority of priorities) {
+          const messages = yield* mailbox.value.receiveByPriority({
+            recipientSessionID: input.sessionID,
+            priority,
+          }).pipe(Effect.catchCause(() => Effect.succeed([] as any[])))
+
+          if (messages.length === 0) continue
+
+          input.slog.info("mailbox.found", { priority, count: messages.length, step: input.step })
+
+          const msg = messages[0]
+          yield* mailbox.value.markRead({
+            messageID: msg.id,
+            recipientSessionID: input.sessionID,
+          }).pipe(Effect.catchCause(() => Effect.void))
+
+          return { priority, message: msg }
+        }
+
+        return null
+      },
+    )
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1332,6 +1372,57 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
+          // Auto-team detection: on first step of lead session, check if request is complex
+          if (step === 0 && !session.parentID) {
+            const lastUserWithParts = msgs.findLast((msg) => msg.info.role === "user")
+            const lastUserText = lastUserWithParts?.parts
+              .filter((p): p is MessageV2.TextPart => p.type === "text" && !p.synthetic)
+              .map((p) => p.text)
+              .join("\n") ?? ""
+            if (lastUserText) {
+              const coordinatorOpt = yield* Effect.serviceOption(SessionCoordinator.Service)
+              if (Option.isSome(coordinatorOpt)) {
+                const existingTeam = yield* coordinatorOpt.value.getTeam(sessionID as any).pipe(
+                  Effect.catchCause(() => Effect.succeed(null)),
+                )
+                if (!existingTeam) {
+                  const autoTeamOpt = yield* Effect.serviceOption(AutoTeam.Service)
+                  if (Option.isSome(autoTeamOpt)) {
+                    const autoTeam = autoTeamOpt.value
+                    if (autoTeam.shouldUseTeam(lastUserText)) {
+                      const teamID = TeamID.ascending()
+                      yield* coordinatorOpt.value.createTeam({ teamID, leadSessionID: sessionID }).pipe(
+                        Effect.catchCause(() => Effect.void),
+                      )
+                      const promptText = autoTeam.buildPrompt(teamID)
+                      const autoTeamMsg: MessageV2.User = {
+                        id: MessageID.ascending(),
+                        sessionID,
+                        time: { created: Date.now() },
+                        role: "user",
+                        agent: lastUser.agent,
+                        model: lastUser.model,
+                        tools: lastUser.tools,
+                        format: lastUser.format,
+                      }
+                      yield* sessions.updateMessage(autoTeamMsg)
+                      const autoTeamPart: MessageV2.Part = {
+                        type: "text",
+                        id: PartID.ascending(),
+                        messageID: autoTeamMsg.id,
+                        sessionID,
+                        text: promptText,
+                        synthetic: true,
+                      }
+                      yield* sessions.updatePart(autoTeamPart)
+                      yield* slog.info("auto_team.triggered", { teamID, request: lastUserText })
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
@@ -1360,6 +1451,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               providerID: lastUser.model.providerID,
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+          if (session.parentID && step > 1) {
+            const mailboxResult = yield* checkTeamMailbox({ sessionID, slog, step })
+            if (mailboxResult?.priority === "urgent") {
+              yield* slog.info("mailbox.urgent_interrupt", { step })
+              const userMsg: MessageV2.User = {
+                id: MessageID.ascending(),
+                sessionID,
+                time: { created: Date.now() },
+                role: "user",
+                agent: lastUser.agent,
+                model: lastUser.model,
+                tools: lastUser.tools,
+                format: lastUser.format,
+              }
+              yield* sessions.updateMessage(userMsg)
+              const userPart: MessageV2.Part = {
+                type: "text",
+                id: PartID.ascending(),
+                messageID: userMsg.id,
+                sessionID,
+                text: `[URGENT MESSAGE FROM LEAD]\n${mailboxResult.message.content}`,
+                synthetic: true,
+              }
+              yield* sessions.updatePart(userPart)
+            }
+          }
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
@@ -1524,10 +1642,81 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             return "continue" as const
           }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
           if (outcome === "break") break
+
+          if (session.parentID) {
+            const mailboxResult = yield* checkTeamMailbox({ sessionID, slog, step })
+            if (mailboxResult) {
+              yield* slog.info("mailbox.injected", { priority: mailboxResult.priority, step })
+              const label = mailboxResult.priority === "urgent"
+                ? "[URGENT MESSAGE FROM LEAD]"
+                : mailboxResult.priority === "inbox"
+                  ? "[MESSAGE FROM LEAD]"
+                  : "[LOW PRIORITY MESSAGE]"
+              const userMsg: MessageV2.User = {
+                id: MessageID.ascending(),
+                sessionID,
+                time: { created: Date.now() },
+                role: "user",
+                agent: lastUser.agent,
+                model: lastUser.model,
+                tools: lastUser.tools,
+                format: lastUser.format,
+              }
+              yield* sessions.updateMessage(userMsg)
+              const userPart: MessageV2.Part = {
+                type: "text",
+                id: PartID.ascending(),
+                messageID: userMsg.id,
+                sessionID,
+                text: `${label}\n${mailboxResult.message.content}`,
+                synthetic: true,
+              }
+              yield* sessions.updatePart(userPart)
+            }
+          }
+
           continue
         }
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+        if (!session.parentID) {
+          const coordinator = yield* Effect.serviceOption(SessionCoordinator.Service)
+          if (Option.isSome(coordinator)) {
+            const team = yield* coordinator.value.getTeam(
+              sessionID as any,
+            ).pipe(Effect.catchCause(() => Effect.succeed(null)))
+            if (team) {
+              yield* slog.info("lead.daemon_enter")
+              const mailbox = yield* Effect.serviceOption(Mailbox.Service)
+              if (Option.isSome(mailbox)) {
+                while (true) {
+                  yield* Effect.sleep(`${LEAD_DAEMON_POLL_INTERVAL} millis`)
+                  const hasUrgent = yield* mailbox.value.hasUnread({
+                    recipientSessionID: sessionID,
+                    priority: "urgent",
+                  }).pipe(Effect.catchCause(() => Effect.succeed(false)))
+
+                  if (hasUrgent) {
+                    yield* slog.info("lead.daemon.urgent_message")
+                    const messages = yield* mailbox.value.receiveByPriority({
+                      recipientSessionID: sessionID,
+                      priority: "urgent",
+                    }).pipe(Effect.catchCause(() => Effect.succeed([] as any[])))
+
+                    for (const msg of messages) {
+                      yield* mailbox.value.markRead({
+                        messageID: msg.id,
+                        recipientSessionID: sessionID,
+                      }).pipe(Effect.catchCause(() => Effect.void))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
         return yield* lastAssistant(sessionID)
       },
     )

@@ -1,0 +1,73 @@
+---
+description: Start a team of engineers to work on a task. Lead decomposes the request, coordinator spawns engineers, tasks are assigned, and the team enters daemon mode.
+subtask: false
+---
+
+# Team Start
+
+You are the **Lead Engineer**. A new team is being formed to accomplish the following goal:
+
+**Goal:** $ARGUMENTS
+
+## Step 1: Decompose the Request
+
+Break the goal above into independent subtasks. For each subtask, identify:
+- A clear title
+- A detailed description of what needs to be done
+- The files that will likely be modified (file scope)
+
+Use the `LeadCoordinator` service's `decompose` method. Create subtasks with non-overlapping file scopes to prevent conflicts. Ensure the total number of subtasks does not exceed the task board limit.
+
+## Step 2: Create Team (if not already created)
+
+If the team does not yet exist, use the `SessionCoordinator` service's `createTeam` method:
+- Provide a unique team ID (use `TeamID.ascending()`)
+- Provide the current (lead) session ID
+
+This initializes the team record in the system. If the team was auto-created (via auto-team mode), this step can be skipped.
+
+## Step 3: Spawn Engineers
+
+For each subtask that can run in parallel, use the `SessionCoordinator` service's `spawnEngineer` method to create engineer sessions. Provide:
+- The team ID from createTeam (or auto-team)
+- The current (lead) session ID
+- A descriptive name for each engineer (e.g., "engineer-auth", "engineer-api")
+
+Do not exceed the maximum team size (`MAX_TEAM_SIZE`).
+
+## Step 4: Assign Tasks
+
+Use the `LeadCoordinator` service's `assign` method to distribute pending tasks to idle engineers. The assign method handles file scope conflict detection automatically.
+
+## Step 5: Enter Daemon Mode
+
+After spawning and assignment:
+1. Display a summary of the team composition and task assignments
+2. Monitor progress using `LeadCoordinator.monitor()` at regular intervals
+3. Reassign tasks if any engineer fails or becomes blocked
+4. Report progress to the user
+
+Use `LeadCoordinator.formatStatus(report)` to produce human-readable status output.
+
+## Error Handling
+
+- If file scope conflicts are detected during decomposition, report them and suggest alternative task boundaries
+- If the team is at max capacity, report which tasks couldn't be assigned
+- If an engineer fails, attempt reassignment before reporting failure
+
+## Output Format
+
+After team startup, display:
+
+```
+Team started: <teamID>
+Engineers spawned: <count>
+Tasks assigned: <count> / <total>
+
+Engineers:
+  <name> — <task title> [working]
+  ...
+
+Pending tasks:
+  <task title> (unassigned)
+```

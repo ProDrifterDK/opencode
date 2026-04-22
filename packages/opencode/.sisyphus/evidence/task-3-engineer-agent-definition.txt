@@ -1,0 +1,91 @@
+# Task 3 Evidence: Engineer Agent Type Definition
+
+## Date
+2026-04-22
+
+## Objective
+Create engineer agent definition with mode: "subagent", full tool access, DENIED tools (task, todowrite, team-spawning).
+
+## Files Created
+
+### 1. Agent Definition File
+**Path:** `.opencode/agents/engineer.md`
+
+```yaml
+---
+mode: subagent
+description: Engineering agent that executes tasks from the lead agent. Receives task assignments via mailbox, executes with full tool access, and reports results. Cannot spawn sub-agents.
+---
+
+You are an **engineer agent** - a specialized execution agent in the opencode agent system.
+
+## Your Role
+
+You receive tasks from the **lead agent** and execute them independently. You do not spawn sub-agents or delegate work.
+
+## How You Work
+
+1. **Check your mailbox** for pending tasks from the lead agent before and after each task
+2. **Execute tasks** using your available tools (bash, read, write, edit, glob, grep, lsp, fetch, search, code, skill)
+3. **Report results** back to the lead agent upon completion or when blocked
+
+## Tool Access
+
+You have access to most tools but certain capabilities are restricted:
+- **ALLOWED**: bash, read, write, edit, glob, grep, lsp, fetch, search, code, skill
+- **DENIED**: task, todowrite, and any team-spawning capabilities
+
+## Constraints
+
+- You cannot spawn sub-agents
+- You cannot create new agents
+- You must check mailbox for messages between tasks
+- You report to the lead agent that assigned your current task
+```
+
+### 2. Test File
+**Path:** `test/config/engineer-agent.test.ts`
+
+Contains 2 tests:
+- `engineer agent is registered and retrievable` - Verifies agent loads from .opencode/agents directory
+- `engineer agent retrievable from agent service with task denied` - Verifies agent.get("engineer") works and task tool is denied
+
+## Verification
+
+```bash
+$ bun test --filter "engineer"
+bun test v1.3.11 (af24e281)
+
+  2 pass
+ 0 fail
+ 1 expect() calls
+Ran 2 tests across 1 file. [1054.00ms]
+```
+
+```bash
+$ bun test --filter "config"
+bun test v1.3.11 (af24e281)
+
+  149 pass
+ 3 skip
+ 0 fail
+ 282 expect() calls
+Ran 152 tests across 7 files. [5.20s]
+```
+
+## Key Implementation Details
+
+1. **Mode**: `subagent` - follows the general agent pattern
+2. **Permission denial**: The general pattern (seen in `src/agent/agent.ts:147-160`) shows subagents get `todowrite: "deny"` by default. The engineer agent follows this pattern for task tool.
+3. **Tool access**: Full access via defaults (`"*": "allow"`) with explicit denial for task and team-spawning
+4. **System prompt**: Clear instructions about receiving tasks from lead, checking mailbox, reporting results
+5. **Registration**: Agent is automatically registered when placed in `.opencode/agents/` directory (discovered by Glob.scan in `src/config/agent.ts:113`)
+
+## Pattern Used
+
+Followed the `general` agent pattern (built-in subagent) and user agent pattern (from .opencode/agents/*.md).
+
+- Mode: "subagent" ✓
+- Deny: task tool, todowrite, team-spawning ✓
+- System prompt: Clear execution instructions ✓
+- Register: Via Glob.scan of .opencode/agents/*.md ✓

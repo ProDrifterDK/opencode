@@ -1,0 +1,35 @@
+Task 4 Evidence: Schema + SQLite Table + CRUD
+===============================================
+Date: 2026-04-22
+
+Files created:
+- src/team/task-board.sql.ts (Drizzle table + types)
+- src/team/task-board.ts (Effect service with CRUD)
+- test/team/task-board.test.ts (CRUD lifecycle tests)
+- .sisyphus/evidence/task-4-schema-created.txt (this file)
+
+Table: task_board
+Columns:
+- id (TEXT PRIMARY KEY, branded TaskBoardID)
+- team_id (TEXT NOT NULL, branded TeamID)
+- title (TEXT NOT NULL)
+- description (TEXT nullable)
+- status (TEXT NOT NULL, TaskStatus enum: pending|in-progress|blocked|completed|failed)
+- assigned_engineer_id (TEXT nullable, branded EngineerID)
+- file_scope (TEXT nullable)
+- blocked_by (TEXT nullable, TaskBoardID)
+- parent_task_id (TEXT nullable, TaskBoardID)
+- time_created (INTEGER NOT NULL, from Timestamps)
+- time_updated (INTEGER NOT NULL, from Timestamps)
+- completed_at (INTEGER nullable)
+
+Indexes: task_board_team_id_idx, task_board_assigned_engineer_id_idx, task_board_status_idx
+
+CRUD Interface:
+- create(input: CreateTaskInput): Effect.Effect<Task, TaskBoardRepoError>
+- update(taskId: TaskBoardID, input: UpdateTaskInput): Effect.Effect<Task, TaskBoardRepoError>
+- list(filter: TaskBoardFilter): Effect.Effect<Task[], TaskBoardRepoError>
+- get(taskId: TaskBoardID): Effect.Effect<Task | null, TaskBoardRepoError>
+- delete(taskId: TaskBoardID): Effect.Effect<void, TaskBoardRepoError>
+
+Test Results: 4 pass, 0 fail, 15 expect() calls

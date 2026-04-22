@@ -1,0 +1,51 @@
+SPIKE EVIDENCE: task_id Resumption Validation
+==============================================
+Date: 2026-04-22
+Branch: spike/team-daemon
+Test file: packages/opencode/spike/team-lead-daemon.test.ts
+
+RESULT: ALL RESUMPTION TESTS PASS
+
+How task_id Resumption Works
+=============================
+
+Source: src/tool/task.ts:63-97
+
+1. User passes task_id parameter to task() tool
+2. Tool calls sessions.get(taskID) with Effect.catchCause
+3. If session exists → reuse it as the child session
+4. If session doesn't exist → catchCause returns undefined → sessions.create()
+5. New session gets parentID = ctx.sessionID (the calling session)
+6. Prompt is sent to the (existing or new) child session
+
+For 30+ Minute Sessions
+========================
+- SQLite WAL mode means no journal file locks
+- busy_timeout=5000ms handles write contention
+- Session data is persisted to SQLite (messages, parts)
+- Runner state is in-memory (Map<SessionID, Runner>) per InstanceState
+- Runner is recreated on process restart from persisted session data
+
+VALIDATED: Runner reuse across sequential tasks
+- Test 5.1: 3 sequential invocations on same runner, all succeed
+- Test 5.2: Cancel → resume pattern works (onInterrupt + new task)
+
+Resumption Pattern
+==================
+```
+// First invocation — creates new session
+task_id: undefined → creates session-child-001
+Result: task_id: session-child-001 (for resuming)
+
+// Second invocation — resumes existing session
+task_id: session-child-001 → reuses session
+Result: task_id: session-child-001 (for resuming)
+
+// Third invocation — same pattern
+task_id: session-child-001 → reuses session
+```
+
+The Runner for the child session goes Idle between invocations,
+allowing new ensureRunning() calls. This is EXACTLY the behavior
+needed for daemon mode where a lead dispatches tasks sequentially
+to children, each child processing one task at a time.
