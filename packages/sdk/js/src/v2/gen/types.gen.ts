@@ -445,6 +445,117 @@ export type EventCommandExecuted = {
   }
 }
 
+export type EventMailboxMessageReceived = {
+  type: "mailbox.message.received"
+  properties: {
+    messageID: string
+    recipientSessionID: string
+    priority: "urgent" | "inbox" | "queue"
+  }
+}
+
+export type EventMailboxMessageRead = {
+  type: "mailbox.message.read"
+  properties: {
+    messageID: string
+    recipientSessionID: string
+  }
+}
+
+export type EventTeamEngineerMessageSent = {
+  type: "team.engineer.message_sent"
+  properties: {
+    messageID: string
+    senderSessionID: string
+    recipientSessionID: string
+    priority: "urgent" | "inbox" | "queue"
+  }
+}
+
+export type EventTeamLeadMessageReceived = {
+  type: "team.lead.message_received"
+  properties: {
+    messageID: string
+    leadSessionID: string
+    senderSessionID: string
+    priority: "urgent" | "inbox" | "queue"
+  }
+}
+
+export type EventTeamCreated = {
+  type: "team.created"
+  properties: {
+    teamID: string
+    leadSessionID: string
+    goal: string
+  }
+}
+
+export type EventTeamDissolved = {
+  type: "team.dissolved"
+  properties: {
+    teamID: string
+    reason: string
+  }
+}
+
+export type EventEngineerSpawned = {
+  type: "engineer.spawned"
+  properties: {
+    teamID: string
+    engineerID: string
+    name: string
+    taskId: string | null
+  }
+}
+
+export type EventEngineerCompleted = {
+  type: "engineer.completed"
+  properties: {
+    teamID: string
+    engineerID: string
+    taskId: string
+  }
+}
+
+export type EventEngineerFailed = {
+  type: "engineer.failed"
+  properties: {
+    teamID: string
+    engineerID: string
+    taskId: string
+    error: string
+  }
+}
+
+export type EventTaskAssigned = {
+  type: "task.assigned"
+  properties: {
+    teamID: string
+    taskId: string
+    engineerID: string
+  }
+}
+
+export type EventTaskUpdated = {
+  type: "task.updated"
+  properties: {
+    teamID: string
+    taskId: string
+    status: string
+    oldStatus: string
+  }
+}
+
+export type EventTaskCompleted = {
+  type: "task.completed"
+  properties: {
+    teamID: string
+    taskId: string
+    engineerID: string
+  }
+}
+
 export type EventVcsBranchUpdated = {
   type: "vcs.branch.updated"
   properties: {
@@ -1138,6 +1249,18 @@ export type GlobalEvent = {
     | EventMcpToolsChanged
     | EventMcpBrowserOpenFailed
     | EventCommandExecuted
+    | EventMailboxMessageReceived
+    | EventMailboxMessageRead
+    | EventTeamEngineerMessageSent
+    | EventTeamLeadMessageReceived
+    | EventTeamCreated
+    | EventTeamDissolved
+    | EventEngineerSpawned
+    | EventEngineerCompleted
+    | EventEngineerFailed
+    | EventTaskAssigned
+    | EventTaskUpdated
+    | EventTaskCompleted
     | EventVcsBranchUpdated
     | EventWorktreeReady
     | EventWorktreeFailed
@@ -2064,6 +2187,18 @@ export type Event =
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
+  | EventMailboxMessageReceived
+  | EventMailboxMessageRead
+  | EventTeamEngineerMessageSent
+  | EventTeamLeadMessageReceived
+  | EventTeamCreated
+  | EventTeamDissolved
+  | EventEngineerSpawned
+  | EventEngineerCompleted
+  | EventEngineerFailed
+  | EventTaskAssigned
+  | EventTaskUpdated
+  | EventTaskCompleted
   | EventVcsBranchUpdated
   | EventWorktreeReady
   | EventWorktreeFailed
@@ -5313,6 +5448,23 @@ export type TuiControlResponseResponses = {
 }
 
 export type TuiControlResponseResponse = TuiControlResponseResponses[keyof TuiControlResponseResponses]
+
+export type TeamStatusData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/team"
+}
+
+export type TeamStatusResponses = {
+  /**
+   * Team status
+   */
+  200: unknown
+}
 
 export type InstanceDisposeData = {
   body?: never

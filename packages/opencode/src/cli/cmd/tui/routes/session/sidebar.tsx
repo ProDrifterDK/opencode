@@ -62,6 +62,11 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 <text fg={theme.text}>
                   <b>{session()!.title}</b>
                 </text>
+                <Show when={sync.data.team.record}>
+                  <text fg={theme.textMuted}>
+                    <span style={{ fg: theme.success }}>●</span> Team ({sync.data.team.engineers.length})
+                  </text>
+                </Show>
                 <Show when={InstallationChannel !== "latest"}>
                   <text fg={theme.textMuted}>{props.sessionID}</text>
                 </Show>

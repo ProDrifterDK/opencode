@@ -164,6 +164,7 @@ import type {
   SyncReplayErrors,
   SyncReplayResponses,
   SyncStartResponses,
+  TeamStatusResponses,
   TextPartInput,
   ToolIdsErrors,
   ToolIdsResponses,
@@ -4098,6 +4099,38 @@ export class Tui extends HeyApiClient {
   }
 }
 
+export class Team extends HeyApiClient {
+  /**
+   * Get team status
+   *
+   * Get the current team status including all active teams and their engineers.
+   */
+  public status<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<TeamStatusResponses, unknown, ThrowOnError>({
+      url: "/team",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Instance extends HeyApiClient {
   /**
    * Dispose instance
@@ -4428,6 +4461,11 @@ export class OpencodeClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
+  }
+
+  private _team?: Team
+  get team(): Team {
+    return (this._team ??= new Team({ client: this.client }))
   }
 
   private _instance?: Instance

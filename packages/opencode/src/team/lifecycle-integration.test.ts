@@ -149,6 +149,7 @@ const memCoordinator = SessionCoordinatorService.of({
   getEngineer: (engineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
   listTeamEngineers: (teamID) =>
     Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listTeams: () => Effect.sync(() => [...teams.values()]),
 })
 
 const memMailbox = MailboxService.of({

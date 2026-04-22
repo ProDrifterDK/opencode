@@ -75,6 +75,24 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       }
       formatter: FormatterStatus[]
       vcs: VcsInfo | undefined
+      team: {
+        record: {
+          teamID: string
+          state: string
+          leadEngineerID: string
+          engineerCount: number
+          createdAt: number
+          updatedAt: number
+        } | null
+        engineers: {
+          engineerID: string
+          name: string
+          state: string
+          currentTask?: string
+          startedAt?: number
+          lastHeartbeat: number
+        }[]
+      }
     }>({
       provider_next: {
         all: [],
@@ -102,6 +120,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       mcp_resource: {},
       formatter: [],
       vcs: undefined,
+      team: {
+        record: null,
+        engineers: [],
+      },
     })
 
     const event = useEvent()
@@ -345,6 +367,89 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
 
         case "vcs.branch.updated": {
           setStore("vcs", { branch: event.properties.branch })
+          break
+        }
+
+      }
+
+      // Team events — not in SDK Event type yet, handle via string check
+      const teamType = (event as { type: string }).type
+      switch (teamType) {
+        case "team.created": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; leadSessionID: string; goal: string }
+          batch(() => {
+            setStore("team", {
+              record: {
+                teamID: p.teamID,
+                state: "active",
+                leadEngineerID: p.leadSessionID,
+                engineerCount: 0,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              },
+              engineers: [],
+            })
+          })
+          break
+        }
+        case "team.dissolved": {
+          setStore("team", { record: null, engineers: [] })
+          break
+        }
+        case "engineer.spawned": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; name: string; taskId: string | null }
+          setStore("team", "engineers", produce((draft) => {
+            draft.push({
+              engineerID: p.engineerID,
+              name: p.name,
+              state: "idle",
+              currentTask: p.taskId ?? undefined,
+              lastHeartbeat: Date.now(),
+            })
+          }))
+          if (store.team.record) {
+            setStore("team", "record", "engineerCount", store.team.engineers.length + 1)
+          }
+          break
+        }
+        case "engineer.completed": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; taskId: string }
+          const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
+          if (idx >= 0) {
+            setStore("team", "engineers", idx, { state: "idle", currentTask: undefined })
+          }
+          break
+        }
+        case "engineer.failed": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; taskId: string; error: string }
+          const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
+          if (idx >= 0) {
+            setStore("team", "engineers", idx, { state: "failed" })
+          }
+          break
+        }
+        case "task.assigned": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; taskId: string; engineerID: string }
+          const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
+          if (idx >= 0) {
+            setStore("team", "engineers", idx, { state: "working", currentTask: p.taskId })
+          }
+          break
+        }
+        case "task.updated": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; taskId: string; status: string; oldStatus: string }
+          const idx = store.team.engineers.findIndex((e) => e.currentTask === p.taskId)
+          if (idx >= 0) {
+            setStore("team", "engineers", idx, "state", p.status === "completed" ? "idle" : p.status)
+          }
+          break
+        }
+        case "task.completed": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; taskId: string; engineerID: string }
+          const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
+          if (idx >= 0) {
+            setStore("team", "engineers", idx, { state: "idle", currentTask: undefined })
+          }
           break
         }
       }

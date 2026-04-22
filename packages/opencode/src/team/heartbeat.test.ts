@@ -83,6 +83,7 @@ const memCoordinator = SessionCoordinatorService.of({
   getEngineer: (engineerID: EngineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
   listTeamEngineers: (teamID: TeamID) =>
     Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listTeams: () => Effect.sync(() => [...teams.values()]),
 })
 
 const memLead = LeadCoordinatorService.of({

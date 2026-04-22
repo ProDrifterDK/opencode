@@ -97,6 +97,7 @@ type Opts = {
     part?: HostPluginApi["state"]["part"]
     lsp?: HostPluginApi["state"]["lsp"]
     mcp?: HostPluginApi["state"]["mcp"]
+    team?: HostPluginApi["state"]["team"]
   }
   theme?: {
     selected?: string
@@ -293,6 +294,7 @@ export function createTuiPluginApi(opts: Opts = {}): HostPluginApi {
       part: opts.state?.part ?? (() => []),
       lsp: opts.state?.lsp ?? (() => []),
       mcp: opts.state?.mcp ?? (() => []),
+      team: opts.state?.team ?? (() => ({ record: null, engineers: [] })),
     },
     theme: {
       get current() {

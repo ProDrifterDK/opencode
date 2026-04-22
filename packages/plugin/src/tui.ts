@@ -283,6 +283,7 @@ export type TuiState = {
   part: (messageID: string) => ReadonlyArray<Part>
   lsp: () => ReadonlyArray<TuiSidebarLspItem>
   mcp: () => ReadonlyArray<TuiSidebarMcpItem>
+  team: () => TuiSidebarTeamState
 }
 
 type TuiConfigView = Pick<PluginConfig, "$schema" | "theme" | "keybinds" | "plugin"> &
@@ -309,6 +310,25 @@ export type TuiSidebarMcpItem = {
 }
 
 export type TuiSidebarLspItem = Pick<LspStatus, "id" | "root" | "status">
+
+export type TuiSidebarTeamState = {
+  record: {
+    teamID: string
+    state: string
+    leadEngineerID: string
+    engineerCount: number
+    createdAt: number
+    updatedAt: number
+  } | null
+  engineers: {
+    engineerID: string
+    name: string
+    state: string
+    currentTask?: string
+    startedAt?: number
+    lastHeartbeat: number
+  }[]
+}
 
 export type TuiSidebarTodoItem = Pick<Todo, "content" | "status">
 
