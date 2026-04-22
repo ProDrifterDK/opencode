@@ -26,6 +26,7 @@ import { Log } from "@/util"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
+import { TeamTools } from "./team"
 import { Glob } from "@opencode-ai/shared/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -172,6 +173,10 @@ export const layer: Layer.Layer<
           }
         }
 
+        const teamTools = Flag.OPENCODE_TEAM_ENABLED
+          ? yield* TeamTools.pipe(Effect.catch(() => Effect.succeed([])))
+          : []
+
         yield* config.get()
         const questionEnabled =
           ["app", "cli", "desktop"].includes(Flag.OPENCODE_CLIENT) || Flag.OPENCODE_ENABLE_QUESTION_TOOL
@@ -216,6 +221,7 @@ export const layer: Layer.Layer<
             tool.patch,
             ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [tool.lsp] : []),
             ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [tool.plan] : []),
+            ...teamTools,
           ],
           task: tool.task,
           read: tool.read,
