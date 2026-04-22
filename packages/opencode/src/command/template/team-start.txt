@@ -4,51 +4,54 @@ You are the **Lead Engineer**. A new team is being formed to accomplish the foll
 
 **Goal:** $ARGUMENTS
 
-## Step 1: Decompose the Request
+## Step 1: Create Team
 
-Break the goal above into independent subtasks. For each subtask, identify:
+Use the `team_create` tool to initialize the team:
+- Pass the goal as the `goal` parameter
+- This returns a `teamID` you'll use in subsequent calls
+
+## Step 2: Decompose the Request
+
+Break the goal into independent subtasks. For each subtask, identify:
 - A clear title
-- A detailed description of what needs to be done
-- The files that will likely be modified (file scope)
+- A detailed description
+- The files that will be modified (file scope)
 
-Use the `LeadCoordinator` service's `decompose` method. Create subtasks with non-overlapping file scopes to prevent conflicts. Ensure the total number of subtasks does not exceed the task board limit.
-
-## Step 2: Create Team (if not already created)
-
-If the team does not yet exist, use the `SessionCoordinator` service's `createTeam` method:
-- Provide a unique team ID (use `TeamID.ascending()`)
-- Provide the current (lead) session ID
-
-This initializes the team record in the system. If the team was auto-created (via auto-team mode), this step can be skipped.
+Use the `team_decompose` tool with your structured subtasks.
+Ensure subtasks have non-overlapping file scopes to prevent conflicts.
 
 ## Step 3: Spawn Engineers
 
-For each subtask that can run in parallel, use the `SessionCoordinator` service's `spawnEngineer` method to create engineer sessions. Provide:
-- The team ID from createTeam (or auto-team)
-- The current (lead) session ID
-- A descriptive name for each engineer (e.g., "engineer-auth", "engineer-api")
+For each subtask, use the `team_spawn` tool to create an engineer:
+- Provide the `teamID` from step 1
+- Give each engineer a descriptive name (e.g., "engineer-auth", "engineer-api")
+- Include the task details (title, description, fileScope)
 
-Do not exceed the maximum team size (`MAX_TEAM_SIZE`).
+Each spawned engineer will start working autonomously on their task.
 
-## Step 4: Assign Tasks
+## Step 4: Monitor Progress
 
-Use the `LeadCoordinator` service's `assign` method to distribute pending tasks to idle engineers. The assign method handles file scope conflict detection automatically.
+Use `team_monitor` to track progress:
+- Call it periodically to see status
+- Watch for blocked or failed engineers
+- Use `team_reassign` if needed to move tasks
 
-## Step 5: Enter Daemon Mode
+## Step 5: Handle Issues
 
-After spawning and assignment:
-1. Display a summary of the team composition and task assignments
-2. Monitor progress using `LeadCoordinator.monitor()` at regular intervals
-3. Reassign tasks if any engineer fails or becomes blocked
-4. Report progress to the user
+- If an engineer is blocked: Check the blocker, provide help via `team_message`
+- If an engineer fails: Use `team_kill` to terminate, then `team_spawn` a replacement
+- Use `team_message` to coordinate between engineers when needed
 
-Use `LeadCoordinator.formatStatus(report)` to produce human-readable status output.
+## Step 6: Complete
 
-## Error Handling
+When all tasks are done:
+- Review the work
+- Use `team_dissolve` to shut down the team
 
-- If file scope conflicts are detected during decomposition, report them and suggest alternative task boundaries
-- If the team is at max capacity, report which tasks couldn't be assigned
-- If an engineer fails, attempt reassignment before reporting failure
+## Available Tools
+
+Lead-only: `team_create`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_kill`, `team_dissolve`
+Both: `team_monitor`, `team_message`
 
 ## Output Format
 
