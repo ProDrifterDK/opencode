@@ -3,7 +3,9 @@ import { Effect } from "effect"
 import * as Tool from "./tool"
 import { SessionCoordinator } from "../team"
 import { LeadCoordinator } from "../team"
+import { TaskBoardRepo } from "../team"
 import { TeamID } from "../team/types"
+import type { EngineerStateRecord } from "../team/types"
 import DESCRIPTION from "./team.txt"
 
 // Priority translation: 4-tier (tool) -> 3-tier (mailbox)
@@ -96,6 +98,137 @@ export const TeamMonitorTool = Tool.define(
               inProgress: report.inProgress,
               failed: report.failed,
               blocked: report.blocked,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+const teamSpawnParams = z.object({
+  teamID: z.string().describe("Team ID from team_create"),
+  name: z.string().describe("Engineer name (e.g., 'engineer-auth')"),
+  task: z.object({
+    title: z.string().describe("Task title"),
+    description: z.string().describe("Task description"),
+    fileScope: z.array(z.string()).optional().describe("Files this task may modify"),
+  }),
+})
+
+export const TeamSpawnTool = Tool.define(
+  "team_spawn",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamSpawnParams,
+      execute: (params: z.infer<typeof teamSpawnParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can spawn engineers"))
+          }
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const engineerSlot = yield* coordinator.spawnEngineer({
+            teamID,
+            leadSessionID: ctx.sessionID,
+            name: params.name,
+          })
+
+          const fileScope = params.task.fileScope
+            ? JSON.stringify(params.task.fileScope)
+            : null
+
+          const task = yield* taskBoard.create({
+            team_id: teamID,
+            title: params.task.title,
+            description: params.task.description,
+            status: "in-progress",
+            assigned_engineer_id: engineerSlot.engineerID,
+            file_scope: fileScope,
+          })
+
+          yield* coordinator.updateEngineer(engineerSlot.engineerID, {
+            state: "working",
+            currentTask: task.id,
+          })
+
+          const output = [
+            `Engineer spawned successfully.`,
+            `Engineer ID: ${engineerSlot.engineerID}`,
+            `Session ID: ${engineerSlot.sessionID}`,
+            `Task ID: ${task.id}`,
+            `Task: ${params.task.title}`,
+          ].join("\n")
+
+          return {
+            title: `Spawn engineer ${params.name}`,
+            output,
+            metadata: {
+              engineerID: engineerSlot.engineerID,
+              sessionID: engineerSlot.sessionID,
+              taskID: task.id,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+const teamAssignParams = z.object({
+  teamID: z.string().describe("Team ID"),
+})
+
+export const TeamAssignTool = Tool.define(
+  "team_assign",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const lead = yield* LeadCoordinator.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamAssignParams,
+      execute: (params: z.infer<typeof teamAssignParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can assign tasks"))
+          }
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const slots = yield* coordinator.listTeamEngineers(teamID)
+
+          const engineers = slots as unknown as EngineerStateRecord[]
+
+          const assigned = yield* lead.assign({ teamId: teamID, engineers })
+
+          for (const task of assigned) {
+            if (task.assigned_engineer_id) {
+              yield* coordinator.updateEngineer(task.assigned_engineer_id, {
+                state: "working",
+                currentTask: task.id,
+              })
+            }
+          }
+
+          const output = [
+            `Tasks assigned: ${assigned.length}`,
+            ...assigned.map((t) => `  - ${t.title} → engineer ${t.assigned_engineer_id}`),
+          ].join("\n")
+
+          return {
+            title: `Assign tasks for team ${params.teamID}`,
+            output,
+            metadata: {
+              assignedCount: assigned.length,
+              assigned: assigned.map((t) => ({
+                taskID: t.id,
+                title: t.title,
+                engineerID: t.assigned_engineer_id,
+              })),
             },
           }
         }).pipe(Effect.orDie),
