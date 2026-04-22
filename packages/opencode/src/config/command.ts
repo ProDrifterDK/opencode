@@ -26,7 +26,7 @@ export type Info = Schema.Schema.Type<typeof Info>
 
 export async function load(dir: string) {
   const result: Record<string, Info> = {}
-  for (const item of await Glob.scan("{command,commands}/**/*.md", {
+  for (const item of await Glob.scan("{.opencode/command,.opencode/commands,command,commands}/**/*.md", {
     cwd: dir,
     absolute: true,
     dot: true,
