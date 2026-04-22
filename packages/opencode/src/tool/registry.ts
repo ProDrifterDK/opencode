@@ -27,6 +27,7 @@ import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
 import { TeamTools } from "./team"
+import { SessionCoordinator } from "../team"
 import { Glob } from "@opencode-ai/shared/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -322,7 +323,7 @@ export const layer: Layer.Layer<
   }),
 )
 
-export const defaultLayer = Layer.suspend(() =>
+const baseRegistryLayer = Layer.suspend(() =>
   layer.pipe(
     Layer.provide(Config.defaultLayer),
     Layer.provide(Plugin.defaultLayer),
@@ -343,3 +344,7 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Truncate.defaultLayer),
   ),
 )
+
+export const defaultLayer = Flag.OPENCODE_TEAM_ENABLED
+  ? baseRegistryLayer.pipe(Layer.provide(SessionCoordinator.defaultLayer))
+  : baseRegistryLayer
