@@ -59,6 +59,16 @@ export interface Interface {
   readonly getTeam: (teamID: TeamID) => Effect.Effect<TeamRecord | null, CoordinatorError>
   readonly getEngineer: (engineerID: EngineerID) => Effect.Effect<EngineerSlot | null, CoordinatorError>
   readonly listTeamEngineers: (teamID: TeamID) => Effect.Effect<EngineerSlot[], CoordinatorError>
+  readonly listTeams: () => Effect.Effect<TeamRecord[], CoordinatorError>
+  readonly isLead: (sessionID: SessionID) => Effect.Effect<boolean, CoordinatorError>
+  readonly isEngineer: (sessionID: SessionID) => Effect.Effect<boolean, CoordinatorError>
+  readonly getEngineerBySession: (sessionID: SessionID) => Effect.Effect<EngineerSlot | null, CoordinatorError>
+  readonly updateEngineer: (engineerID: EngineerID, updates: {
+    state?: EngineerState
+    currentTask?: string | null
+    lastHeartbeat?: number
+  }) => Effect.Effect<EngineerSlot, CoordinatorError>
+  readonly getTeamForSession: (sessionID: SessionID) => Effect.Effect<TeamID | null, CoordinatorError>
 }
 
 type DbClient = Parameters<typeof Database.use>[0] extends (db: infer T) => unknown ? T : never
@@ -391,6 +401,72 @@ export const layer = Layer.effect(
       Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
     )
 
+    const listTeams = Effect.fn("SessionCoordinator.listTeams")(() =>
+      Effect.sync(() => [...teams.values()].map((t) => ({
+        teamID: t.teamID,
+        state: t.state,
+        leadSessionID: t.leadSessionID,
+        engineerCount: t.engineerCount,
+        createdAt: t.createdAt,
+        updatedAt: t.updatedAt,
+      }))),
+    )
+
+    const isLead = Effect.fn("SessionCoordinator.isLead")((sessionID: SessionID) =>
+      Effect.sync(() => [...teams.values()].some((t) => t.leadSessionID === sessionID)),
+    )
+
+    const isEngineer = Effect.fn("SessionCoordinator.isEngineer")((sessionID: SessionID) =>
+      Effect.sync(() => [...engineers.values()].some((e) => e.sessionID === sessionID)),
+    )
+
+    const getEngineerBySession = Effect.fn("SessionCoordinator.getEngineerBySession")((sessionID: SessionID) =>
+      Effect.sync(() => [...engineers.values()].find((e) => e.sessionID === sessionID) ?? null),
+    )
+
+    const getTeamForSession = Effect.fn("SessionCoordinator.getTeamForSession")((sessionID: SessionID) =>
+      Effect.sync(() => {
+        const asLead = [...teams.values()].find((t) => t.leadSessionID === sessionID)
+        if (asLead) return asLead.teamID
+        const asEngineer = [...engineers.values()].find((e) => e.sessionID === sessionID)
+        if (asEngineer) return asEngineer.teamID
+        return null
+      }),
+    )
+
+    const updateEngineer = Effect.fn("SessionCoordinator.updateEngineer")(function* (
+      engineerID: EngineerID,
+      updates: { state?: EngineerState; currentTask?: string | null; lastHeartbeat?: number },
+    ) {
+      const slot = engineers.get(engineerID)
+      if (!slot) {
+        return yield* Effect.fail(new CoordinatorError({ message: `Engineer not found: ${engineerID}` }))
+      }
+
+      const now = Date.now()
+      const updated: EngineerSlot = {
+        ...slot,
+        ...(updates.state !== undefined ? { state: updates.state } : {}),
+        ...(updates.currentTask !== undefined ? { currentTask: updates.currentTask } : {}),
+        lastHeartbeat: updates.lastHeartbeat ?? now,
+      }
+
+      yield* dbTx((db) => {
+        db.update(EngineerSlotTable)
+          .set({
+            ...(updates.state !== undefined ? { state: updates.state } : {}),
+            ...(updates.currentTask !== undefined ? { current_task: updates.currentTask } : {}),
+            last_heartbeat: updated.lastHeartbeat,
+            time_updated: now,
+          })
+          .where(eq(EngineerSlotTable.id, engineerID))
+          .run()
+      })
+
+      engineers.set(engineerID, updated)
+      return updated
+    })
+
     return Service.of({
       createTeam,
       spawnEngineer,
@@ -400,6 +476,12 @@ export const layer = Layer.effect(
       getTeam,
       getEngineer,
       listTeamEngineers,
+      listTeams,
+      isLead,
+      isEngineer,
+      getEngineerBySession,
+      updateEngineer,
+      getTeamForSession,
     })
   }),
 )
