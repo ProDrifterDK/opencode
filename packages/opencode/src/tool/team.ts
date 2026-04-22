@@ -4,6 +4,7 @@ import * as Tool from "./tool"
 import { SessionCoordinator } from "../team"
 import { LeadCoordinator } from "../team"
 import { TaskBoardRepo } from "../team"
+import { Mailbox } from "../team"
 import { TeamID } from "../team/types"
 import type { EngineerStateRecord } from "../team/types"
 import DESCRIPTION from "./team.txt"
@@ -402,5 +403,220 @@ export const TeamKillTool = Tool.define(
   }),
 )
 
-// Suppress unused warning for translatePriority (reserved for mailbox priority mapping)
-void (translatePriority as unknown)
+const teamMessageParams = z.object({
+  recipientID: z.string().describe("Engineer ID, or 'lead' to message the lead"),
+  content: z.string().describe("Message content"),
+  priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"),
+})
+
+export const TeamMessageTool = Tool.define(
+  "team_message",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const mailbox = yield* Mailbox.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamMessageParams,
+      execute: (params: z.infer<typeof teamMessageParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const teamID = yield* coordinator.getTeamForSession(ctx.sessionID)
+          if (!teamID) {
+            return yield* Effect.fail(new Error("Not part of a team"))
+          }
+
+          let recipientSessionID: import("../session/schema").SessionID
+          if (params.recipientID === "lead") {
+            const team = yield* coordinator.getTeam(teamID)
+            if (!team) {
+              return yield* Effect.fail(new Error("Team not found"))
+            }
+            recipientSessionID = team.leadSessionID
+          } else {
+            const recipientEngineerID = params.recipientID as import("../team/types").EngineerID
+            const recipient = yield* coordinator.getEngineer(recipientEngineerID)
+            if (!recipient) {
+              return yield* Effect.fail(new Error(`Engineer ${params.recipientID} not found`))
+            }
+            if (recipient.teamID !== teamID) {
+              return yield* Effect.fail(
+                new Error(`Cannot message ${params.recipientID}: not in your team`),
+              )
+            }
+            recipientSessionID = recipient.sessionID
+          }
+
+          const mailboxPriority = translatePriority(params.priority)
+          const message = yield* mailbox.send({
+            recipientSessionID,
+            senderSessionID: ctx.sessionID,
+            priority: mailboxPriority,
+            type: "team_message",
+            content: params.content,
+          })
+
+          const output = [
+            `Message sent successfully.`,
+            `Message ID: ${message.id}`,
+            `Recipient: ${params.recipientID}`,
+            `Priority: ${params.priority}`,
+          ].join("\n")
+
+          return {
+            title: `Message to ${params.recipientID}`,
+            output,
+            metadata: {
+              messageID: message.id,
+              recipientID: params.recipientID,
+              priority: params.priority,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+const teamStatusParams = z.object({
+  state: z.enum(["working", "blocked", "completed"]).describe("Current state"),
+  progress: z.string().optional().describe("Progress description"),
+  blocker: z.string().optional().describe("Blocker description if blocked"),
+})
+
+export const TeamStatusTool = Tool.define(
+  "team_status",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamStatusParams,
+      execute: (params: z.infer<typeof teamStatusParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
+          if (!isEngineer) {
+            return yield* Effect.fail(new Error("Only engineers can report status"))
+          }
+
+          const engineer = yield* coordinator.getEngineerBySession(ctx.sessionID)
+          if (!engineer) {
+            return yield* Effect.fail(new Error("Engineer session not found"))
+          }
+
+          const engineerState =
+            params.state === "completed"
+              ? ("idle" as const)
+              : params.state === "blocked"
+                ? ("blocked" as const)
+                : ("working" as const)
+
+          yield* coordinator.updateEngineer(engineer.engineerID, {
+            state: engineerState,
+            lastHeartbeat: Date.now(),
+          })
+
+          if (engineer.currentTask) {
+            const taskID = engineer.currentTask as import("../team/task-board.sql").TaskBoardID
+            const taskStatus =
+              params.state === "completed"
+                ? "completed"
+                : params.state === "blocked"
+                  ? "blocked"
+                  : "in-progress"
+
+            yield* taskBoard.update(taskID, { status: taskStatus })
+
+            if (params.state === "completed") {
+              yield* coordinator.updateEngineer(engineer.engineerID, {
+                currentTask: null,
+              })
+            }
+          }
+
+          const output = [
+            `Status updated.`,
+            `State: ${params.state}`,
+            params.progress ? `Progress: ${params.progress}` : null,
+            params.blocker ? `Blocker: ${params.blocker}` : null,
+          ]
+            .filter(Boolean)
+            .join("\n")
+
+          return {
+            title: `Status: ${params.state}`,
+            output,
+            metadata: {
+              state: params.state,
+              engineerID: engineer.engineerID,
+              currentTask: engineer.currentTask ?? null,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+const teamDissolveParams = z.object({
+  teamID: z.string().describe("Team ID to dissolve"),
+  force: z.boolean().default(false).describe("Force dissolve even with in-progress tasks"),
+})
+
+export const TeamDissolveTool = Tool.define(
+  "team_dissolve",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const lead = yield* LeadCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamDissolveParams,
+      execute: (params: z.infer<typeof teamDissolveParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can dissolve a team"))
+          }
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const report = yield* lead.monitor(teamID)
+
+          if (report.inProgress > 0 && !params.force) {
+            return yield* Effect.fail(
+              new Error(
+                `Cannot dissolve: ${report.inProgress} tasks in progress. Use force=true to terminate immediately.`,
+              ),
+            )
+          }
+
+          const engineers = yield* coordinator.listTeamEngineers(teamID)
+          const engineerCount = engineers.length
+
+          if (params.force) {
+            const allTasks = yield* taskBoard.list({ team_id: teamID })
+            const inProgressTasks = allTasks.filter((t) => t.status === "in-progress")
+            for (const task of inProgressTasks) {
+              yield* taskBoard.update(task.id, { status: "failed" })
+            }
+          }
+
+          yield* coordinator.dissolveTeam({ teamID })
+
+          const output = [
+            `Team ${params.teamID} dissolved.`,
+            `Engineers terminated: ${engineerCount}`,
+          ].join("\n")
+
+          return {
+            title: `Dissolve team ${params.teamID}`,
+            output,
+            metadata: {
+              teamID: params.teamID,
+              engineersTerminated: engineerCount,
+              forced: params.force,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
