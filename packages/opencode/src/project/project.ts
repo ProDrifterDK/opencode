@@ -13,6 +13,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { NodePath } from "@effect/platform-node"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
+import { SessionCoordinator } from "../team"
 import { zod } from "@/util/effect-zod"
 import { withStatics } from "@/util/schema"
 
@@ -459,11 +460,15 @@ export const layer: Layer.Layer<
   }),
 )
 
-export const defaultLayer = layer.pipe(
+const baseLayer = layer.pipe(
   Layer.provide(CrossSpawnSpawner.defaultLayer),
   Layer.provide(AppFileSystem.defaultLayer),
   Layer.provide(NodePath.layer),
 )
+
+export const defaultLayer = Flag.OPENCODE_TEAM_ENABLED
+  ? baseLayer.pipe(Layer.provide(SessionCoordinator.defaultLayer))
+  : baseLayer
 
 export function list() {
   return Database.use((db) =>
