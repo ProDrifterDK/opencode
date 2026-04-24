@@ -175,6 +175,26 @@ export function Prompt(props: PromptProps) {
     }
   })
 
+  // Team status for statusbar
+  const teamActive = createMemo(() => sync.data.team.record !== null)
+  const teamEngineers = createMemo(() => sync.data.team.engineers)
+  const teamWorkingCount = createMemo(() => teamEngineers().filter((e) => e.state === "working").length)
+  const teamBlockedCount = createMemo(() => teamEngineers().filter((e) => e.state === "blocked").length)
+  const teamFailedCount = createMemo(() => teamEngineers().filter((e) => e.state === "failed").length)
+  const teamCompletedCount = createMemo(() => teamEngineers().filter((e) => e.state === "completed").length)
+
+  const TEAM_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+  const [teamSpinnerIdx, setTeamSpinnerIdx] = createSignal(0)
+  onMount(() => {
+    const interval = setInterval(() => {
+      if (teamWorkingCount() > 0) {
+        setTeamSpinnerIdx((i) => (i + 1) % TEAM_SPINNER_FRAMES.length)
+      }
+    }, 80)
+    onCleanup(() => clearInterval(interval))
+  })
+  const teamSpinner = () => TEAM_SPINNER_FRAMES[teamSpinnerIdx()]
+
   const [store, setStore] = createStore<{
     prompt: PromptInfo
     mode: "normal" | "shell"
@@ -1348,6 +1368,49 @@ export function Prompt(props: PromptProps) {
                       </text>
                     </Match>
                   </Switch>
+                  <Show when={teamActive()}>
+                    <text fg={theme.text}>
+                      <Switch>
+                        <Match when={teamWorkingCount() > 0}>
+                          <span style={{ fg: theme.success }}>{teamSpinner()}</span>
+                        </Match>
+                        <Match when={teamBlockedCount() > 0}>
+                          <span style={{ fg: theme.warning }}>◆</span>
+                        </Match>
+                        <Match when={teamFailedCount() > 0}>
+                          <span style={{ fg: theme.error }}>◆</span>
+                        </Match>
+                        <Match when={true}>
+                          <span style={{ fg: theme.textMuted }}>◆</span>
+                        </Match>
+                      </Switch>
+                      {" "}
+                      <Switch>
+                        <Match when={teamWorkingCount() > 0}>
+                          <span style={{ fg: theme.success }}>{teamWorkingCount()}</span>
+                          <span style={{ fg: theme.textMuted }}> working</span>
+                          <Show when={teamCompletedCount() > 0}>
+                            <span style={{ fg: theme.textMuted }}> · {teamCompletedCount()} done</span>
+                          </Show>
+                        </Match>
+                        <Match when={teamBlockedCount() > 0}>
+                          <span style={{ fg: theme.warning }}>{teamBlockedCount()}</span>
+                          <span style={{ fg: theme.textMuted }}> blocked</span>
+                        </Match>
+                        <Match when={teamFailedCount() > 0}>
+                          <span style={{ fg: theme.error }}>{teamFailedCount()}</span>
+                          <span style={{ fg: theme.textMuted }}> failed</span>
+                        </Match>
+                        <Match when={teamCompletedCount() > 0}>
+                          <span style={{ fg: theme.success }}>✓</span>
+                          <span style={{ fg: theme.textMuted }}> {teamCompletedCount()} done</span>
+                        </Match>
+                        <Match when={true}>
+                          <span style={{ fg: theme.textMuted }}>team</span>
+                        </Match>
+                      </Switch>
+                    </text>
+                  </Show>
                   <text fg={theme.text}>
                     {keybind.print("command_list")} <span style={{ fg: theme.textMuted }}>commands</span>
                   </text>
