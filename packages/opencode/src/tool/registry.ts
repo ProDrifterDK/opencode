@@ -27,7 +27,10 @@ import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
 import { TeamTools } from "./team"
-import { SessionCoordinator } from "../team"
+import { SessionCoordinator } from "../team/session-coordinator"
+import { LeadCoordinator } from "../team/lead-coordinator"
+import { TaskBoardRepo } from "../team/task-board"
+import { Mailbox } from "../team/mailbox"
 import { Glob } from "@opencode-ai/shared/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -89,6 +92,10 @@ export const layer: Layer.Layer<
   | Ripgrep.Service
   | Format.Service
   | Truncate.Service
+  | SessionCoordinator.Service
+  | LeadCoordinator.Service
+  | TaskBoardRepo.Service
+  | Mailbox.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -345,6 +352,4 @@ const baseRegistryLayer = Layer.suspend(() =>
   ),
 )
 
-export const defaultLayer = Flag.OPENCODE_TEAM_ENABLED
-  ? baseRegistryLayer.pipe(Layer.provide(Layer.suspend(() => SessionCoordinator.defaultLayer)))
-  : baseRegistryLayer
+export const defaultLayer = baseRegistryLayer

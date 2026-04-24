@@ -1,12 +1,13 @@
 import z from "zod"
 import { Effect } from "effect"
 import * as Tool from "./tool"
-import { SessionCoordinator } from "../team"
-import { LeadCoordinator } from "../team"
-import { TaskBoardRepo } from "../team"
-import { Mailbox } from "../team"
+import { SessionCoordinator } from "../team/session-coordinator"
+import { LeadCoordinator } from "../team/lead-coordinator"
+import { TaskBoardRepo } from "../team/task-board"
+import { Mailbox } from "../team/mailbox"
 import { TeamID } from "../team/types"
 import type { EngineerStateRecord } from "../team/types"
+import { Event, publishTeamEvent } from "../team/events"
 import DESCRIPTION from "./team.txt"
 
 // Priority translation: 4-tier (tool) -> 3-tier (mailbox)
@@ -76,6 +77,7 @@ export const TeamMonitorTool = Tool.define(
   "team_monitor",
   Effect.gen(function* () {
     const lead = yield* LeadCoordinator.Service
+    const mailbox = yield* Mailbox.Service
 
     return {
       description: DESCRIPTION,
@@ -88,9 +90,22 @@ export const TeamMonitorTool = Tool.define(
           const report = yield* lead.monitor(teamID)
           const formatted = lead.formatStatus(report)
 
+          // Fetch and consume unread messages for the lead
+          const messages = yield* mailbox.receive(ctx.sessionID)
+          let output = formatted
+
+          if (messages.length > 0) {
+            const msgLines: string[] = ["\n  📬 Inbox:"]
+            for (const msg of messages) {
+              const priority = msg.priority === "urgent" ? "🚨" : msg.priority === "inbox" ? "📩" : "📭"
+              msgLines.push(`    ${priority} ${msg.content}`)
+            }
+            output += msgLines.join("\n")
+          }
+
           return {
             title: `Monitor team ${params.teamID}`,
-            output: formatted,
+            output,
             metadata: {
               teamID: params.teamID,
               totalTasks: report.totalTasks,
@@ -99,6 +114,7 @@ export const TeamMonitorTool = Tool.define(
               inProgress: report.inProgress,
               failed: report.failed,
               blocked: report.blocked,
+              unreadMessages: messages.length,
             },
           }
         }).pipe(Effect.orDie),
@@ -114,6 +130,10 @@ const teamSpawnParams = z.object({
     description: z.string().describe("Task description"),
     fileScope: z.array(z.string()).optional().describe("Files this task may modify"),
   }),
+  model: z.object({
+    providerID: z.string().describe("Provider ID (e.g., 'anthropic', 'openai')"),
+    modelID: z.string().describe("Model ID (e.g., 'claude-sonnet-4-20250514', 'gpt-4o')"),
+  }).optional().describe("Optional LLM model for this engineer. Defaults to current session's model."),
 })
 
 export const TeamSpawnTool = Tool.define(
@@ -157,12 +177,33 @@ export const TeamSpawnTool = Tool.define(
             currentTask: task.id,
           })
 
+          // Publish event to trigger the Team Daemon to start the engineer's loop
+          publishTeamEvent(Event.EngineerSpawned, {
+            teamID,
+            engineerID: engineerSlot.engineerID,
+            sessionID: engineerSlot.sessionID,
+            name: params.name,
+            state: "working",
+            taskID: task.id,
+            taskTitle: params.task.title,
+            taskDescription: params.task.description,
+            providerID: params.model?.providerID,
+            modelID: params.model?.modelID,
+          })
+
+          const modelInfo = params.model
+            ? `Model: ${params.model.providerID}/${params.model.modelID}`
+            : "Model: (session default)"
+
           const output = [
             `Engineer spawned successfully.`,
             `Engineer ID: ${engineerSlot.engineerID}`,
             `Session ID: ${engineerSlot.sessionID}`,
             `Task ID: ${task.id}`,
             `Task: ${params.task.title}`,
+            modelInfo,
+            ``,
+            `Note: Do NOT poll team_monitor. Engineer will notify you when done.`,
           ].join("\n")
 
           return {
@@ -515,6 +556,16 @@ export const TeamStatusTool = Tool.define(
             lastHeartbeat: Date.now(),
           })
 
+          // Publish progress event for UI updates
+          if (params.progress) {
+            publishTeamEvent(Event.EngineerProgress, {
+              teamID: engineer.teamID,
+              engineerID: engineer.engineerID,
+              progressText: params.progress,
+              timestamp: Date.now(),
+            })
+          }
+
           if (engineer.currentTask) {
             const taskID = engineer.currentTask as import("../team/task-board.sql").TaskBoardID
             const taskStatus =
@@ -621,6 +672,407 @@ export const TeamDissolveTool = Tool.define(
   }),
 )
 
+const teamReportParams = z.object({
+  status: z.enum(["completed", "blocked", "failed"]).describe("Task completion status"),
+  summary: z.string().describe("Brief summary of work done or reason for failure/block"),
+})
+
+export const TeamReportTool = Tool.define(
+  "team_report",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+    const mailbox = yield* Mailbox.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamReportParams,
+      execute: (params: z.infer<typeof teamReportParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
+          if (!isEngineer) {
+            return yield* Effect.fail(new Error("Only engineers can report task completion"))
+          }
+
+          const engineer = yield* coordinator.getEngineerBySession(ctx.sessionID)
+          if (!engineer) {
+            return yield* Effect.fail(new Error("Engineer not found"))
+          }
+
+          if (!engineer.currentTask) {
+            return yield* Effect.fail(new Error("No task assigned to this engineer"))
+          }
+
+          const taskID = engineer.currentTask
+          const task = yield* taskBoard.get(taskID)
+          const taskTitle = task?.title ?? taskID
+
+          yield* taskBoard.update(taskID, {
+            status: params.status,
+          })
+
+          const newState = params.status === "completed" ? "idle" : params.status === "blocked" ? "blocked" : "failed"
+          yield* coordinator.updateEngineer(engineer.engineerID, {
+            state: newState,
+            currentTask: null,
+          })
+
+          // Publish progress event with status summary for sidebar
+          const statusEmoji = params.status === "completed" ? "✅" : params.status === "blocked" ? "🚧" : "❌"
+          publishTeamEvent(Event.EngineerProgress, {
+            teamID: engineer.teamID,
+            engineerID: engineer.engineerID,
+            progressText: `${statusEmoji} ${params.status}: ${params.summary.slice(0, 50)}${params.summary.length > 50 ? "..." : ""}`,
+            timestamp: Date.now(),
+          })
+
+          // Publish completion/failure event for UI
+          if (params.status === "completed") {
+            publishTeamEvent(Event.EngineerCompleted, {
+              teamID: engineer.teamID,
+              engineerID: engineer.engineerID,
+              taskId: taskID,
+            })
+          } else if (params.status === "failed") {
+            publishTeamEvent(Event.EngineerFailed, {
+              teamID: engineer.teamID,
+              engineerID: engineer.engineerID,
+              taskId: taskID,
+              error: params.summary,
+            })
+          }
+
+          // Send message to lead to notify them
+          const team = yield* coordinator.getTeam(engineer.teamID)
+          if (team) {
+            const statusEmoji = params.status === "completed" ? "✅" : params.status === "blocked" ? "🚧" : "❌"
+            const message = [
+              `${statusEmoji} Engineer ${engineer.name} reports: ${params.status.toUpperCase()}`,
+              `Task: ${taskTitle}`,
+              `Summary: ${params.summary}`,
+            ].join("\n")
+
+            yield* mailbox.send({
+              senderSessionID: ctx.sessionID,
+              recipientSessionID: team.leadSessionID,
+              type: "team_report",
+              content: message,
+              priority: params.status === "failed" ? "urgent" : "inbox",
+            })
+          }
+
+          const output = [
+            `Task reported as ${params.status}.`,
+            `Task ID: ${taskID}`,
+            `Summary: ${params.summary}`,
+            ``,
+            `Lead has been notified. You can now stand by for further instructions.`,
+          ].join("\n")
+
+          return {
+            title: `Report task ${params.status}`,
+            output,
+            metadata: {
+              taskID,
+              status: params.status,
+              engineerID: engineer.engineerID,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+// ─── Team Inbox Tool (lightweight mailbox check) ────────────────────────────
+
+export const TeamInboxTool = Tool.define(
+  "team_inbox",
+  Effect.gen(function* () {
+    const mailbox = yield* Mailbox.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: z.object({
+        peek: z.boolean().optional().describe("If true, preview messages without marking as read"),
+      }),
+      execute: (params: { peek?: boolean }, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const messages = params.peek
+            ? yield* mailbox.peek(ctx.sessionID)
+            : yield* mailbox.receive(ctx.sessionID)
+
+          const unread = messages.filter((m) => !m.read_at)
+
+          if (unread.length === 0) {
+            return {
+              title: "Check inbox",
+              output: "📭 No new messages.",
+              metadata: { messageCount: 0 },
+            }
+          }
+
+          const lines: string[] = [`📬 ${unread.length} message(s):`]
+          for (const msg of unread) {
+            const priority = msg.priority === "urgent" ? "🚨" : msg.priority === "inbox" ? "📩" : "📭"
+            lines.push(`  ${priority} ${msg.content}`)
+          }
+
+          return {
+            title: "Check inbox",
+            output: lines.join("\n"),
+            metadata: {
+              messageCount: unread.length,
+              messages: unread.map((m) => ({
+                id: m.id,
+                priority: m.priority,
+                from: m.sender_session_id,
+              })),
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+// ─── Team Roster Tool (discover teammates) ─────────────────────────────────
+
+export const TeamRosterTool = Tool.define(
+  "team_roster",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: z.object({}),
+      execute: (_params: Record<string, never>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const teamID = yield* coordinator.getTeamForSession(ctx.sessionID)
+          if (!teamID) {
+            return yield* Effect.fail(new Error("Not part of a team"))
+          }
+
+          const team = yield* coordinator.getTeam(teamID)
+          const engineers = yield* coordinator.listTeamEngineers(teamID)
+          const myEngineer = yield* coordinator.getEngineerBySession(ctx.sessionID)
+          const myID = myEngineer?.engineerID
+
+          const lines: string[] = [
+            `Team: ${teamID}`,
+            `Goal: ${team?.goal ?? "N/A"}`,
+            ``,
+            `Teammates:`,
+          ]
+
+          for (const eng of engineers) {
+            const isMe = eng.engineerID === myID
+            const stateEmoji = eng.state === "working" ? "🔨" : eng.state === "idle" ? "💤" : eng.state === "blocked" ? "🚧" : "❌"
+            lines.push(`  ${stateEmoji} ${eng.name}${isMe ? " (you)" : ""} - ID: ${eng.engineerID}`)
+            if (eng.currentTask) {
+              lines.push(`      Task: ${eng.currentTask}`)
+            }
+          }
+
+          lines.push(``)
+          lines.push(`To message a teammate: team_message with recipientID set to their ID`)
+          lines.push(`To message the lead: team_message with recipientID set to "lead"`)
+
+          return {
+            title: "Team roster",
+            output: lines.join("\n"),
+            metadata: {
+              teamID,
+              engineerCount: engineers.length,
+              engineers: engineers.map((e) => ({
+                engineerID: e.engineerID,
+                name: e.name,
+                state: e.state,
+                isMe: e.engineerID === myID,
+              })),
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+// ─── Team Tasks Tool (list available tasks) ────────────────────────────────
+
+export const TeamTasksTool = Tool.define(
+  "team_tasks",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: z.object({
+        showAll: z.boolean().optional().describe("Show all tasks including assigned ones (default: only unassigned)"),
+      }),
+      execute: (params: { showAll?: boolean }, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const teamID = yield* coordinator.getTeamForSession(ctx.sessionID)
+          if (!teamID) {
+            return yield* Effect.fail(new Error("Not part of a team"))
+          }
+
+          const allTasks = yield* taskBoard.list({ team_id: teamID })
+          const tasks = params.showAll
+            ? allTasks
+            : allTasks.filter((t) => t.status === "pending" && !t.assigned_engineer_id)
+
+          if (tasks.length === 0) {
+            return {
+              title: "Available tasks",
+              output: params.showAll
+                ? "No tasks in the team."
+                : "No unassigned tasks available. Use showAll=true to see all tasks.",
+              metadata: { taskCount: 0, tasks: [] },
+            }
+          }
+
+          const lines: string[] = [
+            params.showAll ? "All tasks:" : "Available tasks (pending, unassigned):",
+            "",
+          ]
+
+          for (const task of tasks) {
+            const statusEmoji =
+              task.status === "pending" ? "⏳" :
+              task.status === "in-progress" ? "🔨" :
+              task.status === "completed" ? "✅" :
+              task.status === "blocked" ? "🚧" : "❌"
+            const assignee = task.assigned_engineer_id ? ` [${task.assigned_engineer_id}]` : " [unclaimed]"
+            lines.push(`${statusEmoji} ${task.id}: ${task.title}${assignee}`)
+            if (task.description) {
+              lines.push(`   ${task.description.slice(0, 60)}${task.description.length > 60 ? "..." : ""}`)
+            }
+          }
+
+          lines.push("")
+          lines.push("To claim a task: team_claim with taskID")
+
+          return {
+            title: "Available tasks",
+            output: lines.join("\n"),
+            metadata: {
+              taskCount: tasks.length,
+              tasks: tasks.map((t) => ({
+                taskID: t.id,
+                title: t.title,
+                status: t.status,
+                assignedTo: t.assigned_engineer_id,
+              })),
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
+// ─── Team Claim Tool (claim a task) ─────────────────────────────────────────
+
+const teamClaimParams = z.object({
+  taskID: z.string().describe("Task ID to claim (from team_tasks)"),
+})
+
+export const TeamClaimTool = Tool.define(
+  "team_claim",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: DESCRIPTION,
+      parameters: teamClaimParams,
+      execute: (params: z.infer<typeof teamClaimParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
+          if (!isEngineer) {
+            return yield* Effect.fail(new Error("Only engineers can claim tasks"))
+          }
+
+          const engineer = yield* coordinator.getEngineerBySession(ctx.sessionID)
+          if (!engineer) {
+            return yield* Effect.fail(new Error("Engineer not found"))
+          }
+
+          if (engineer.currentTask) {
+            return yield* Effect.fail(
+              new Error(`You already have a task assigned: ${engineer.currentTask}. Complete it first with team_report.`),
+            )
+          }
+
+          const taskID = params.taskID as import("../team/task-board.sql").TaskBoardID
+          const task = yield* taskBoard.get(taskID)
+          if (!task) {
+            return yield* Effect.fail(new Error(`Task not found: ${params.taskID}`))
+          }
+
+          if (task.team_id !== engineer.teamID) {
+            return yield* Effect.fail(new Error("Task belongs to a different team"))
+          }
+
+          if (task.assigned_engineer_id && task.assigned_engineer_id !== engineer.engineerID) {
+            return yield* Effect.fail(
+              new Error(`Task already claimed by another engineer: ${task.assigned_engineer_id}`),
+            )
+          }
+
+          if (task.status !== "pending") {
+            return yield* Effect.fail(new Error(`Task is not pending (status: ${task.status})`))
+          }
+
+          // Claim the task
+          yield* taskBoard.update(taskID, {
+            status: "in-progress",
+            assigned_engineer_id: engineer.engineerID,
+          })
+
+          yield* coordinator.updateEngineer(engineer.engineerID, {
+            state: "working",
+            currentTask: taskID,
+          })
+
+          // Publish progress event
+          publishTeamEvent(Event.EngineerProgress, {
+            teamID: engineer.teamID,
+            engineerID: engineer.engineerID,
+            progressText: `Claimed: ${task.title.slice(0, 40)}${task.title.length > 40 ? "..." : ""}`,
+            timestamp: Date.now(),
+          })
+
+          publishTeamEvent(Event.TaskAssigned, {
+            teamID: engineer.teamID,
+            taskId: taskID,
+            engineerID: engineer.engineerID,
+          })
+
+          const output = [
+            `Task claimed successfully!`,
+            ``,
+            `Task ID: ${taskID}`,
+            `Title: ${task.title}`,
+            task.description ? `Description: ${task.description}` : null,
+            task.file_scope ? `File scope: ${task.file_scope}` : null,
+            ``,
+            `Start working on this task. When done, call team_report.`,
+          ].filter(Boolean).join("\n")
+
+          return {
+            title: `Claimed task: ${task.title}`,
+            output,
+            metadata: {
+              taskID,
+              title: task.title,
+              description: task.description,
+              engineerID: engineer.engineerID,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
+  }),
+)
+
 // ─── Export all tools ───────────────────────────────────────────────────────
 
 export const TeamTools = Effect.gen(function* () {
@@ -634,7 +1086,12 @@ export const TeamTools = Effect.gen(function* () {
     TeamMonitorTool,
     TeamMessageTool,
     TeamStatusTool,
+    TeamReportTool,
     TeamDissolveTool,
+    TeamInboxTool,
+    TeamRosterTool,
+    TeamTasksTool,
+    TeamClaimTool,
   ])
   return yield* Effect.all(infos.map(Tool.init))
 })

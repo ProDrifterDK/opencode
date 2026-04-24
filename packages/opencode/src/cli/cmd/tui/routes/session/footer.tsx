@@ -1,10 +1,12 @@
-import { createMemo, Match, onCleanup, onMount, Show, Switch } from "solid-js"
+import { createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { useTheme } from "../../context/theme"
 import { useSync } from "../../context/sync"
 import { useDirectory } from "../../context/directory"
 import { useConnected } from "../../component/dialog-model"
 import { createStore } from "solid-js/store"
 import { useRoute } from "../../context/route"
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 export function Footer() {
   const { theme } = useTheme()
@@ -19,6 +21,27 @@ export function Footer() {
   })
   const directory = useDirectory()
   const connected = useConnected()
+
+  // Team status
+  const teamActive = createMemo(() => sync.data.team.record !== null)
+  const engineers = createMemo(() => sync.data.team.engineers)
+  const workingCount = createMemo(() => engineers().filter((e) => e.state === "working").length)
+  const blockedCount = createMemo(() => engineers().filter((e) => e.state === "blocked").length)
+  const failedCount = createMemo(() => engineers().filter((e) => e.state === "failed").length)
+  const idleCount = createMemo(() => engineers().filter((e) => e.state === "idle").length)
+  const completedCount = createMemo(() => engineers().filter((e) => e.state === "completed").length)
+
+  // Spinner animation for working engineers
+  const [spinnerIdx, setSpinnerIdx] = createSignal(0)
+  onMount(() => {
+    const interval = setInterval(() => {
+      if (workingCount() > 0) {
+        setSpinnerIdx((i) => (i + 1) % SPINNER_FRAMES.length)
+      }
+    }, 80)
+    onCleanup(() => clearInterval(interval))
+  })
+  const spinner = () => SPINNER_FRAMES[spinnerIdx()]
 
   const [store, setStore] = createStore({
     welcome: false,
@@ -64,6 +87,48 @@ export function Footer() {
               <text fg={theme.warning}>
                 <span style={{ fg: theme.warning }}>△</span> {permissions().length} Permission
                 {permissions().length > 1 ? "s" : ""}
+              </text>
+            </Show>
+            <Show when={teamActive()}>
+              <text fg={theme.text}>
+                <Switch>
+                  <Match when={workingCount() > 0}>
+                    <span style={{ fg: theme.success }}>{spinner()}</span>
+                  </Match>
+                  <Match when={blockedCount() > 0}>
+                    <span style={{ fg: theme.warning }}>◆</span>
+                  </Match>
+                  <Match when={failedCount() > 0}>
+                    <span style={{ fg: theme.error }}>◆</span>
+                  </Match>
+                  <Match when={true}>
+                    <span style={{ fg: theme.textMuted }}>◆</span>
+                  </Match>
+                </Switch>
+                {" "}
+                <Switch>
+                  <Match when={workingCount() > 0}>
+                    <span style={{ fg: theme.success }}>{workingCount()}</span> Working
+                    <Show when={completedCount() > 0}>
+                      <span style={{ fg: theme.textMuted }}> · {completedCount()} done</span>
+                    </Show>
+                  </Match>
+                  <Match when={blockedCount() > 0}>
+                    <span style={{ fg: theme.warning }}>{blockedCount()}</span> Blocked
+                  </Match>
+                  <Match when={failedCount() > 0}>
+                    <span style={{ fg: theme.error }}>{failedCount()}</span> Failed
+                  </Match>
+                  <Match when={completedCount() > 0}>
+                    <span style={{ fg: theme.success }}>✓</span> {completedCount()} Complete
+                  </Match>
+                  <Match when={idleCount() > 0}>
+                    {idleCount()} Idle
+                  </Match>
+                  <Match when={true}>
+                    Team
+                  </Match>
+                </Switch>
               </text>
             </Show>
             <text fg={theme.text}>

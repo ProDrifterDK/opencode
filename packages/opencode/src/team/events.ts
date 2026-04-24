@@ -20,8 +20,14 @@ export const Event = {
   EngineerSpawned: BusEvent.define("engineer.spawned", z.object({
     teamID: z.string(),
     engineerID: z.string(),
+    sessionID: z.string(),
     name: z.string(),
-    taskId: z.string().nullable(),
+    state: z.string(),
+    taskID: z.string(),
+    taskTitle: z.string(),
+    taskDescription: z.string(),
+    providerID: z.string().optional(),
+    modelID: z.string().optional(),
   })),
 
   EngineerCompleted: BusEvent.define("engineer.completed", z.object({
@@ -54,6 +60,13 @@ export const Event = {
     teamID: z.string(),
     taskId: z.string(),
     engineerID: z.string(),
+  })),
+
+  EngineerProgress: BusEvent.define("engineer.progress", z.object({
+    teamID: z.string(),
+    engineerID: z.string(),
+    progressText: z.string(),
+    timestamp: z.number(),
   })),
 } as const
 

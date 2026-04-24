@@ -1,15 +1,30 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createMemo, For, Match, Show, Switch, createSignal } from "solid-js"
+import { createMemo, For, Match, Show, Switch, createSignal, onMount, onCleanup } from "solid-js"
 
 const id = "internal:sidebar-team"
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
 function View(props: { api: TuiPluginApi }) {
   const [open, setOpen] = createSignal(true)
+  const [spinnerIdx, setSpinnerIdx] = createSignal(0)
   const theme = () => props.api.theme.current
   const team = createMemo(() => props.api.state.team())
   const active = createMemo(() => team().record !== null)
   const working = createMemo(() => team().engineers.filter((e) => e.state === "working").length)
   const failed = createMemo(() => team().engineers.filter((e) => e.state === "failed").length)
+
+  // Animate spinner when engineers are working
+  onMount(() => {
+    const interval = setInterval(() => {
+      if (working() > 0) {
+        setSpinnerIdx((i) => (i + 1) % SPINNER_FRAMES.length)
+      }
+    }, 80)
+    onCleanup(() => clearInterval(interval))
+  })
+
+  const spinner = () => SPINNER_FRAMES[spinnerIdx()]
 
   const dot = (state: string) => {
     if (state === "working") return theme().success
@@ -49,12 +64,15 @@ function View(props: { api: TuiPluginApi }) {
                   flexShrink={0}
                   style={{ fg: dot(eng.state) }}
                 >
-                  •
+                  {eng.state === "working" ? spinner() : "•"}
                 </text>
                 <text fg={theme().text} wrapMode="word">
                   {eng.name}{" "}
                   <span style={{ fg: theme().textMuted }}>
                     <Switch fallback={stateLabel(eng.state)}>
+                      <Match when={eng.progressText}>
+                        {eng.progressText}
+                      </Match>
                       <Match when={eng.state === "working" && eng.currentTask}>
                         Working on {eng.currentTask}
                       </Match>

@@ -89,6 +89,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           name: string
           state: string
           currentTask?: string
+          progressText?: string
           startedAt?: number
           lastHeartbeat: number
         }[]
@@ -397,12 +398,12 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           break
         }
         case "engineer.spawned": {
-          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; name: string; taskId: string | null }
+          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; name: string; state: string; taskId: string | null }
           setStore("team", "engineers", produce((draft) => {
             draft.push({
               engineerID: p.engineerID,
               name: p.name,
-              state: "idle",
+              state: p.state ?? "idle",
               currentTask: p.taskId ?? undefined,
               lastHeartbeat: Date.now(),
             })
@@ -416,7 +417,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; taskId: string }
           const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
           if (idx >= 0) {
-            setStore("team", "engineers", idx, { state: "idle", currentTask: undefined })
+            setStore("team", "engineers", idx, { state: "idle", currentTask: undefined, progressText: undefined })
           }
           break
         }
@@ -424,7 +425,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; taskId: string; error: string }
           const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
           if (idx >= 0) {
-            setStore("team", "engineers", idx, { state: "failed" })
+            setStore("team", "engineers", idx, { state: "failed", progressText: `❌ Failed: ${p.error.slice(0, 30)}` })
           }
           break
         }
@@ -448,7 +449,15 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           const p = (event as { properties: unknown }).properties as { teamID: string; taskId: string; engineerID: string }
           const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
           if (idx >= 0) {
-            setStore("team", "engineers", idx, { state: "idle", currentTask: undefined })
+            setStore("team", "engineers", idx, { state: "idle", currentTask: undefined, progressText: undefined })
+          }
+          break
+        }
+        case "engineer.progress": {
+          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; progressText: string; timestamp: number }
+          const idx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
+          if (idx >= 0) {
+            setStore("team", "engineers", idx, { progressText: p.progressText, lastHeartbeat: p.timestamp })
           }
           break
         }

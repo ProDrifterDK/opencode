@@ -47,6 +47,10 @@ import { Installation } from "@/installation"
 import { ShareNext } from "@/share"
 import { SessionShare } from "@/share"
 import { SessionCoordinator } from "@/team/session-coordinator"
+import { LeadCoordinator } from "@/team/lead-coordinator"
+import { TaskBoardRepo } from "@/team/task-board"
+import { Mailbox } from "@/team/mailbox"
+import { TeamDaemon } from "@/team/daemon"
 import { Npm } from "@/npm"
 import { memoMap } from "./memo-map"
 
@@ -96,7 +100,17 @@ export const AppLayer = Layer.mergeAll(
   Installation.defaultLayer,
   ShareNext.defaultLayer,
   SessionShare.defaultLayer,
+  TaskBoardRepo.layer,
+  Mailbox.defaultLayer,
+  LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer)),
   SessionCoordinator.defaultLayer,
+  TeamDaemon.layer.pipe(
+    Layer.provide(Bus.defaultLayer),
+    Layer.provide(SessionPrompt.defaultLayer),
+    Layer.provide(SessionCoordinator.defaultLayer),
+    Layer.provide(Mailbox.defaultLayer),
+    Layer.provide(TaskBoardRepo.layer),
+  ),
 ).pipe(Layer.provideMerge(Observability.layer))
 
 const rt = ManagedRuntime.make(AppLayer, { memoMap })

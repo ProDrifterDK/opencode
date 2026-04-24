@@ -1680,6 +1680,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+        // Lead daemon: event-driven mailbox monitoring
+        let restartLoop = false
         if (!session.parentID) {
           const coordinator = yield* Effect.serviceOption(SessionCoordinator.Service)
           if (Option.isSome(coordinator)) {
@@ -1688,28 +1690,67 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             ).pipe(Effect.catchCause(() => Effect.succeed(null)))
             if (team) {
               yield* slog.info("lead.daemon_enter")
-              const mailbox = yield* Effect.serviceOption(Mailbox.Service)
-              if (Option.isSome(mailbox)) {
+              const mailboxOpt = yield* Effect.serviceOption(Mailbox.Service)
+              if (Option.isSome(mailboxOpt)) {
+                const mailboxSvc = mailboxOpt.value
+
+                // Event-driven: subscribe to LeadMessageReceived events
+                const eventStream = bus.subscribe(Mailbox.Event.LeadMessageReceived)
+                  .pipe(
+                    Stream.filter((e) => e.properties.leadSessionID === sessionID),
+                    Stream.take(1),
+                  )
+
+                // Race between: event arrival OR timeout (fallback poll)
+                const waitForMessage = Effect.raceFirst(
+                  Stream.runHead(eventStream).pipe(
+                    Effect.map(() => "event" as const),
+                    Effect.catchAll(() => Effect.succeed("timeout" as const)),
+                  ),
+                  Effect.sleep(`${LEAD_DAEMON_POLL_INTERVAL} millis`).pipe(
+                    Effect.map(() => "timeout" as const),
+                  ),
+                )
+
                 while (true) {
-                  yield* Effect.sleep(`${LEAD_DAEMON_POLL_INTERVAL} millis`)
-                  const hasUrgent = yield* mailbox.value.hasUnread({
-                    recipientSessionID: sessionID,
-                    priority: "urgent",
-                  }).pipe(Effect.catchCause(() => Effect.succeed(false)))
+                  const wakeReason = yield* waitForMessage
+                  yield* slog.info("lead.daemon.wake", { reason: wakeReason })
 
-                  if (hasUrgent) {
-                    yield* slog.info("lead.daemon.urgent_message")
-                    const messages = yield* mailbox.value.receiveByPriority({
-                      recipientSessionID: sessionID,
-                      priority: "urgent",
-                    }).pipe(Effect.catchCause(() => Effect.succeed([] as any[])))
+                  // Check all priorities for messages
+                  const mailboxResult = yield* checkTeamMailbox({ sessionID, slog, step })
+                  if (mailboxResult) {
+                    yield* slog.info("lead.daemon.message_received", { priority: mailboxResult.priority })
 
-                    for (const msg of messages) {
-                      yield* mailbox.value.markRead({
-                        messageID: msg.id,
-                        recipientSessionID: sessionID,
-                      }).pipe(Effect.catchCause(() => Effect.void))
+                    // Inject message into conversation (like engineers do)
+                    const label = mailboxResult.priority === "urgent"
+                      ? "[URGENT MESSAGE FROM ENGINEER]"
+                      : mailboxResult.priority === "inbox"
+                        ? "[MESSAGE FROM ENGINEER]"
+                        : "[LOW PRIORITY MESSAGE]"
+                    const userMsg: MessageV2.User = {
+                      id: MessageID.ascending(),
+                      sessionID,
+                      time: { created: Date.now() },
+                      role: "user",
+                      agent: lastUser.agent,
+                      model: lastUser.model,
+                      tools: lastUser.tools,
+                      format: lastUser.format,
                     }
+                    yield* sessions.updateMessage(userMsg)
+                    const userPart: MessageV2.Part = {
+                      type: "text",
+                      id: PartID.ascending(),
+                      messageID: userMsg.id,
+                      sessionID,
+                      text: `${label}\n${mailboxResult.message.content}`,
+                      synthetic: true,
+                    }
+                    yield* sessions.updatePart(userPart)
+
+                    // Break to restart main loop with injected message
+                    restartLoop = true
+                    break
                   }
                 }
               }
@@ -1717,7 +1758,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
         }
 
-        return yield* lastAssistant(sessionID)
+        if (!restartLoop) {
+          return yield* lastAssistant(sessionID)
+        }
+        // restartLoop is true - continue to next iteration of main while loop
       },
     )
 

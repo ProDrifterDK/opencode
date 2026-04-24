@@ -2,19 +2,29 @@ Team orchestration tools for multi-agent collaboration.
 
 These tools enable a lead session to create and coordinate a team of engineer agents working on complex tasks.
 
+IMPORTANT FOR LEAD: After spawning engineers, DO NOT poll team_monitor repeatedly.
+Engineers will send notifications via team_report when they complete/fail/block.
+You will receive these notifications automatically as system messages.
+Wait for engineer notifications instead of polling.
+
 Available tools:
 - team_create: Initialize a new team for a goal
-- team_spawn: Create an engineer and assign a task
+- team_spawn: Create an engineer and assign a task (optional model selection)
 - team_decompose: Break a goal into subtasks with file scopes
 - team_assign: Auto-assign pending tasks to idle engineers
 - team_reassign: Move a task from one engineer to another
 - team_kill: Terminate a single engineer session
-- team_monitor: Get progress report for a team
-- team_message: Send a message to another session
+- team_monitor: Get progress report for a team (includes unread inbox messages)
+- team_inbox: Check mailbox for new messages (fast, no status poll)
+- team_message: Send a message to another session (use engineer ID or "lead")
+- team_roster: List all teammates with their IDs and status (for messaging)
+- team_tasks: List available tasks (pending, unassigned) that can be claimed
+- team_claim: Claim an unassigned task to work on
 - team_status: (Engineers only) Report state and progress
+- team_report: (Engineers only) Report task completion/failure/blocked status
 - team_dissolve: Gracefully shut down a team
 
 Role restrictions:
 - Lead-only: team_create, team_spawn, team_decompose, team_assign, team_reassign, team_kill, team_dissolve
-- Engineer-only: team_status
-- Both: team_monitor, team_message
+- Engineer-only: team_status, team_report, team_claim
+- Both: team_monitor, team_inbox, team_message, team_roster, team_tasks

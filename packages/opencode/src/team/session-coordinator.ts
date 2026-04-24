@@ -59,6 +59,7 @@ export interface Interface {
   readonly getTeam: (teamID: TeamID) => Effect.Effect<TeamRecord | null, CoordinatorError>
   readonly getEngineer: (engineerID: EngineerID) => Effect.Effect<EngineerSlot | null, CoordinatorError>
   readonly listTeamEngineers: (teamID: TeamID) => Effect.Effect<EngineerSlot[], CoordinatorError>
+  readonly listAllEngineers: () => Effect.Effect<EngineerSlot[], CoordinatorError>
   readonly listTeams: () => Effect.Effect<TeamRecord[], CoordinatorError>
   readonly isLead: (sessionID: SessionID) => Effect.Effect<boolean, CoordinatorError>
   readonly isEngineer: (sessionID: SessionID) => Effect.Effect<boolean, CoordinatorError>
@@ -233,12 +234,8 @@ export const layer = Layer.effect(
       team.state = "active"
       team.updatedAt = now
 
-      void publishTeamEvent(Event.EngineerSpawned, {
-        teamID: input.teamID,
-        engineerID,
-        name: engName,
-        taskId: slot.currentTask,
-      })
+      // Note: EngineerSpawned event is published by team_spawn tool
+      // which has full task details (title, description)
 
       return slot
     })
@@ -401,6 +398,10 @@ export const layer = Layer.effect(
       Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
     )
 
+    const listAllEngineers = Effect.fn("SessionCoordinator.listAllEngineers")(() =>
+      Effect.sync(() => [...engineers.values()]),
+    )
+
     const listTeams = Effect.fn("SessionCoordinator.listTeams")(() =>
       Effect.sync(() => [...teams.values()].map((t) => ({
         teamID: t.teamID,
@@ -476,6 +477,7 @@ export const layer = Layer.effect(
       getTeam,
       getEngineer,
       listTeamEngineers,
+      listAllEngineers,
       listTeams,
       isLead,
       isEngineer,
