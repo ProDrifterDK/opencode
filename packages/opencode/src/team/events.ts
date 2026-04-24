@@ -1,6 +1,7 @@
 import z from "zod"
 import { BusEvent } from "@/bus/bus-event"
 import * as Bus from "@/bus"
+import { GlobalBus } from "@/bus/global"
 import { Log } from "@/util"
 
 const log = Log.create({ service: "team.events" })
@@ -74,8 +75,19 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
   def: D,
   properties: z.output<D["properties"]>,
 ): void {
+  // Publish to Effect Bus (for backend subscribers like daemon)
   Bus.publish(def, properties).catch((err) => {
     log.error("failed to publish team event", { type: def.type, error: String(err) })
+  })
+
+  // Also emit to GlobalBus so TUI receives the event
+  // Use "global" directory so it's processed regardless of workspace
+  GlobalBus.emit("event", {
+    directory: "global",
+    payload: {
+      type: def.type,
+      properties,
+    },
   })
 }
 
