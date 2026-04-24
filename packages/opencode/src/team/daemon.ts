@@ -12,6 +12,7 @@ import { Database } from "@/storage"
 import { EngineerSlotTable, TeamStateTable } from "./session-coordinator.sql"
 import { TaskBoardTable } from "./task-board.sql"
 import { eq, and } from "drizzle-orm"
+import { Event as MessageEvent } from "@/session/message-v2"
 
 const log = Log.create({ service: "team.daemon" })
 
@@ -493,6 +494,62 @@ export const layer = Layer.effect(
       }
     }
 
+    // Track last emitted tool per engineer to avoid duplicate progress updates
+    const lastToolPerEngineer = new Map<string, string>()
+
+    const handlePartUpdated = (event: {
+      type: string
+      properties: {
+        sessionID: string
+        part: {
+          type: string
+          tool?: string
+          state?: { type: string }
+        }
+        time: number
+      }
+    }) => {
+      // Only process tool parts that are running
+      if (event.properties.part.type !== "tool") return
+      if (event.properties.part.state?.type !== "running") return
+
+      const toolName = event.properties.part.tool
+      if (!toolName) return
+
+      // Check if this session belongs to a running engineer
+      const engineerEntry = [...running.entries()].find(
+        ([, eng]) => eng.sessionID === event.properties.sessionID
+      )
+      if (!engineerEntry) return
+
+      const [engineerID, engineer] = engineerEntry
+
+      // Skip if we already emitted this tool for this engineer
+      const lastTool = lastToolPerEngineer.get(engineerID)
+      if (lastTool === toolName) return
+      lastToolPerEngineer.set(engineerID, toolName)
+
+      // Format tool name for display (e.g., "Read" -> "Reading", "Bash" -> "Running bash")
+      const formatToolName = (name: string) => {
+        const lowerName = name.toLowerCase()
+        if (lowerName === "read") return "Reading file"
+        if (lowerName === "write") return "Writing file"
+        if (lowerName === "edit") return "Editing file"
+        if (lowerName === "bash") return "Running command"
+        if (lowerName === "grep" || lowerName === "globalsearch") return "Searching"
+        if (lowerName === "agent") return "Spawning agent"
+        if (lowerName.startsWith("mcp__")) return `MCP: ${name.slice(5).split("__")[0]}`
+        return name
+      }
+
+      publishTeamEvent(Event.EngineerProgress, {
+        teamID: engineer.teamID,
+        engineerID,
+        progressText: formatToolName(toolName),
+        timestamp: Date.now(),
+      })
+    }
+
     const start = Effect.fn("TeamDaemon.start")(function* () {
       log.info("starting team daemon")
 
@@ -504,6 +561,9 @@ export const layer = Layer.effect(
 
       const unsubEngineerMessage = yield* bus.subscribeCallback(MailboxEvent.EngineerMessageSent, handleEngineerMessageReceived)
       unsubscribers.push(unsubEngineerMessage)
+
+      const unsubPartUpdated = yield* bus.subscribeCallback(MessageEvent.PartUpdated, handlePartUpdated)
+      unsubscribers.push(unsubPartUpdated)
 
       // Start heartbeat monitoring
       heartbeatUpdateInterval = setInterval(updateRunningHeartbeats, HEARTBEAT_UPDATE_INTERVAL)
