@@ -399,17 +399,29 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         }
         case "engineer.spawned": {
           const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; name: string; state: string; taskId: string | null }
-          setStore("team", "engineers", produce((draft) => {
-            draft.push({
-              engineerID: p.engineerID,
-              name: p.name,
+          // Check if engineer already exists (avoid duplicates)
+          const existingIdx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
+          if (existingIdx >= 0) {
+            // Update existing engineer
+            setStore("team", "engineers", existingIdx, {
               state: p.state ?? "idle",
               currentTask: p.taskId ?? undefined,
               lastHeartbeat: Date.now(),
             })
-          }))
-          if (store.team.record) {
-            setStore("team", "record", "engineerCount", store.team.engineers.length + 1)
+          } else {
+            // Add new engineer
+            setStore("team", "engineers", produce((draft) => {
+              draft.push({
+                engineerID: p.engineerID,
+                name: p.name,
+                state: p.state ?? "idle",
+                currentTask: p.taskId ?? undefined,
+                lastHeartbeat: Date.now(),
+              })
+            }))
+            if (store.team.record) {
+              setStore("team", "record", "engineerCount", store.team.engineers.length + 1)
+            }
           }
           break
         }
