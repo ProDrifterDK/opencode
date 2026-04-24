@@ -1012,14 +1012,20 @@ export const TeamClaimTool = Tool.define(
             return yield* Effect.fail(new Error("Task belongs to a different team"))
           }
 
-          if (task.assigned_engineer_id && task.assigned_engineer_id !== engineer.engineerID) {
+          // Task must be pending AND unassigned to be claimable
+          if (task.status !== "pending") {
+            return yield* Effect.fail(new Error(`Task is not claimable (status: ${task.status}). Only pending tasks can be claimed.`))
+          }
+
+          if (task.assigned_engineer_id) {
+            if (task.assigned_engineer_id === engineer.engineerID) {
+              return yield* Effect.fail(
+                new Error(`This task is already assigned to you. Use team_report to complete it.`),
+              )
+            }
             return yield* Effect.fail(
               new Error(`Task already claimed by another engineer: ${task.assigned_engineer_id}`),
             )
-          }
-
-          if (task.status !== "pending") {
-            return yield* Effect.fail(new Error(`Task is not pending (status: ${task.status})`))
           }
 
           // Claim the task
