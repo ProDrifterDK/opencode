@@ -2,7 +2,7 @@
 
 ## Tools Reference
 
-**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_retask`, `team_kill`, `team_dissolve`, `team_resume`, `team_commit`
+**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_retask`, `team_kill`, `team_dissolve`, `team_resume`, `team_commit`, `team_share`
 **Engineer-only:** `team_status`, `team_report`, `team_claim`
 **Both:** `team_monitor`, `team_inbox`, `team_roster`, `team_tasks`, `team_message`
 
@@ -59,6 +59,9 @@ Writes a structured markdown summary of the team's run (tasks completed/failed/p
 `team_retask({ taskID, title?, description?, fileScope? })` — edits the title, description, and/or fileScope of a `pending` or `blocked` task. At least one field must be supplied. Rejects `in-progress`, `completed`, and `failed` tasks. Runs a glob-overlap check on `fileScope` changes against other active tasks.
 `team_kill({ teamID, engineerID })` + fresh `team_spawn` — replaces a failed engineer.
 `team_assign({ teamID })` — auto-pairs any pending tasks with idle engineers.
+
+### team_share
+`team_share({ teamID })` — shares every session transcript for the team (Lead + all engineers) and returns a URL per session. Lead-only. Useful for handing off a full team run to a reviewer or for archiving.
 
 ### team_monitor
 Expensive aggregate roll-up. Call only when:

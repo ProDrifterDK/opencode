@@ -1,6 +1,7 @@
 import z from "zod"
 import { Effect } from "effect"
 import * as Tool from "./tool"
+import { SessionShare } from "../share"
 import { SessionCoordinator } from "../team/session-coordinator"
 import { LeadCoordinator } from "../team/lead-coordinator"
 import { TaskBoardRepo } from "../team/task-board"
@@ -70,6 +71,8 @@ const requireEngineer = (ctx: Tool.Context, coordinator: any, action = "use this
 const TOOL_DESCRIPTIONS = {
   team_create:
     "Initialize a new team for a goal. Returns a teamID used by every later call. Lead-only; called ONCE per team.",
+  team_share:
+    "Share all session transcripts for the team (Lead + all engineers). Returns a URL for each session. Lead-only.",
   team_agents:
     "List configured agents ({ name, description, ... }). Call this before team_spawn to pick an agent per subtask; match on description, not name. Lead-only.",
   team_spawn:
@@ -1683,6 +1686,69 @@ export const TeamAgentsTool = Tool.define(
   }),
 )
 
+// ─── Team Share Tool (share all sessions for the team) ─────────────────────
+
+export const TeamShareTool = Tool.define(
+  "team_share",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const shareService = yield* SessionShare.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_share,
+      parameters: z.object({
+        teamID: z.string().describe("Team ID whose sessions to share"),
+      }),
+      execute: (params: { teamID: string }, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* requireLead(ctx, coordinator, "share team transcripts")
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const team = yield* coordinator.getTeam(teamID)
+          if (!team) {
+            return yield* Effect.fail(new Error(`Team ${params.teamID} not found`))
+          }
+
+          const engineers = yield* coordinator.listTeamEngineers(teamID)
+
+          // Share lead session
+          const leadResult = yield* shareService.share(team.leadSessionID)
+
+          // Share each engineer session
+          const engineerShares: { name: string; task: string | null; url: string }[] = []
+          for (const eng of engineers) {
+            const result = yield* shareService.share(eng.sessionID).pipe(
+              Effect.catch((err: unknown) =>
+                Effect.fail(new Error(`Failed to share engineer ${eng.name}: ${String(err)}`)),
+              ),
+            )
+            engineerShares.push({ name: eng.name, task: eng.currentTask, url: result.url })
+          }
+
+          const lines: string[] = [
+            `Team ${params.teamID} shared:`,
+            `  Lead: ${leadResult.url}`,
+            `  Engineers (${engineerShares.length}):`,
+          ]
+          for (const e of engineerShares) {
+            const label = e.task ? `${e.name} (${e.task})` : e.name
+            lines.push(`    ${label}: ${e.url}`)
+          }
+
+          return {
+            title: `Share team ${params.teamID}`,
+            output: lines.join("\n"),
+            metadata: {
+              teamID: params.teamID,
+              leadURL: leadResult.url,
+              engineers: engineerShares,
+            },
+          }
+        }).pipe(toolErrorBoundary),
+    }
+  }),
+)
+
 // ─── Export all tools ───────────────────────────────────────────────────────
 
 export const TeamTools = Effect.gen(function* () {
@@ -1706,6 +1772,7 @@ export const TeamTools = Effect.gen(function* () {
     TeamTasksTool,
     TeamClaimTool,
     TeamAgentsTool,
+    TeamShareTool,
   ])
   return yield* Effect.all(infos.map(Tool.init))
 })
