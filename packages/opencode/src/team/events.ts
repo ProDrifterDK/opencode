@@ -29,6 +29,8 @@ export const Event = {
     taskDescription: z.string(),
     providerID: z.string().optional(),
     modelID: z.string().optional(),
+    agentName: z.string().optional(),
+    agentColor: z.string().optional(),
   })),
 
   EngineerCompleted: BusEvent.define("engineer.completed", z.object({
@@ -75,9 +77,15 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
   def: D,
   properties: z.output<D["properties"]>,
 ): void {
-  // Publish to Effect Bus (for backend subscribers like daemon)
+  // Publish to Effect Bus (for backend subscribers like daemon).
+  // Silently ignore "No context found" errors — they occur when publishTeamEvent
+  // is called outside an active instance (e.g. tests, gracefulShutdown). In those
+  // cases the GlobalBus emission below is sufficient.
   Bus.publish(def, properties).catch((err) => {
-    log.error("failed to publish team event", { type: def.type, error: String(err) })
+    const msg = String(err)
+    if (!msg.includes("No context found for instance")) {
+      log.error("failed to publish team event", { type: def.type, error: msg })
+    }
   })
 
   // Also emit to GlobalBus so TUI receives the event

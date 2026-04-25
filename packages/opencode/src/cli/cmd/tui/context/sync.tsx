@@ -92,6 +92,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           progressText?: string
           startedAt?: number
           lastHeartbeat: number
+          agentName?: string
+          agentColor?: string
         }[]
       }
     }>({
@@ -398,15 +400,17 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           break
         }
         case "engineer.spawned": {
-          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; name: string; state: string; taskId: string | null }
+          const p = (event as { properties: unknown }).properties as { teamID: string; engineerID: string; name: string; state: string; taskID: string | null; taskTitle?: string; agentName?: string; agentColor?: string }
           // Check if engineer already exists (avoid duplicates)
           const existingIdx = store.team.engineers.findIndex((e) => e.engineerID === p.engineerID)
           if (existingIdx >= 0) {
             // Update existing engineer
             setStore("team", "engineers", existingIdx, {
               state: p.state ?? "idle",
-              currentTask: p.taskId ?? undefined,
+              currentTask: p.taskTitle ?? undefined,
               lastHeartbeat: Date.now(),
+              agentName: p.agentName,
+              agentColor: p.agentColor,
             })
           } else {
             // Add new engineer
@@ -415,8 +419,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                 engineerID: p.engineerID,
                 name: p.name,
                 state: p.state ?? "idle",
-                currentTask: p.taskId ?? undefined,
+                currentTask: p.taskTitle ?? undefined,
                 lastHeartbeat: Date.now(),
+                agentName: p.agentName,
+                agentColor: p.agentColor,
               })
             }))
             if (store.team.record) {

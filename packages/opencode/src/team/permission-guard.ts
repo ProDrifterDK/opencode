@@ -40,6 +40,15 @@ export interface Interface {
   readonly unregister: (sessionID: SessionID) => Effect.Effect<void>
   readonly check: (sessionID: SessionID, filePath: string) => Effect.Effect<void, ScopeDeniedError>
   readonly isEngineer: (sessionID: SessionID) => boolean
+  // Service-level wrapper around `check` that knows which tools to gate
+  // and how to pull the target path out of their args. Use this from
+  // call sites that don't know about GUARDED_TOOLS / extractFilePath
+  // internals (e.g. session/prompt.ts before `tool.execute.before`).
+  readonly enforceForTool: (
+    sessionID: SessionID,
+    toolID: string,
+    args: Record<string, unknown>,
+  ) => Effect.Effect<void, ScopeDeniedError>
 }
 
 // ─── State ─────────────────────────────────────────────────────────────────────
@@ -123,7 +132,19 @@ export const layer = Layer.effect(
 
     const isEngineer = (sessionID: SessionID): boolean => state.engineers.has(sessionID)
 
-    return Service.of({ register, unregister, check, isEngineer })
+    const enforceForTool = (
+      sessionID: SessionID,
+      toolID: string,
+      args: Record<string, unknown>,
+    ): Effect.Effect<void, ScopeDeniedError> => {
+      if (!state.engineers.has(sessionID)) return Effect.void
+      if (!GUARDED_TOOLS.has(toolID)) return Effect.void
+      const filePath = extractFilePath(toolID, args)
+      if (!filePath) return Effect.void
+      return check(sessionID, filePath)
+    }
+
+    return Service.of({ register, unregister, check, isEngineer, enforceForTool })
   }),
 )
 

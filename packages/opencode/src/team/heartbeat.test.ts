@@ -83,7 +83,18 @@ const memCoordinator = SessionCoordinatorService.of({
   getEngineer: (engineerID: EngineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
   listTeamEngineers: (teamID: TeamID) =>
     Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listAllEngineers: () => Effect.sync(() => [...engineers.values()]),
   listTeams: () => Effect.sync(() => [...teams.values()]),
+  isLead: () => Effect.succeed(false),
+  isEngineer: () => Effect.succeed(false),
+  getEngineerBySession: () => Effect.succeed(null),
+  updateEngineer: (engineerID: EngineerID) =>
+    Effect.sync(() => {
+      const slot = engineers.get(engineerID)
+      if (slot) slot.lastHeartbeat = Date.now()
+      return slot ?? makeSlot({ engineerID })
+    }),
+  getTeamForSession: () => Effect.succeed(null),
 })
 
 const memLead = LeadCoordinatorService.of({
@@ -411,5 +422,142 @@ describe("HeartbeatMonitor", () => {
 
     expect(results).toHaveLength(1)
     expect(results[0].stuckCount).toBe(0)
+  })
+
+  // ─── startTeamMonitoring / stopTeamMonitoring ────────────────────────────
+
+  test("startTeamMonitoring is idempotent: second call is a no-op", async () => {
+    teams.set(TEAM_ID, makeTeam())
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    // Call twice — should not throw and should tear down cleanly once
+    await runWith(service.startTeamMonitoring(TEAM_ID, LEAD_SESSION))
+    await runWith(service.startTeamMonitoring(TEAM_ID, LEAD_SESSION))
+
+    // Single stop should succeed without error
+    await runWith(service.stopTeamMonitoring(TEAM_ID))
+
+    // After stop, no health entries remain (team had no engineers)
+    expect(service.getHealth(ENG_A)).toBeNull()
+  })
+
+  test("stopTeamMonitoring cleans health entries for team engineers", async () => {
+    teams.set(TEAM_ID, makeTeam({ engineerCount: 1 }))
+    engineers.set(ENG_A, makeSlot())
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    await runWith(service.startTeamMonitoring(TEAM_ID, LEAD_SESSION))
+    // Seed a health entry so we can verify it gets cleared
+    await runWith(service.recordHeartbeat(ENG_A))
+    expect(service.getHealth(ENG_A)).not.toBeNull()
+
+    await runWith(service.stopTeamMonitoring(TEAM_ID))
+
+    expect(service.getHealth(ENG_A)).toBeNull()
+  })
+
+  test("multi-team isolation: stopping team1 does not affect team2", async () => {
+    const TEAM_2 = "team_two" as TeamID
+    const LEAD_2 = "sess_lead_two" as SessionID
+    teams.set(TEAM_ID, makeTeam())
+    teams.set(TEAM_2, makeTeam({ teamID: TEAM_2, leadSessionID: LEAD_2 }))
+    engineers.set(ENG_A, makeSlot({ teamID: TEAM_ID }))
+    engineers.set(ENG_B, makeSlot({ engineerID: ENG_B, teamID: TEAM_2, sessionID: "sess_eng_b" as SessionID, name: "engineer-b" }))
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    await runWith(service.startTeamMonitoring(TEAM_ID, LEAD_SESSION))
+    await runWith(service.startTeamMonitoring(TEAM_2, LEAD_2))
+
+    await runWith(service.recordHeartbeat(ENG_A))
+    await runWith(service.recordHeartbeat(ENG_B))
+
+    // Stop team1; team2's engineer health should remain
+    await runWith(service.stopTeamMonitoring(TEAM_ID))
+
+    expect(service.getHealth(ENG_A)).toBeNull()
+    expect(service.getHealth(ENG_B)).not.toBeNull()
+
+    // Clean up team2
+    await runWith(service.stopTeamMonitoring(TEAM_2))
+  })
+
+  test("stopTeamMonitoring on never-started team is a no-op", async () => {
+    const UNKNOWN_TEAM = "team_never_started" as TeamID
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    // Must not throw
+    await expect(
+      runWith(service.stopTeamMonitoring(UNKNOWN_TEAM)),
+    ).resolves.toBeUndefined()
+  })
+
+  // ─── isMonitoring / primary+backstop gate ───────────────────────────────
+
+  test("isMonitoring returns true while team monitoring is active", async () => {
+    teams.set(TEAM_ID, makeTeam())
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    // Before start: not monitored — daemon backstop should handle it
+    const before = await runWith(service.isMonitoring(TEAM_ID))
+    expect(before).toBe(false)
+
+    await runWith(service.startTeamMonitoring(TEAM_ID, LEAD_SESSION))
+
+    // After start: primary monitor is active — daemon should skip
+    const during = await runWith(service.isMonitoring(TEAM_ID))
+    expect(during).toBe(true)
+
+    await runWith(service.stopTeamMonitoring(TEAM_ID))
+
+    // After stop: falls back to daemon backstop again
+    const after = await runWith(service.isMonitoring(TEAM_ID))
+    expect(after).toBe(false)
+  })
+
+  test("isMonitoring is per-team: one team active does not affect another", async () => {
+    const TEAM_2 = "team_other" as TeamID
+    const LEAD_2 = "sess_lead_other" as SessionID
+    teams.set(TEAM_ID, makeTeam())
+    teams.set(TEAM_2, makeTeam({ teamID: TEAM_2, leadSessionID: LEAD_2 }))
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    await runWith(service.startTeamMonitoring(TEAM_ID, LEAD_SESSION))
+
+    // TEAM_ID is monitored
+    expect(await runWith(service.isMonitoring(TEAM_ID))).toBe(true)
+    // TEAM_2 is NOT monitored — still available for daemon backstop
+    expect(await runWith(service.isMonitoring(TEAM_2))).toBe(false)
+
+    await runWith(service.startTeamMonitoring(TEAM_2, LEAD_2))
+
+    // Both monitored now
+    expect(await runWith(service.isMonitoring(TEAM_ID))).toBe(true)
+    expect(await runWith(service.isMonitoring(TEAM_2))).toBe(true)
+
+    await runWith(service.stopTeamMonitoring(TEAM_ID))
+
+    // Only TEAM_2 still monitored
+    expect(await runWith(service.isMonitoring(TEAM_ID))).toBe(false)
+    expect(await runWith(service.isMonitoring(TEAM_2))).toBe(true)
+
+    await runWith(service.stopTeamMonitoring(TEAM_2))
   })
 })

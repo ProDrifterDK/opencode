@@ -281,4 +281,176 @@ describe("GitManager", () => {
 
     expect(status.behind).toBeGreaterThanOrEqual(1)
   })
+
+  // --- mergeBranch with custom message (squash) ---
+
+  test("mergeBranch with custom message produces one squash commit", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+    const main = defaultBranch()
+
+    await runWith(service.createBranch({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+      fileScopes: ["src/*"],
+    }))
+
+    Bun.spawnSync(["sh", "-c", "echo work1 > work1.txt && git add . && git commit -m eng1"], { cwd: testDir })
+    Bun.spawnSync(["sh", "-c", "echo work2 > work2.txt && git add . && git commit -m eng2"], { cwd: testDir })
+
+    git(["checkout", main])
+
+    await runWith(service.mergeBranch({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+      message: "squash: engineer work done",
+    }))
+
+    const log = git(["log", "--oneline", "-1"])
+    expect(log).toContain("squash: engineer work done")
+
+    const files = git(["ls-files"])
+    expect(files).toContain("work1.txt")
+    expect(files).toContain("work2.txt")
+  })
+
+  test("mergeBranch with conflict returns MergeConflictError and no merge in progress", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+    const main = defaultBranch()
+
+    await runWith(service.createBranch({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+      fileScopes: ["src/*"],
+    }))
+
+    Bun.spawnSync(["sh", "-c", "echo eng > clash.txt && git add . && git commit -m eng-clash"], { cwd: testDir })
+
+    git(["checkout", main])
+    Bun.spawnSync(["sh", "-c", "echo main > clash.txt && git add . && git commit -m main-clash"], { cwd: testDir })
+
+    const result = await runWith(
+      service.mergeBranch({ teamID: TEAM_ID, engineerID: ENG_A, message: "should fail" }).pipe(Effect.flip),
+    )
+
+    expect(result).toBeInstanceOf(MergeConflictError)
+    expect((result as MergeConflictError).branch).toBe(branchOf(TEAM_ID, ENG_A))
+
+    // No merge in progress after abort
+    const mergeHead = Bun.spawnSync(["sh", "-c", "test -f MERGE_HEAD && echo yes || echo no"], { cwd: testDir, stdout: "pipe" })
+    expect(new TextDecoder().decode(mergeHead.stdout).trim()).toBe("no")
+  })
+
+  // --- createEngineerWorktree ---
+
+  test("createEngineerWorktree creates worktree at expected path on new branch", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    const result = await runWith(service.createEngineerWorktree({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+    }))
+
+    expect(result.branch).toBe(branchOf(TEAM_ID, ENG_A))
+    expect(result.worktreePath).toContain(ENG_A)
+    expect(result.worktreePath).toContain(TEAM_ID)
+
+    const worktrees = git(["worktree", "list", "--porcelain"])
+    expect(worktrees).toContain(result.worktreePath)
+    expect(worktrees).toContain(result.branch)
+  })
+
+  test("createEngineerWorktree re-attach: calling twice does not throw", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    const first = await runWith(service.createEngineerWorktree({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+    }))
+
+    // Second call with the same IDs should not throw
+    const second = await runWith(service.createEngineerWorktree({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+    }))
+
+    expect(second.branch).toBe(first.branch)
+    expect(second.worktreePath).toBe(first.worktreePath)
+  })
+
+  // --- removeEngineerWorktree ---
+
+  test("removeEngineerWorktree removes worktree and deletes branch", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    const { worktreePath, branch } = await runWith(service.createEngineerWorktree({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+    }))
+
+    await runWith(service.removeEngineerWorktree({ teamID: TEAM_ID, engineerID: ENG_A }))
+
+    const worktrees = git(["worktree", "list", "--porcelain"])
+    expect(worktrees).not.toContain(worktreePath)
+
+    const branches = git(["branch"])
+    expect(branches).not.toContain(branch)
+  })
+
+  test("removeEngineerWorktree tolerates already-gone worktree", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    // Remove something that was never created — should not throw
+    await expect(
+      runWith(service.removeEngineerWorktree({ teamID: TEAM_ID, engineerID: ENG_A })),
+    ).resolves.toBeUndefined()
+  })
+
+  // --- commitInWorktree ---
+
+  test("commitInWorktree commits on engineer branch without moving lead branch", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+    const main = defaultBranch()
+
+    const { worktreePath, branch } = await runWith(service.createEngineerWorktree({
+      teamID: TEAM_ID,
+      engineerID: ENG_A,
+    }))
+
+    // Write a file in the worktree dir
+    Bun.spawnSync(["sh", "-c", "echo worktree-file > wt.txt"], { cwd: worktreePath })
+
+    await runWith(service.commitInWorktree({ worktreePath, message: "engineer commit" }))
+
+    // Lead branch has not moved
+    const leadBranch = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim()
+    expect(leadBranch).toBe(main)
+
+    // Engineer branch has the commit
+    const engLog = git(["log", "--oneline", "-1", branch])
+    expect(engLog).toContain("engineer commit")
+  })
+
+  // --- cleanupBranches with worktrees ---
+
+  test("cleanupBranches removes worktrees and branches for team", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+    const main = defaultBranch()
+
+    await runWith(service.createEngineerWorktree({ teamID: TEAM_ID, engineerID: ENG_A }))
+    await runWith(service.createEngineerWorktree({ teamID: TEAM_ID, engineerID: ENG_B }))
+
+    await runWith(service.cleanupBranches(TEAM_ID))
+
+    const worktrees = git(["worktree", "list", "--porcelain"])
+    expect(worktrees).not.toContain(ENG_A)
+    expect(worktrees).not.toContain(ENG_B)
+
+    const branches = git(["branch"])
+    expect(branches).not.toContain(branchOf(TEAM_ID, ENG_A))
+    expect(branches).not.toContain(branchOf(TEAM_ID, ENG_B))
+
+    // Lead branch unchanged
+    const leadBranch = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim()
+    expect(leadBranch).toBe(main)
+  })
 })

@@ -51,6 +51,10 @@ import { LeadCoordinator } from "@/team/lead-coordinator"
 import { TaskBoardRepo } from "@/team/task-board"
 import { Mailbox } from "@/team/mailbox"
 import { TeamDaemon } from "@/team/daemon"
+import { GitManager } from "@/team/git-manager"
+import { RateLimiter } from "@/team/rate-limiter"
+import { HeartbeatMonitor } from "@/team/heartbeat"
+import { PermissionGuard } from "@/team/permission-guard"
 import { Npm } from "@/npm"
 import { memoMap } from "./memo-map"
 
@@ -104,12 +108,27 @@ export const AppLayer = Layer.mergeAll(
   Mailbox.defaultLayer,
   LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer)),
   SessionCoordinator.defaultLayer,
+  GitManager.layer,
+  RateLimiter.layer,
+  PermissionGuard.layer.pipe(Layer.provide(Mailbox.defaultLayer)),
+  // HeartbeatMonitor exposes richer per-team monitoring (orphan
+  // detection, per-engineer rate-limit backoff, diagnostic pings) that
+  // the daemon's simpler setInterval sweep doesn't cover. It is wired
+  // into AppLayer so consumers can resolve the service, but nothing
+  // auto-calls `startMonitoring` today — doing so needs a team-scoped
+  // Scope lifetime, which is future work. See src/team/heartbeat.ts.
+  HeartbeatMonitor.layer.pipe(
+    Layer.provide(SessionCoordinator.defaultLayer),
+    Layer.provide(LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer))),
+    Layer.provide(Mailbox.defaultLayer),
+  ),
   TeamDaemon.layer.pipe(
     Layer.provide(Bus.defaultLayer),
     Layer.provide(SessionPrompt.defaultLayer),
     Layer.provide(SessionCoordinator.defaultLayer),
     Layer.provide(Mailbox.defaultLayer),
     Layer.provide(TaskBoardRepo.layer),
+    Layer.provide(RateLimiter.layer),
   ),
 ).pipe(Layer.provideMerge(Observability.layer))
 

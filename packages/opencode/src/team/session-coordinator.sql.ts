@@ -16,6 +16,8 @@ export interface EngineerSlotRow {
   name: string
   state: EngineerRuntimeState
   current_task: string | null
+  agent_name: string | null
+  agent_color: string | null
   started_at: number | null
   last_heartbeat: number
   time_created: number
@@ -24,7 +26,7 @@ export interface EngineerSlotRow {
 
 export interface TeamStateRow {
   team_id: TeamID
-  state: "idle" | "active" | "dissolving"
+  state: "idle" | "active" | "dissolving" | "terminated"
   lead_session_id: SessionID
   engineer_count: number
   time_created: number
@@ -39,7 +41,7 @@ export const TeamStateTable = sqliteTable(
   "team_state",
   {
     team_id: text().$type<TeamID>().primaryKey(),
-    state: text().$type<"idle" | "active" | "dissolving">().notNull(),
+    state: text().$type<"idle" | "active" | "dissolving" | "terminated">().notNull(),
     lead_session_id: text().$type<SessionID>().notNull(),
     engineer_count: integer().notNull(),
     time_created: integer().notNull(),
@@ -57,6 +59,8 @@ export const EngineerSlotTable = sqliteTable(
     name: text().notNull(),
     state: text().$type<EngineerRuntimeState>().notNull(),
     current_task: text(),
+    agent_name: text(),
+    agent_color: text(),
     started_at: integer(),
     last_heartbeat: integer().notNull(),
     ...Timestamps,

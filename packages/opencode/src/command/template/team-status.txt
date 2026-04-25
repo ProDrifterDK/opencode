@@ -1,49 +1,78 @@
 # Team Status
 
-Retrieve and display the current status of the active team.
+Retrieve and display the current status of the active team using the
+`team_*` LLM tools. You are the Lead of the session that invoked this
+command; only the Lead can call `team_monitor` on a team it owns.
 
-## Step 1: Gather Data
+## Step 1: Identify the Team
 
-If `$ARGUMENTS` contains a team ID, use that specific team. Otherwise, find the active team by querying `SessionCoordinator.getTeam()` for known team IDs.
+If `$ARGUMENTS` contains a team ID (format: `tm_*`), use that.
 
-For the active team:
-1. Use `LeadCoordinator.monitor(teamId)` to get a `ProgressReport` containing:
-   - Total tasks, pending, in-progress, completed, failed, blocked counts
-   - Engineer summaries (ID, state, current task)
-   - Blocked tasks and their blockers
-2. Use `SessionCoordinator.listTeamEngineers(teamId)` to get full engineer slot details including:
-   - Engineer ID, name, state
-   - Session ID
-   - Current task
-   - Last heartbeat timestamp
+Otherwise you must already know the active team's ID from the current
+conversation — when `/team-start` was run, `team_create` returned a
+`teamID` which should still be in context. If you truly don't have one,
+tell the user: "No team ID known in this session. Run `/team-start
+<goal>` or pass a team ID: `/team-status <tm_...>`."
 
-## Step 2: Format Output
+## Step 2: Fetch Progress
 
-Use `LeadCoordinator.formatStatus(report)` for the base status text, then augment with engineer session details.
+Call:
 
-Display a formatted table:
+```
+team_monitor({ teamID })
+```
+
+The output contains fields equivalent to a progress report: total,
+pending, inProgress, completed, failed, blocked counts, plus an
+`engineers` array summarising each slot's state and current task, and
+a `blockers` array for blocked tasks.
+
+Then call:
+
+```
+team_roster({ teamID })
+```
+
+to get full engineer details (name, session ID, current task, last
+heartbeat). `team_roster` exposes the same information a direct
+`listTeamEngineers` call would — use its output to augment the display
+below.
+
+## Step 3: Format Output
+
+Render a formatted table combining the two results. This is the shape a
+past version of this prompt called a `ProgressReport`:
 
 ```
 ╔══════════════════════════════════════════╗
-║ Team Status: <teamID>                   ║
+║ Team Status: <teamID>                    ║
 ╠══════════════════════════════════════════╣
-║ Tasks: <completed>/<total> completed    ║
-║ Pending: <n> | In Progress: <n>         ║
-║ Failed: <n> | Blocked: <n>              ║
+║ Tasks: <completed>/<total> completed     ║
+║ Pending: <n> | In Progress: <n>          ║
+║ Failed: <n> | Blocked: <n>               ║
 ╠══════════════════════════════════════════╣
-║ Engineers:                               ║
-║   <name> [<state>] — <task or idle>     ║
-║   ...                                    ║
+║ Engineers:                                ║
+║   <name> [<state>] — <task or idle>      ║
+║   (last heartbeat: <ago>)                 ║
+║   ...                                     ║
 ╠══════════════════════════════════════════╣
-║ Blockers:                                ║
-║   <task> blocked by <blocking task>      ║
-║   ...                                    ║
+║ Blockers:                                 ║
+║   <task title> blocked by <reason>        ║
+║   ...                                     ║
 ╚══════════════════════════════════════════╝
 ```
 
-If no active team exists, display: "No active team found. Use `/team-start <description>` to start one."
+No fancy summary formatter exists server-side — the previous version of
+this prompt referred to a `formatStatus` helper, but in reality the
+formatting is your job. Do it here in the prompt based on the two tool
+outputs above.
 
 ## Error Handling
 
-- If the team ID is not found, report: "Team not found: <teamID>"
-- If monitoring fails, show the error message from `LeadCoordinatorError`
+- If `team_monitor` fails with "Team not found": report "Team not found:
+  `<teamID>`" and stop.
+- If `team_roster` fails but `team_monitor` succeeded, render the
+  progress table without engineer details and note that the roster
+  lookup failed.
+- If the Lead-only check fails ("Only the lead can…"), the invoking
+  session is not the Lead of that team — tell the user and stop.

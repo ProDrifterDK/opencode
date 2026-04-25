@@ -1,10 +1,10 @@
-import { Effect, Layer, Context, Schema, Deferred, Schedule } from "effect"
+import { Effect, Layer, Context, Schema, Deferred } from "effect"
 import {
   RATE_LIMIT_TOKENS_PER_MIN,
   RATE_LIMIT_MAX_CONCURRENT,
   RATE_LIMIT_BASE_BACKOFF_MS,
 } from "./constants"
-import type { EngineerID } from "./types"
+import type { EngineerID, TeamID } from "./types"
 
 export class RateLimitExhaustedError extends Schema.TaggedErrorClass<RateLimitExhaustedError>()("RateLimitExhaustedError", {
   engineerID: Schema.String,
@@ -35,16 +35,36 @@ export interface RateLimiterStats {
   consecutive429s: number
 }
 
+// Per-team state. All counters, queue, and circuit breaker are isolated per
+// TeamID so one team's 429 burst cannot stall another team's engineers.
+interface TeamState {
+  activeCalls: number
+  tokensUsedThisMinute: number
+  consecutive429s: number
+  circuitBreakerOpen: boolean
+  circuitBreakerOpenUntil: number
+  minuteWindowStart: number
+  queue: PendingRequest[]
+}
+
 export interface Interface {
   readonly acquire: (
+    teamID: TeamID,
     engineerID: EngineerID,
     priority: Priority,
     estimatedTokens: number,
   ) => Effect.Effect<void, RateLimitExhaustedError | CircuitBreakerOpenError>
-  readonly release: (engineerID: EngineerID, tokensUsed: number) => Effect.Effect<void>
-  readonly report429: (engineerID: EngineerID) => Effect.Effect<void>
-  readonly resetCircuitBreaker: () => Effect.Effect<void>
-  readonly getStats: () => RateLimiterStats
+  readonly release: (teamID: TeamID, engineerID: EngineerID, tokensUsed: number) => Effect.Effect<void>
+  readonly report429: (teamID: TeamID, engineerID: EngineerID) => Effect.Effect<void>
+  // resetCircuitBreaker is per-team: clears the breaker only for the given team.
+  readonly resetCircuitBreaker: (teamID: TeamID) => Effect.Effect<void>
+  // getStats(teamID) returns stats for that team, or null if no state exists yet.
+  // Returning a single-team result keeps callers simple; they always have a teamID
+  // in scope when they need metrics.
+  readonly getStats: (teamID: TeamID) => RateLimiterStats | null
+  // forgetTeam removes a team's state from the map. Call when a team is dissolved
+  // to free the (tiny) memory. Not auto-called — let the caller decide.
+  readonly forgetTeam: (teamID: TeamID) => void
 }
 
 const PRIORITY_ORDER: Record<Priority, number> = {
@@ -58,81 +78,101 @@ const CIRCUIT_BREAKER_BLOCK_MS = 5 * 60 * 1000
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/RateLimiter") {}
 
+const freshTeamState = (): TeamState => ({
+  activeCalls: 0,
+  tokensUsedThisMinute: 0,
+  consecutive429s: 0,
+  circuitBreakerOpen: false,
+  circuitBreakerOpenUntil: 0,
+  minuteWindowStart: Date.now(),
+  queue: [],
+})
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    let activeCalls = 0
-    let tokensUsedThisMinute = 0
-    let consecutive429s = 0
-    let circuitBreakerOpen = false
-    let circuitBreakerOpenUntil = 0
+    // Map from TeamID -> per-team mutable state. Lazily populated on first acquire.
+    const teamStates = new Map<TeamID, TeamState>()
 
-    const queue: PendingRequest[] = []
+    const getOrCreateTeamState = (teamID: TeamID): TeamState => {
+      let state = teamStates.get(teamID)
+      if (!state) {
+        state = freshTeamState()
+        teamStates.set(teamID, state)
+      }
+      return state
+    }
 
-    const minuteWindowStart = { value: Date.now() }
+    // ---- helpers scoped to a single TeamState ----
 
-    const resetMinuteWindow = () => {
+    const resetMinuteWindow = (s: TeamState) => {
       const now = Date.now()
-      if (now - minuteWindowStart.value >= 60_000) {
-        tokensUsedThisMinute = 0
-        minuteWindowStart.value = now
+      if (now - s.minuteWindowStart >= 60_000) {
+        s.tokensUsedThisMinute = 0
+        s.minuteWindowStart = now
       }
     }
 
-    const hasBudget = (tokens: number): boolean => {
-      resetMinuteWindow()
-      return tokensUsedThisMinute + tokens <= RATE_LIMIT_TOKENS_PER_MIN
+    const hasBudget = (s: TeamState, tokens: number): boolean => {
+      resetMinuteWindow(s)
+      return s.tokensUsedThisMinute + tokens <= RATE_LIMIT_TOKENS_PER_MIN
     }
 
-    const canProceed = (tokens: number): boolean =>
-      activeCalls < RATE_LIMIT_MAX_CONCURRENT
-      && hasBudget(tokens)
-      && !isCircuitBreakerActive()
-
-    const isCircuitBreakerActive = (): boolean => {
-      if (!circuitBreakerOpen) return false
-      if (Date.now() >= circuitBreakerOpenUntil) {
-        circuitBreakerOpen = false
-        consecutive429s = 0
+    const isCircuitBreakerActive = (s: TeamState): boolean => {
+      if (!s.circuitBreakerOpen) return false
+      if (Date.now() >= s.circuitBreakerOpenUntil) {
+        s.circuitBreakerOpen = false
+        s.consecutive429s = 0
         return false
       }
       return true
     }
 
-    const sortQueue = () => {
-      queue.sort((a, b) => {
+    const canProceed = (s: TeamState, tokens: number): boolean =>
+      s.activeCalls < RATE_LIMIT_MAX_CONCURRENT
+      && hasBudget(s, tokens)
+      && !isCircuitBreakerActive(s)
+
+    const sortQueue = (s: TeamState) => {
+      s.queue.sort((a, b) => {
         const priorityDiff = PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]
         if (priorityDiff !== 0) return priorityDiff
         return a.enqueuedAt - b.enqueuedAt
       })
     }
 
-    const processQueue = Effect.fn("RateLimiter.processQueue")(
-      function* () {
-        sortQueue()
+    const processQueue = (teamID: TeamID) =>
+      Effect.fn("RateLimiter.processQueue")(
+        function* () {
+          const s = getOrCreateTeamState(teamID)
+          sortQueue(s)
 
-        while (queue.length > 0) {
-          const next = queue[0]
-          if (!canProceed(next.estimatedTokens)) break
+          while (s.queue.length > 0) {
+            const next = s.queue[0]
+            if (!canProceed(s, next.estimatedTokens)) break
 
-          queue.shift()
-          activeCalls++
-          tokensUsedThisMinute += next.estimatedTokens
-          yield* Deferred.succeed(next.deferred, undefined)
-        }
-      },
-    )
+            s.queue.shift()
+            s.activeCalls++
+            s.tokensUsedThisMinute += next.estimatedTokens
+            yield* Deferred.succeed(next.deferred, undefined)
+          }
+        },
+      )()
+
+    // ---- public Interface ----
 
     const acquire = Effect.fn("RateLimiter.acquire")(
-      function* (engineerID: EngineerID, priority: Priority, estimatedTokens: number) {
-        if (isCircuitBreakerActive()) {
-          const remaining = circuitBreakerOpenUntil - Date.now()
+      function* (teamID: TeamID, engineerID: EngineerID, priority: Priority, estimatedTokens: number) {
+        const s = getOrCreateTeamState(teamID)
+
+        if (isCircuitBreakerActive(s)) {
+          const remaining = s.circuitBreakerOpenUntil - Date.now()
           yield* new CircuitBreakerOpenError({ engineerID, remainingMs: remaining })
         }
 
-        if (canProceed(estimatedTokens)) {
-          activeCalls++
-          tokensUsedThisMinute += estimatedTokens
+        if (canProceed(s, estimatedTokens)) {
+          s.activeCalls++
+          s.tokensUsedThisMinute += estimatedTokens
           return
         }
 
@@ -144,31 +184,33 @@ export const layer = Layer.effect(
           deferred,
           enqueuedAt: Date.now(),
         }
-        queue.push(request)
+        s.queue.push(request)
 
-        yield* processQueue()
+        yield* processQueue(teamID)
 
         yield* Deferred.await(deferred)
       },
     )
 
     const release = Effect.fn("RateLimiter.release")(
-      function* (_engineerID: EngineerID, _tokensUsed: number) {
-        activeCalls = Math.max(0, activeCalls - 1)
-        yield* processQueue()
+      function* (teamID: TeamID, _engineerID: EngineerID, _tokensUsed: number) {
+        const s = getOrCreateTeamState(teamID)
+        s.activeCalls = Math.max(0, s.activeCalls - 1)
+        yield* processQueue(teamID)
       },
     )
 
     const report429 = Effect.fn("RateLimiter.report429")(
-      function* (engineerID: EngineerID) {
-        consecutive429s++
+      function* (teamID: TeamID, engineerID: EngineerID) {
+        const s = getOrCreateTeamState(teamID)
+        s.consecutive429s++
 
-        if (consecutive429s < CIRCUIT_BREAKER_THRESHOLD) return
+        if (s.consecutive429s < CIRCUIT_BREAKER_THRESHOLD) return
 
-        circuitBreakerOpen = true
-        circuitBreakerOpenUntil = Date.now() + CIRCUIT_BREAKER_BLOCK_MS
+        s.circuitBreakerOpen = true
+        s.circuitBreakerOpenUntil = Date.now() + CIRCUIT_BREAKER_BLOCK_MS
 
-        const pending = queue.splice(0)
+        const pending = s.queue.splice(0)
         for (const req of pending) {
           yield* Deferred.fail(req.deferred, new CircuitBreakerOpenError({
             engineerID: req.engineerID,
@@ -179,21 +221,30 @@ export const layer = Layer.effect(
     )
 
     const resetCircuitBreaker = Effect.fn("RateLimiter.resetCircuitBreaker")(
-      function* () {
-        circuitBreakerOpen = false
-        circuitBreakerOpenUntil = 0
-        consecutive429s = 0
+      function* (teamID: TeamID) {
+        const s = getOrCreateTeamState(teamID)
+        s.circuitBreakerOpen = false
+        s.circuitBreakerOpenUntil = 0
+        s.consecutive429s = 0
       },
     )
 
-    const getStats = (): RateLimiterStats => ({
-      activeCalls,
-      queuedCalls: queue.length,
-      tokensUsedThisMinute,
-      tokensBudgetPerMinute: RATE_LIMIT_TOKENS_PER_MIN,
-      circuitBreakerOpen: isCircuitBreakerActive(),
-      consecutive429s,
-    })
+    const getStats = (teamID: TeamID): RateLimiterStats | null => {
+      const s = teamStates.get(teamID)
+      if (!s) return null
+      return {
+        activeCalls: s.activeCalls,
+        queuedCalls: s.queue.length,
+        tokensUsedThisMinute: s.tokensUsedThisMinute,
+        tokensBudgetPerMinute: RATE_LIMIT_TOKENS_PER_MIN,
+        circuitBreakerOpen: isCircuitBreakerActive(s),
+        consecutive429s: s.consecutive429s,
+      }
+    }
+
+    const forgetTeam = (teamID: TeamID): void => {
+      teamStates.delete(teamID)
+    }
 
     return Service.of({
       acquire,
@@ -201,6 +252,7 @@ export const layer = Layer.effect(
       report429,
       resetCircuitBreaker,
       getStats,
+      forgetTeam,
     })
   }),
 )

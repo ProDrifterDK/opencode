@@ -19,27 +19,38 @@ describe("team slash commands", () => {
     const content = fs.readFileSync(path.join(COMMAND_DIR, "team-start.md"), "utf8")
     const parsed = matter(content)
 
+    // The prompt MUST talk in terms of LLM-callable tools (team_*), not
+    // Effect service names (SessionCoordinator / LeadCoordinator /
+    // spawnEngineer) — the original prompt instructed the LLM to call
+    // Effect methods directly, which LLMs can't do (see
+    // docs/superpowers/specs/2026-04-22-team-tools-design.md, Problem
+    // Statement).
     expect(parsed.data.description).toBeString()
     expect(parsed.data.description.length).toBeGreaterThan(0)
     expect(parsed.data.subtask).toBe(false)
     expect(parsed.content).toInclude("$ARGUMENTS")
-    expect(parsed.content).toInclude("LeadCoordinator")
-    expect(parsed.content).toInclude("SessionCoordinator")
-    expect(parsed.content).toInclude("decompose")
-    expect(parsed.content).toInclude("spawnEngineer")
-    expect(parsed.content).toInclude("assign")
+    expect(parsed.content).toInclude("team_create")
+    expect(parsed.content).toInclude("team_decompose")
+    expect(parsed.content).toInclude("team_spawn")
+    expect(parsed.content).toInclude("team_monitor")
+    expect(parsed.content).toInclude("team_dissolve")
   })
 
   test("team-status has correct frontmatter and template", () => {
     const content = fs.readFileSync(path.join(COMMAND_DIR, "team-status.md"), "utf8")
     const parsed = matter(content)
 
+    // Like team-start, the prompt must reference LLM-callable tool
+    // names (team_*), not Effect service methods. `monitor` and
+    // `ProgressReport` remain as natural-language concepts in the
+    // prompt body, but the actionable API is `team_monitor` /
+    // `team_roster`.
     expect(parsed.data.description).toBeString()
     expect(parsed.data.description.length).toBeGreaterThan(0)
     expect(parsed.data.subtask).toBe(false)
-    expect(parsed.content).toInclude("monitor")
-    expect(parsed.content).toInclude("formatStatus")
-    expect(parsed.content).toInclude("listTeamEngineers")
+    expect(parsed.content).toInclude("team_monitor")
+    expect(parsed.content).toInclude("team_roster")
+    expect(parsed.content).toInclude("$ARGUMENTS")
     expect(parsed.content).toInclude("ProgressReport")
   })
 
@@ -47,11 +58,15 @@ describe("team slash commands", () => {
     const content = fs.readFileSync(path.join(COMMAND_DIR, "team-stop.md"), "utf8")
     const parsed = matter(content)
 
+    // The prompt must talk in LLM-callable tool names. The actual
+    // tools are `team_kill` (single engineer) and `team_dissolve`
+    // (whole team), not the old Effect-service pseudo-API
+    // (`killEngineer` / `dissolveTeam`).
     expect(parsed.data.description).toBeString()
     expect(parsed.data.description.length).toBeGreaterThan(0)
     expect(parsed.data.subtask).toBe(false)
-    expect(parsed.content).toInclude("killEngineer")
-    expect(parsed.content).toInclude("dissolveTeam")
+    expect(parsed.content).toInclude("team_kill")
+    expect(parsed.content).toInclude("team_dissolve")
     expect(parsed.content).toInclude("$ARGUMENTS")
   })
 

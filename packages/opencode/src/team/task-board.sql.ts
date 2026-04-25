@@ -23,6 +23,7 @@ export interface Task {
   file_scope: string | null
   blocked_by: TaskBoardID | null
   parent_task_id: TaskBoardID | null
+  dependencies: readonly TaskBoardID[]
   time_created: number
   time_updated: number
   completed_at: number | null
@@ -37,6 +38,7 @@ export interface CreateTaskInput {
   file_scope?: string | null
   blocked_by?: TaskBoardID | null
   parent_task_id?: TaskBoardID | null
+  dependencies?: readonly TaskBoardID[]
 }
 
 export interface UpdateTaskInput {
@@ -48,6 +50,7 @@ export interface UpdateTaskInput {
   blocked_by?: TaskBoardID | null
   parent_task_id?: TaskBoardID | null
   completed_at?: number | null
+  dependencies?: readonly TaskBoardID[]
 }
 
 export interface TaskBoardFilter {
@@ -76,6 +79,7 @@ export const TaskBoardTable = sqliteTable(
     file_scope: text(),
     blocked_by: text().$type<TaskBoardID>(),
     parent_task_id: text().$type<TaskBoardID>(),
+    dependencies: text().notNull().default("[]"),
     ...Timestamps,
     completed_at: integer(),
   },

@@ -59,6 +59,18 @@ export class TaskBoardFullError extends Schema.TaggedErrorClass<TaskBoardFullErr
   }
 }
 
+export class TaskDependenciesNotMetError extends Schema.TaggedErrorClass<TaskDependenciesNotMetError>()(
+  "TaskDependenciesNotMetError",
+  {
+    taskId: Schema.String,
+    unmetDependencies: Schema.Array(Schema.String),
+  },
+) {
+  override get message() {
+    return `Task ${this.taskId} has unmet dependencies: ${this.unmetDependencies.join(", ")}`
+  }
+}
+
 // ─── Status transition map ─────────────────────────────────────────────────────
 
 const ALLOWED_TRANSITIONS: Record<TaskStatus, Set<TaskStatus>> = {
@@ -79,6 +91,7 @@ type Err =
   | OwnershipDeniedError
   | InvalidStatusTransitionError
   | TaskBoardFullError
+  | TaskDependenciesNotMetError
   | TaskBoardRepoError
 
 export interface Interface {
@@ -125,6 +138,8 @@ export interface Interface {
     engineerId: EngineerID,
   ) => Effect.Effect<Task[], Err>
   readonly listBlocked: (teamId: TeamID) => Effect.Effect<Task[], Err>
+  readonly listReadyTasks: (teamId: TeamID) => Effect.Effect<Task[], Err>
+  readonly checkDependencies: (taskId: TaskBoardID) => Effect.Effect<void, Err>
 }
 
 // ─── Ownership check ───────────────────────────────────────────────────────────
@@ -187,6 +202,10 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
               to: input.status,
             })
           }
+          // Reject claim/start if dependencies are not all completed
+          if (input.status === "in-progress" && task!.status === "pending") {
+            yield* checkDependencies(taskId)
+          }
         }
         const oldStatus = task!.status
         const updated = yield* repo.update(taskId, input)
@@ -205,6 +224,10 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
               taskId,
               engineerID: updated.assigned_engineer_id,
             })
+          }
+
+          if (updated.status === "completed") {
+            yield* repo.update(taskId, { completed_at: Date.now() })
           }
         }
 
@@ -325,6 +348,26 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
       },
     )
 
+    const listReadyTasks = Effect.fn("TaskBoardService.listReadyTasks")(
+      function* (teamId: TeamID) {
+        return yield* repo.listReadyTasks(teamId)
+      },
+    )
+
+    const checkDependencies = Effect.fn("TaskBoardService.checkDependencies")(
+      function* (taskId: TaskBoardID) {
+        const task = yield* repo.get(taskId)
+        if (!task) return
+        if (task.dependencies.length === 0) return
+        const allTasks = yield* repo.list({ team_id: task.team_id })
+        const completedIds = new Set(allTasks.filter((t) => t.status === "completed").map((t) => t.id))
+        const unmet = task.dependencies.filter((depId) => !completedIds.has(depId))
+        if (unmet.length > 0) {
+          yield* new TaskDependenciesNotMetError({ taskId, unmetDependencies: unmet as string[] })
+        }
+      },
+    )
+
     return Service.of({
       createTask,
       updateTaskStatus,
@@ -338,6 +381,8 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
       listByStatus,
       listByEngineer,
       listBlocked,
+      listReadyTasks,
+      checkDependencies,
     })
   }),
 )

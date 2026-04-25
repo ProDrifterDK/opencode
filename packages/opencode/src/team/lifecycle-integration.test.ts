@@ -253,6 +253,7 @@ const memTaskBoard = TaskBoardRepoService.of({
         file_scope: input.file_scope ?? null,
         blocked_by: input.blocked_by ?? null,
         parent_task_id: input.parent_task_id ?? null,
+        dependencies: input.dependencies ?? [],
         time_created: now,
         time_updated: now,
         completed_at: null,
@@ -275,6 +276,7 @@ const memTaskBoard = TaskBoardRepoService.of({
         blocked_by: input.blocked_by !== undefined ? input.blocked_by : existing.blocked_by,
         parent_task_id: input.parent_task_id !== undefined ? input.parent_task_id : existing.parent_task_id,
         completed_at: input.completed_at !== undefined ? input.completed_at : existing.completed_at,
+        dependencies: input.dependencies !== undefined ? input.dependencies : existing.dependencies,
         time_updated: Date.now(),
       }
       tasks.set(taskId, updated)
@@ -296,6 +298,18 @@ const memTaskBoard = TaskBoardRepoService.of({
 
   delete: (taskId: TaskBoardID) =>
     Effect.sync(() => { tasks.delete(taskId) }),
+
+  listReadyTasks: (teamId: TeamID) =>
+    Effect.sync(() => {
+      const all = [...tasks.values()].filter((t) => t.team_id === teamId)
+      const completedIds = new Set(all.filter((t) => t.status === "completed").map((t) => t.id))
+      return all.filter(
+        (t) =>
+          t.status === "pending" &&
+          !t.assigned_engineer_id &&
+          t.dependencies.every((depId) => completedIds.has(depId)),
+      )
+    }),
 })
 
 const memLead = LeadCoordinatorService.of({
@@ -340,6 +354,15 @@ const memGit = GitManagerService.of({
       hasConflicts: false,
       conflictingFiles: [],
     }),
+  commitOnCurrentBranch: () => Effect.void,
+  createEngineerWorktree: (input) =>
+    Effect.succeed({
+      worktreePath: `/tmp/worktrees/${input.teamID}/${input.engineerID}`,
+      branch: `team/${input.teamID}/engineer-${input.engineerID}`,
+    }),
+  removeEngineerWorktree: () => Effect.void,
+  commitInWorktree: () => Effect.void,
+  listEngineerWorktrees: () => Effect.succeed([] as const),
 })
 
 // ---------------------------------------------------------------------------
@@ -670,27 +693,27 @@ describe("Team Lifecycle Integration", () => {
 
       // Fill 4 slots
       for (let i = 0; i < 4; i++) {
-        yield* service.acquire(`eng_fill_${i}` as EngineerID, "engineer", 100).pipe(
+        yield* service.acquire(TEAM_ID, `eng_fill_${i}` as EngineerID, "engineer", 100).pipe(
           Effect.forkScoped,
         )
       }
 
       yield* Effect.sleep(5)
-      expect(service.getStats().activeCalls).toBe(4)
+      expect(service.getStats(TEAM_ID)?.activeCalls).toBe(4)
 
       // Queue 2 more
-      yield* service.acquire(ENG_A, "engineer", 100).pipe(Effect.forkScoped)
-      yield* service.acquire(ENG_B, "engineer", 100).pipe(Effect.forkScoped)
+      yield* service.acquire(TEAM_ID, ENG_A, "engineer", 100).pipe(Effect.forkScoped)
+      yield* service.acquire(TEAM_ID, ENG_B, "engineer", 100).pipe(Effect.forkScoped)
       yield* Effect.sleep(5)
 
-      expect(service.getStats().queuedCalls).toBe(2)
-      expect(service.getStats().activeCalls).toBe(4)
+      expect(service.getStats(TEAM_ID)?.queuedCalls).toBe(2)
+      expect(service.getStats(TEAM_ID)?.activeCalls).toBe(4)
 
-      return service.getStats()
+      return service.getStats(TEAM_ID)
     }))
 
-    expect(result.queuedCalls).toBe(2)
-    expect(result.activeCalls).toBe(4)
+    expect(result?.queuedCalls).toBe(2)
+    expect(result?.activeCalls).toBe(4)
   })
 
   // 9. Orphan detection: lead dies, engineers self-terminate
@@ -866,15 +889,15 @@ describe("Team Lifecycle Integration", () => {
     const error = await runRateLimiter(
       Effect.gen(function* () {
         const service = yield* RateLimiterService
-        yield* service.report429(ENG_A)
-        yield* service.report429(ENG_A)
-        yield* service.report429(ENG_A)
+        yield* service.report429(TEAM_ID, ENG_A)
+        yield* service.report429(TEAM_ID, ENG_A)
+        yield* service.report429(TEAM_ID, ENG_A)
 
-        const stats = service.getStats()
-        expect(stats.circuitBreakerOpen).toBe(true)
+        const stats = service.getStats(TEAM_ID)
+        expect(stats?.circuitBreakerOpen).toBe(true)
 
         // New request should fail
-        yield* service.acquire(ENG_B, "engineer", 100)
+        yield* service.acquire(TEAM_ID, ENG_B, "engineer", 100)
       }).pipe(Effect.flip),
     )
 

@@ -16,6 +16,8 @@ CREATE TABLE `engineer_slot` (
 	`name` text NOT NULL,
 	`state` text NOT NULL,
 	`current_task` text,
+	`agent_name` text,
+	`agent_color` text,
 	`started_at` integer,
 	`last_heartbeat` integer NOT NULL,
 	`time_created` integer NOT NULL,

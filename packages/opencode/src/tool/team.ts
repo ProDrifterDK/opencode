@@ -8,9 +8,17 @@ import { Mailbox } from "../team/mailbox"
 import { TeamID } from "../team/types"
 import type { EngineerStateRecord } from "../team/types"
 import { Event, publishTeamEvent } from "../team/events"
-import DESCRIPTION from "./team.txt"
+import { Provider } from "../provider"
+import { TeamDaemon } from "../team/daemon"
+import { HeartbeatMonitor } from "../team/heartbeat"
+import { GitManager } from "../team/git-manager"
+import { Agent } from "../agent/agent"
+import { Log } from "@/util"
 
-// Priority translation: 4-tier (tool) -> 3-tier (mailbox)
+const log = Log.create({ service: "tool.team" })
+// Priority translation: 4-tier (tool) -> 3-tier (mailbox).
+// Note: `high` and `normal` both collapse to `inbox` — documented design;
+// the 4-tier surface is for caller clarity, not distinct delivery semantics.
 type ToolPriority = "low" | "normal" | "high" | "urgent"
 type MailboxPriority = "urgent" | "inbox" | "queue"
 
@@ -27,13 +35,72 @@ function translatePriority(priority: ToolPriority): MailboxPriority {
   }
 }
 
+const toolErrorBoundary = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.tapError((error) =>
+      Effect.sync(() => console.error("[toolErrorBoundary]", error)),
+    ),
+  )
+
+// Role guards — previously copy-pasted 13 times.
+const requireLead = (ctx: Tool.Context, coordinator: any, action = "use this tool") =>
+  Effect.gen(function* () {
+    const isLead = yield* coordinator.isLead(ctx.sessionID)
+    if (!isLead) {
+      return yield* Effect.fail(new Error(`Only the team lead can ${action}`))
+    }
+  })
+
+const requireEngineer = (ctx: Tool.Context, coordinator: any, action = "use this tool") =>
+  Effect.gen(function* () {
+    const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
+    if (!isEngineer) {
+      return yield* Effect.fail(new Error(`Only engineers can ${action}`))
+    }
+  })
+
+// Per-tool descriptions. Previously every tool advertised the full 50-line
+// team.txt catalog, bloating the system prompt 16× with identical content.
+const TOOL_DESCRIPTIONS = {
+  team_create:
+    "Initialize a new team for a goal. Returns a teamID used by every later call. Lead-only; called ONCE per team.",
+  team_agents:
+    "List configured agents ({ name, description, ... }). Call this before team_spawn to pick an agent per subtask; match on description, not name. Lead-only.",
+  team_spawn:
+    "Create an engineer session with a task. REQUIRES an `agent` parameter from team_agents. Lead-only.",
+  team_decompose:
+    "Break a team goal into subtasks with non-overlapping file scopes. Lead-only.",
+  team_assign:
+    "Auto-assign pending tasks to idle engineers using file-scope matching. Lead-only.",
+  team_reassign: "Move a task from one engineer to another. Lead-only.",
+  team_kill:
+    "Terminate a single engineer session and release its task to pending. Lead-only.",
+  team_monitor:
+    "Aggregate progress report for a team. Call on-demand only — do NOT poll; engineers notify the lead through team_inbox.",
+  team_inbox: "Read unread messages addressed to you (fast, no aggregate status).",
+  team_message:
+    "Send a message to another session. Recipient is an engineer ID or 'lead'.",
+  team_roster:
+    "List all teammates with IDs and current state. Use before team_message to resolve engineer IDs.",
+  team_tasks: "List pending, unassigned tasks that can be claimed.",
+  team_claim: "Claim an unassigned task to start working on it. Engineer-only.",
+  team_status: "Report current state and progress. Engineer-only.",
+  team_report:
+    "Report task completion, failure, or blocked status. Engineer-only; required at end of a task.",
+  team_dissolve:
+    "Gracefully shut down a team when all tasks are complete. Lead-only.",
+  team_commit:
+    "Squash-merge each completed engineer's branch into the lead's current branch using the engineer's task title as the commit message. Conflicts are surfaced and require manual resolution. Lead-only.",
+} as const
+
 export const TeamCreateTool = Tool.define(
   "team_create",
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
+    const daemon = yield* TeamDaemon.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_create,
       parameters: z.object({
         goal: z.string().describe("The goal or mission for the team to accomplish"),
       }),
@@ -44,12 +111,27 @@ export const TeamCreateTool = Tool.define(
             return yield* Effect.fail(new Error("A team already exists for this session"))
           }
 
+          // Start the team daemon (ensures event subscriptions are active)
+          yield* daemon.start()
+
           const teamID = TeamID.ascending()
           const record = yield* coordinator.createTeam({
             teamID,
             leadSessionID: ctx.sessionID,
             goal: params.goal,
           })
+
+          const heartbeatMonitor = yield* HeartbeatMonitor.Service
+          yield* heartbeatMonitor.startTeamMonitoring(record.teamID, record.leadSessionID).pipe(
+            Effect.catchAll((err) =>
+              Effect.sync(() =>
+                log.warn("failed to start heartbeat monitoring", {
+                  teamID: record.teamID,
+                  error: String(err),
+                }),
+              ),
+            ),
+          )
 
           const output = [
             `Team created successfully.`,
@@ -68,7 +150,7 @@ export const TeamCreateTool = Tool.define(
               state: record.state,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -80,7 +162,7 @@ export const TeamMonitorTool = Tool.define(
     const mailbox = yield* Mailbox.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_monitor,
       parameters: z.object({
         teamID: z.string().describe("The team ID to monitor"),
       }),
@@ -117,7 +199,7 @@ export const TeamMonitorTool = Tool.define(
               unreadMessages: messages.length,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -130,10 +212,7 @@ const teamSpawnParams = z.object({
     description: z.string().describe("Task description"),
     fileScope: z.array(z.string()).optional().describe("Files this task may modify"),
   }),
-  model: z.object({
-    providerID: z.string().describe("Provider ID (e.g., 'anthropic', 'openai')"),
-    modelID: z.string().describe("Model ID (e.g., 'claude-sonnet-4-20250514', 'gpt-4o')"),
-  }).optional().describe("Optional LLM model for this engineer. Defaults to current session's model."),
+  agent: z.string().optional().describe("Agent name to use for this engineer (use team_agents to list). If not specified, uses session's default model."),
 })
 
 export const TeamSpawnTool = Tool.define(
@@ -141,9 +220,10 @@ export const TeamSpawnTool = Tool.define(
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
+    const agentService = yield* Agent.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_spawn,
       parameters: teamSpawnParams,
       execute: (params: z.infer<typeof teamSpawnParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -152,11 +232,33 @@ export const TeamSpawnTool = Tool.define(
             return yield* Effect.fail(new Error("Only the lead can spawn engineers"))
           }
 
+          // Resolve agent to get model configuration and color
+          let modelConfig: { providerID: string; modelID: string } | undefined
+          let agentName: string | undefined
+          let agentColor: string | undefined
+          if (params.agent) {
+            const agents = yield* agentService.list()
+            const agent = agents.find(a => a.name.toLowerCase() === params.agent!.toLowerCase())
+            if (!agent) {
+              return yield* Effect.fail(new Error(`Agent "${params.agent}" not found. Use team_agents to list available agents.`))
+            }
+            agentName = agent.name
+            agentColor = agent.color
+            if (agent.model) {
+              modelConfig = {
+                providerID: agent.model.providerID,
+                modelID: agent.model.modelID,
+              }
+            }
+          }
+
           const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
           const engineerSlot = yield* coordinator.spawnEngineer({
             teamID,
             leadSessionID: ctx.sessionID,
             name: params.name,
+            agentName,
+            agentColor,
           })
 
           const fileScope = params.task.fileScope
@@ -187,12 +289,14 @@ export const TeamSpawnTool = Tool.define(
             taskID: task.id,
             taskTitle: params.task.title,
             taskDescription: params.task.description,
-            providerID: params.model?.providerID,
-            modelID: params.model?.modelID,
+            providerID: modelConfig?.providerID,
+            modelID: modelConfig?.modelID,
+            agentName,
+            agentColor,
           })
 
-          const modelInfo = params.model
-            ? `Model: ${params.model.providerID}/${params.model.modelID}`
+          const modelInfo = agentName
+            ? `Agent: ${agentName}` + (modelConfig ? ` (${modelConfig.providerID}/${modelConfig.modelID})` : " (session default model)")
             : "Model: (session default)"
 
           const output = [
@@ -215,7 +319,7 @@ export const TeamSpawnTool = Tool.define(
               taskID: task.id,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -231,7 +335,7 @@ export const TeamAssignTool = Tool.define(
     const lead = yield* LeadCoordinator.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_assign,
       parameters: teamAssignParams,
       execute: (params: z.infer<typeof teamAssignParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -256,10 +360,15 @@ export const TeamAssignTool = Tool.define(
             }
           }
 
-          const output = [
-            `Tasks assigned: ${assigned.length}`,
-            ...assigned.map((t) => `  - ${t.title} → engineer ${t.assigned_engineer_id}`),
-          ].join("\n")
+          let output: string
+          if (assigned.length === 0) {
+            output = "No ready tasks to assign. All pending tasks may be waiting for dependencies to complete, or no idle engineers are available."
+          } else {
+            output = [
+              `Tasks assigned: ${assigned.length}`,
+              ...assigned.map((t) => `  - ${t.title} → engineer ${t.assigned_engineer_id}`),
+            ].join("\n")
+          }
 
           return {
             title: `Assign tasks for team ${params.teamID}`,
@@ -273,7 +382,7 @@ export const TeamAssignTool = Tool.define(
               })),
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -283,12 +392,17 @@ const teamDecomposeParams = z.object({
   subtasks: z
     .array(
       z.object({
+        id: z.string().optional().describe("Optional client-side identifier for dependency references"),
         title: z.string(),
         description: z.string(),
         files: z.array(z.string()).default([]),
+        dependencies: z
+          .array(z.string())
+          .optional()
+          .describe("IDs of subtasks (from `id` field) that must complete before this one can start"),
       }),
     )
-    .describe("Subtasks to create (pre-parsed by LLM)"),
+    .describe("Subtasks to create (pre-parsed by LLM). Use `id` + `dependencies` to declare execution order."),
 })
 
 export const TeamDecomposeTool = Tool.define(
@@ -298,7 +412,7 @@ export const TeamDecomposeTool = Tool.define(
     const lead = yield* LeadCoordinator.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_decompose,
       parameters: teamDecomposeParams,
       execute: (params: z.infer<typeof teamDecomposeParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -310,7 +424,13 @@ export const TeamDecomposeTool = Tool.define(
           const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
           const tasks = yield* lead.decompose({
             teamId: teamID,
-            subtasks: params.subtasks,
+            subtasks: params.subtasks.map((s) => ({
+              id: s.id,
+              title: s.title,
+              description: s.description,
+              files: s.files,
+              dependencies: s.dependencies,
+            })),
             request: `Decomposed into ${params.subtasks.length} subtasks`,
           })
 
@@ -327,7 +447,7 @@ export const TeamDecomposeTool = Tool.define(
               tasks: tasks.map((t) => ({ taskID: t.id, title: t.title })),
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -344,7 +464,7 @@ export const TeamReassignTool = Tool.define(
     const lead = yield* LeadCoordinator.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_reassign,
       parameters: teamReassignParams,
       execute: (params: z.infer<typeof teamReassignParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -379,7 +499,7 @@ export const TeamReassignTool = Tool.define(
               toEngineerID: params.toEngineerID,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -395,7 +515,7 @@ export const TeamKillTool = Tool.define(
     const taskBoard = yield* TaskBoardRepo.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_kill,
       parameters: teamKillParams,
       execute: (params: z.infer<typeof teamKillParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -439,7 +559,7 @@ export const TeamKillTool = Tool.define(
               tasksReassigned: inProgressTasks.length,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -457,7 +577,7 @@ export const TeamMessageTool = Tool.define(
     const mailbox = yield* Mailbox.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_message,
       parameters: teamMessageParams,
       execute: (params: z.infer<typeof teamMessageParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -512,7 +632,7 @@ export const TeamMessageTool = Tool.define(
               priority: params.priority,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -530,7 +650,7 @@ export const TeamStatusTool = Tool.define(
     const taskBoard = yield* TaskBoardRepo.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_status,
       parameters: teamStatusParams,
       execute: (params: z.infer<typeof teamStatusParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -602,7 +722,7 @@ export const TeamStatusTool = Tool.define(
               currentTask: engineer.currentTask ?? null,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -618,9 +738,10 @@ export const TeamDissolveTool = Tool.define(
     const coordinator = yield* SessionCoordinator.Service
     const lead = yield* LeadCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
+    const gitManager = yield* GitManager.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_dissolve,
       parameters: teamDissolveParams,
       execute: (params: z.infer<typeof teamDissolveParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -653,9 +774,30 @@ export const TeamDissolveTool = Tool.define(
 
           yield* coordinator.dissolveTeam({ teamID })
 
+          const hbMonitor = yield* HeartbeatMonitor.Service
+          yield* hbMonitor.stopTeamMonitoring(teamID).pipe(Effect.ignore)
+
+          // Delete any team/<teamID>/* git branches that were created for
+          // this team. If no branches were created (current behavior, since
+          // the daemon does not auto-checkout per engineer) this is a
+          // no-op. Git errors are swallowed — the team is logically
+          // dissolved regardless of whether branch cleanup succeeds.
+const branchCleanup = yield* gitManager
+            .cleanupBranches(teamID)
+            .pipe(
+              Effect.map(() => ({ cleaned: true, error: null as string | null })),
+              Effect.tapError((err) =>
+                Effect.sync(() => ({ cleaned: false, error: String(err) })),
+              ),
+              Effect.mapError(() => ({ cleaned: false, error: "cleanup failed" as string | null })),
+            )
+
           const output = [
             `Team ${params.teamID} dissolved.`,
             `Engineers terminated: ${engineerCount}`,
+            branchCleanup.cleaned
+              ? `Git branches cleaned.`
+              : `Git branch cleanup skipped: ${branchCleanup.error}`,
           ].join("\n")
 
           return {
@@ -667,7 +809,129 @@ export const TeamDissolveTool = Tool.define(
               forced: params.force,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
+    }
+  }),
+)
+
+const teamCommitParams = z.object({
+  teamID: z.string().describe("Team ID from team_create"),
+})
+
+export const TeamCommitTool = Tool.define(
+  "team_commit",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const gitManager = yield* GitManager.Service
+    const taskBoard = yield* TaskBoardRepo.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_commit,
+      parameters: teamCommitParams,
+      execute: (params: z.infer<typeof teamCommitParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const isLead = yield* coordinator.isLead(ctx.sessionID)
+          if (!isLead) {
+            return yield* Effect.fail(new Error("Only the lead can commit team work"))
+          }
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+
+          // Fetch all tasks for the team and find completed ones with an assigned engineer
+          const allTasks = yield* taskBoard.list({ team_id: teamID })
+          const completedTasks = allTasks.filter(
+            (t) => t.status === "completed" && t.assigned_engineer_id !== null,
+          )
+
+          // Also check engineers listed on the team to handle the "skipped" reporting
+          const engineers = yield* coordinator.listTeamEngineers(teamID)
+
+          const merged: { engineerID: string; taskTitle: string }[] = []
+          const conflicts: { engineerID: string; branch: string; files: readonly string[] }[] = []
+          const skipped: { engineerID: string; reason: string }[] = []
+
+          // Collect engineers that are not idle/completed for the skipped list
+          for (const eng of engineers) {
+            if (eng.state !== "idle") {
+              const stateLabel =
+                eng.state === "working"
+                  ? "still running"
+                  : eng.state === "blocked"
+                    ? "blocked"
+                    : "failed"
+              skipped.push({ engineerID: eng.engineerID, reason: stateLabel })
+            }
+          }
+
+          // Process completed tasks — stop on first conflict
+          for (const task of completedTasks) {
+            const engineerID = task.assigned_engineer_id!
+
+            const mergeResult = yield* gitManager
+              .mergeBranch({
+                teamID,
+                engineerID: engineerID as import("../team/types").EngineerID,
+                message: task.title,
+              })
+              .pipe(
+                Effect.map(() => ({ ok: true as const })),
+                Effect.catchTag("MergeConflictError", (err) =>
+                  Effect.succeed({
+                    ok: false as const,
+                    branch: err.branch,
+                    files: err.conflictingFiles,
+                  }),
+                ),
+              )
+
+            if (mergeResult.ok) {
+              merged.push({ engineerID, taskTitle: task.title })
+            } else {
+              conflicts.push({ engineerID, branch: mergeResult.branch, files: mergeResult.files })
+              // Stop on first conflict — predictable behavior; user resolves and re-runs
+              break
+            }
+          }
+
+          const lines: string[] = []
+
+          if (merged.length === 0 && completedTasks.length === 0) {
+            lines.push("No engineers with completed tasks to merge.")
+          } else {
+            lines.push(`Merged ${merged.length} engineer${merged.length === 1 ? "" : "s"} into current branch:`)
+            for (const m of merged) {
+              lines.push(`  ✓ ${m.engineerID} (task: "${m.taskTitle}")`)
+            }
+          }
+
+          if (skipped.length > 0) {
+            lines.push(`Skipped ${skipped.length}: ${skipped.map((s) => `${s.engineerID} (${s.reason})`).join(", ")}`)
+          }
+
+          if (conflicts.length > 0) {
+            lines.push(`Conflicts ${conflicts.length}:`)
+            for (const c of conflicts) {
+              lines.push(`  ! ${c.engineerID} on branch ${c.branch}`)
+              if (c.files.length > 0) {
+                lines.push(`    Conflicting files: ${c.files.join(", ")}`)
+              }
+              lines.push(`    Resolve conflicts manually, then re-run team_commit.`)
+            }
+          } else {
+            lines.push(`Conflicts 0`)
+          }
+
+          return {
+            title: `Commit team ${params.teamID}`,
+            output: lines.join("\n"),
+            metadata: {
+              teamID: params.teamID,
+              merged: merged.map((m) => m.engineerID),
+              conflicts: conflicts.map((c) => ({ engineerID: c.engineerID, branch: c.branch })),
+              skipped: skipped.map((s) => s.engineerID),
+            },
+          }
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -685,7 +949,7 @@ export const TeamReportTool = Tool.define(
     const mailbox = yield* Mailbox.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_report,
       parameters: teamReportParams,
       execute: (params: z.infer<typeof teamReportParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -778,7 +1042,7 @@ export const TeamReportTool = Tool.define(
               engineerID: engineer.engineerID,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -791,7 +1055,7 @@ export const TeamInboxTool = Tool.define(
     const mailbox = yield* Mailbox.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_inbox,
       parameters: z.object({
         peek: z.boolean().optional().describe("If true, preview messages without marking as read"),
       }),
@@ -829,7 +1093,7 @@ export const TeamInboxTool = Tool.define(
               })),
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -842,7 +1106,7 @@ export const TeamRosterTool = Tool.define(
     const coordinator = yield* SessionCoordinator.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_roster,
       parameters: z.object({}),
       execute: (_params: Record<string, never>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -890,7 +1154,7 @@ export const TeamRosterTool = Tool.define(
               })),
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -904,7 +1168,7 @@ export const TeamTasksTool = Tool.define(
     const taskBoard = yield* TaskBoardRepo.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_tasks,
       parameters: z.object({
         showAll: z.boolean().optional().describe("Show all tasks including assigned ones (default: only unassigned)"),
       }),
@@ -916,16 +1180,33 @@ export const TeamTasksTool = Tool.define(
           }
 
           const allTasks = yield* taskBoard.list({ team_id: teamID })
-          const tasks = params.showAll
-            ? allTasks
-            : allTasks.filter((t) => t.status === "pending" && !t.assigned_engineer_id)
+          let tasks
+          if (params.showAll) {
+            tasks = allTasks
+          } else {
+            // Only show unblocked pending tasks (dependencies all completed)
+            const completedIds = new Set(allTasks.filter((t) => t.status === "completed").map((t) => t.id))
+            tasks = allTasks.filter(
+              (t) =>
+                t.status === "pending" &&
+                !t.assigned_engineer_id &&
+                t.dependencies.every((depId) => completedIds.has(depId)),
+            )
+          }
 
           if (tasks.length === 0) {
+            const blockedPending = allTasks.filter(
+              (t) => t.status === "pending" && !t.assigned_engineer_id,
+            )
+            const msg =
+              params.showAll
+                ? "No tasks in the team."
+                : blockedPending.length > 0
+                  ? `No claimable tasks right now — ${blockedPending.length} task(s) are waiting for dependencies. Use showAll=true to see all tasks.`
+                  : "No unassigned tasks available. Use showAll=true to see all tasks."
             return {
               title: "Available tasks",
-              output: params.showAll
-                ? "No tasks in the team."
-                : "No unassigned tasks available. Use showAll=true to see all tasks.",
+              output: msg,
               metadata: { taskCount: 0, tasks: [] },
             }
           }
@@ -964,7 +1245,7 @@ export const TeamTasksTool = Tool.define(
               })),
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -982,7 +1263,7 @@ export const TeamClaimTool = Tool.define(
     const taskBoard = yield* TaskBoardRepo.Service
 
     return {
-      description: DESCRIPTION,
+      description: TOOL_DESCRIPTIONS.team_claim,
       parameters: teamClaimParams,
       execute: (params: z.infer<typeof teamClaimParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -1015,6 +1296,20 @@ export const TeamClaimTool = Tool.define(
           // Task must be pending AND unassigned to be claimable
           if (task.status !== "pending") {
             return yield* Effect.fail(new Error(`Task is not claimable (status: ${task.status}). Only pending tasks can be claimed.`))
+          }
+
+          // Check that all dependencies are completed
+          if (task.dependencies.length > 0) {
+            const allTasks = yield* taskBoard.list({ team_id: task.team_id })
+            const completedIds = new Set(allTasks.filter((t) => t.status === "completed").map((t) => t.id))
+            const unmet = task.dependencies.filter((depId) => !completedIds.has(depId))
+            if (unmet.length > 0) {
+              return yield* Effect.fail(
+                new Error(
+                  `Task "${task.title}" cannot be claimed yet. Blocked by unfinished dependencies: ${unmet.join(", ")}`,
+                ),
+              )
+            }
           }
 
           if (task.assigned_engineer_id) {
@@ -1074,7 +1369,83 @@ export const TeamClaimTool = Tool.define(
               engineerID: engineer.engineerID,
             },
           }
-        }).pipe(Effect.orDie),
+        }).pipe(toolErrorBoundary),
+    }
+  }),
+)
+
+// ─── Team Agents Tool ──────────────────────────────────────────────────────
+
+const teamAgentsParams = z.object({
+  includeNative: z.boolean().optional().describe(
+    "Include native/built-in agents (default: false, only show user-configured agents)"
+  ),
+})
+
+export const TeamAgentsTool = Tool.define(
+  "team_agents",
+  Effect.gen(function* () {
+    const agentService = yield* Agent.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_agents,
+      parameters: teamAgentsParams,
+      execute: (params: z.infer<typeof teamAgentsParams>, _ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const allAgents = yield* agentService.list()
+          const defaultAgent = yield* agentService.defaultAgent()
+          const includeNative = params.includeNative ?? false
+
+          const agents = allAgents.filter((agent) => {
+            if (agent.hidden) return false
+            if (!includeNative && agent.native) return false
+            return true
+          })
+
+          if (agents.length === 0) {
+            return {
+              title: "No configured agents",
+              output: [
+                "No user-configured agents found.",
+                "",
+                "Engineers will use the session's default model.",
+                "",
+                "To configure agents, add them to your opencode config:",
+                "  ~/.config/opencode/config.json -> agents section",
+                "",
+                "Or use includeNative: true to see built-in agents.",
+              ].join("\n"),
+              metadata: { agentCount: 0, defaultAgent },
+            }
+          }
+
+          const lines = [
+            `Available agents for engineers:`,
+            "",
+            ...agents.map((agent) => {
+              const modelInfo = agent.model
+                ? `${agent.model.providerID}/${agent.model.modelID}`
+                : "(session default)"
+              const isDefault = agent.name === defaultAgent ? " [DEFAULT]" : ""
+              return [
+                `## ${agent.name}${isDefault}`,
+                agent.description ? `   ${agent.description}` : "",
+                `   Model: ${modelInfo}`,
+                "",
+              ].filter(Boolean).join("\n")
+            }),
+            "Usage in team_spawn:",
+            '  agent: "agent-name"',
+            "",
+            "If no agent specified, engineers use the session's default model.",
+          ]
+
+          return {
+            title: `Listed ${agents.length} agents`,
+            output: lines.join("\n"),
+            metadata: { agentCount: agents.length, defaultAgent, agents: agents.map((a) => a.name) },
+          }
+        }).pipe(toolErrorBoundary),
     }
   }),
 )
@@ -1094,10 +1465,12 @@ export const TeamTools = Effect.gen(function* () {
     TeamStatusTool,
     TeamReportTool,
     TeamDissolveTool,
+    TeamCommitTool,
     TeamInboxTool,
     TeamRosterTool,
     TeamTasksTool,
     TeamClaimTool,
+    TeamAgentsTool,
   ])
   return yield* Effect.all(infos.map(Tool.init))
 })

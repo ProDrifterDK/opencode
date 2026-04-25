@@ -1,12 +1,42 @@
 import { useProject } from "@tui/context/project"
 import { useSync } from "@tui/context/sync"
-import { createMemo, Show } from "solid-js"
+import { createMemo, For, Show } from "solid-js"
 import { useTheme } from "../../context/theme"
 import { useTuiConfig } from "../../context/tui-config"
 import { InstallationChannel, InstallationVersion } from "@/installation/version"
 import { TuiPluginRuntime } from "../../plugin"
 
 import { getScrollAcceleration } from "../../util/scroll"
+
+const ENGINEER_COLORS = [
+  "#ff6b6b", // coral red
+  "#4ecdc4", // teal
+  "#ffe66d", // yellow
+  "#95e1d3", // mint
+  "#f38181", // salmon
+  "#aa96da", // lavender
+  "#fcbad3", // pink
+  "#a8d8ea", // sky blue
+  "#ffd93d", // gold
+  "#6bcb77", // green
+  "#c9b1ff", // purple
+  "#ff9f45", // orange
+]
+
+function hashString(str: string): number {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i)
+    hash = hash & hash
+  }
+  return Math.abs(hash)
+}
+
+function getEngineerColor(name: string, agentName?: string): string {
+  const key = agentName || name
+  const index = hashString(key) % ENGINEER_COLORS.length
+  return ENGINEER_COLORS[index]
+}
 
 export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const project = useProject()
@@ -62,11 +92,6 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 <text fg={theme.text}>
                   <b>{session()!.title}</b>
                 </text>
-                <Show when={sync.data.team.record}>
-                  <text fg={theme.textMuted}>
-                    <span style={{ fg: theme.success }}>●</span> Team ({sync.data.team.engineers.length})
-                  </text>
-                </Show>
                 <Show when={InstallationChannel !== "latest"}>
                   <text fg={theme.textMuted}>{props.sessionID}</text>
                 </Show>

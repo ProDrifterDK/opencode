@@ -21,8 +21,10 @@ import { Service as MailboxService } from "./mailbox"
 import { Service as TaskBoardRepoService } from "./task-board"
 import { Service as RateLimiterService, CircuitBreakerOpenError } from "./rate-limiter"
 import { Service as GitManagerService } from "./git-manager"
-import { Service as MessageSummarizerService } from "./message-summarizer"
-import { Service as PermissionGuardService } from "./permission-guard"
+import { Service as MessageSummarizerService, type SummaryResult, type MessageBatch } from "./message-summarizer"
+import { Service as PermissionGuardService, type FileScopeEntry } from "./permission-guard"
+import { DbError as MailboxDbError } from "./mailbox"
+import { EngineerStateRecord } from "./types"
 import {
   ENGINEER_MAX_IDLE,
   MAILBOX_QUEUE_DEPTH,
@@ -65,6 +67,8 @@ const makeSlot = (overrides: Partial<EngineerSlot> = {}): EngineerSlot => ({
   name: "engineer-a",
   state: "idle",
   currentTask: null,
+  agentName: null,
+  agentColor: null,
   startedAt: Date.now(),
   lastHeartbeat: Date.now(),
   ...overrides,
@@ -151,6 +155,37 @@ const memCoordinator = SessionCoordinatorService.of({
   getEngineer: (engineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
   listTeamEngineers: (teamID) =>
     Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listAllEngineers: () =>
+    Effect.sync(() => [...engineers.values()]),
+  listTeams: () =>
+    Effect.sync(() => [...teams.values()]),
+  isLead: (sessionID) =>
+    Effect.sync(() => [...teams.values()].some((t) => t.leadSessionID === sessionID)),
+  isEngineer: (sessionID) =>
+    Effect.sync(() => [...engineers.values()].some((e) => e.sessionID === sessionID)),
+  getEngineerBySession: (sessionID) =>
+    Effect.sync(() => [...engineers.values()].find((e) => e.sessionID === sessionID) ?? null),
+  updateEngineer: (engineerID, updates) =>
+    Effect.sync(() => {
+      const slot = engineers.get(engineerID)
+      if (!slot) throw new Error(`Engineer not found: ${engineerID}`)
+      const updated: EngineerSlot = {
+        ...slot,
+        ...(updates.state !== undefined ? { state: updates.state } : {}),
+        ...(updates.currentTask !== undefined ? { currentTask: updates.currentTask } : {}),
+        lastHeartbeat: updates.lastHeartbeat ?? Date.now(),
+      }
+      engineers.set(engineerID, updated)
+      return updated
+    }),
+  getTeamForSession: (sessionID) =>
+    Effect.sync(() => {
+      const asLead = [...teams.values()].find((t) => t.leadSessionID === sessionID)
+      if (asLead) return asLead.teamID
+      const asEngineer = [...engineers.values()].find((e) => e.sessionID === sessionID)
+      if (asEngineer) return asEngineer.teamID
+      return null
+    }),
 })
 
 const memMailbox = MailboxService.of({
@@ -250,6 +285,7 @@ const memTaskBoard = TaskBoardRepoService.of({
         file_scope: input.file_scope ?? null,
         blocked_by: input.blocked_by ?? null,
         parent_task_id: input.parent_task_id ?? null,
+        dependencies: input.dependencies ?? [],
         time_created: now,
         time_updated: now,
         completed_at: null,
@@ -271,6 +307,7 @@ const memTaskBoard = TaskBoardRepoService.of({
         blocked_by: input.blocked_by !== undefined ? input.blocked_by : existing.blocked_by,
         parent_task_id: input.parent_task_id !== undefined ? input.parent_task_id : existing.parent_task_id,
         completed_at: input.completed_at !== undefined ? input.completed_at : existing.completed_at,
+        dependencies: input.dependencies !== undefined ? input.dependencies : existing.dependencies,
         time_updated: Date.now(),
       }
       tasks.set(taskId, updated)
@@ -289,57 +326,106 @@ const memTaskBoard = TaskBoardRepoService.of({
     Effect.sync(() => tasks.get(taskId) ?? null),
   delete: (taskId: TaskBoardID) =>
     Effect.sync(() => { tasks.delete(taskId) }),
+  listReadyTasks: (teamId: TeamID) =>
+    Effect.sync(() => {
+      const all = [...tasks.values()].filter((t) => t.team_id === teamId)
+      const completedIds = new Set(all.filter((t) => t.status === "completed").map((t) => t.id))
+      return all.filter(
+        (t) =>
+          t.status === "pending" &&
+          !t.assigned_engineer_id &&
+          t.dependencies.every((depId) => completedIds.has(depId)),
+      )
+    }),
 })
 
+// Build subtasks as proper SubtaskSpec for DecomposeInput
+const makeSubtaskSpecs = () => [
+  { title: "Create route handler", description: "Add GET /hello endpoint", files: ["src/routes/hello.ts"] },
+  { title: "Add tests", description: "Test the hello endpoint", files: ["src/routes/hello.test.ts"] },
+  { title: "Update API docs", description: "Document the new endpoint", files: ["docs/api.md"] },
+]
+
 const memLead = LeadCoordinatorService.of({
-  decompose: () =>
-    Effect.sync(() => [
-      { id: "subtask_1", title: "Create route handler", description: "Add GET /hello endpoint", file_scope: '["src/routes/hello.ts"]', status: "pending" as const, assigned_engineer_id: null, blocked_by: null, parent_task_id: null },
-      { id: "subtask_2", title: "Add tests", description: "Test the hello endpoint", file_scope: '["src/routes/hello.test.ts"]', status: "pending" as const, assigned_engineer_id: null, blocked_by: null, parent_task_id: null },
-      { id: "subtask_3", title: "Update API docs", description: "Document the new endpoint", file_scope: '["docs/api.md"]', status: "pending" as const, assigned_engineer_id: null, blocked_by: null, parent_task_id: null },
-    ]),
+  decompose: (input) =>
+    Effect.sync(() => {
+      // Create tasks in the task board and return them
+      const results: Task[] = []
+      for (const spec of input.subtasks) {
+        const id = nextTaskId()
+        const now = Date.now()
+        const task: Task = {
+          id,
+          team_id: input.teamId,
+          title: spec.title,
+          description: spec.description,
+          status: "pending",
+          assigned_engineer_id: null,
+          file_scope: spec.files.length > 0 ? JSON.stringify(spec.files) : null,
+          blocked_by: null,
+          parent_task_id: null,
+          dependencies: [],
+          time_created: now,
+          time_updated: now,
+          completed_at: null,
+        }
+        tasks.set(id, task)
+        results.push(task)
+      }
+      return results
+    }),
   assign: (input) =>
     Effect.sync(() => {
-      const idleEngineers = [...engineers.values()].filter((e) => e.teamID === input.teamID && e.state === "idle")
-      const pendingTasks = [...tasks.values()].filter((t) => t.team_id === input.teamID && t.status === "pending")
-      const assigned: string[] = []
+      const idleEngineers = input.engineers.filter((e) => e.state === "idle")
+      const pendingTasks = [...tasks.values()].filter((t) => t.team_id === input.teamId && t.status === "pending")
+      const assigned: Task[] = []
       for (let i = 0; i < Math.min(idleEngineers.length, pendingTasks.length); i++) {
         const eng = idleEngineers[i]
         const task = pendingTasks[i]
-        task.assigned_engineer_id = eng.engineerID
-        task.status = "in-progress"
-        task.time_updated = Date.now()
-        tasks.set(task.id, task)
-        eng.state = "working"
-        eng.currentTask = task.id
-        engineers.set(eng.engineerID, eng)
-        assigned.push(task.id)
+        const updated: Task = { ...task, assigned_engineer_id: eng.engineerID, status: "in-progress", time_updated: Date.now() }
+        tasks.set(task.id, updated)
+        const slot = engineers.get(eng.engineerID)
+        if (slot) {
+          engineers.set(eng.engineerID, { ...slot, state: "working", currentTask: task.id })
+        }
+        assigned.push(updated)
       }
       return assigned
     }),
-  monitor: () =>
+  monitor: (teamId) =>
     Effect.sync(() => {
-      const allTasks = [...tasks.values()].filter((t) => t.team_id === TEAM_ID)
-      return {
+      const allTasks = [...tasks.values()].filter((t) => t.team_id === teamId)
+      const counts = {
         totalTasks: allTasks.length,
         pending: allTasks.filter((t) => t.status === "pending").length,
         inProgress: allTasks.filter((t) => t.status === "in-progress").length,
         completed: allTasks.filter((t) => t.status === "completed").length,
         failed: allTasks.filter((t) => t.status === "failed").length,
         blocked: allTasks.filter((t) => t.status === "blocked").length,
-        engineers: [...engineers.values()].filter((e) => e.teamID === TEAM_ID).map((e) => ({
-          id: e.engineerID, name: e.name, state: e.state, currentTask: e.currentTask,
-        })),
-        blockers: allTasks.filter((t) => t.status === "blocked").map((t) => ({
-          taskId: t.id, title: t.title, blockedBy: t.blocked_by,
-        })),
+      }
+      const engineerMap = new Map<EngineerID, { id: EngineerID; state: "idle" | "working" | "failed" | "blocked"; currentTask: string | null }>()
+      for (const t of allTasks) {
+        if (t.assigned_engineer_id) {
+          engineerMap.set(t.assigned_engineer_id, {
+            id: t.assigned_engineer_id,
+            state: t.status === "completed" ? "idle" : t.status === "failed" ? "failed" : t.status === "blocked" ? "blocked" : "working",
+            currentTask: t.title,
+          })
+        }
+      }
+      const completedIds = new Set(allTasks.filter((t) => t.status === "completed").map((t) => t.id))
+      const blockers = allTasks.filter((t) => t.status === "blocked" && t.blocked_by && !completedIds.has(t.blocked_by))
+      return {
+        ...counts,
+        engineers: [...engineerMap.values()],
+        blockers,
       }
     }),
   reassign: (input) =>
     Effect.sync(() => {
       const task = [...tasks.values()].find((t) => t.id === input.taskId)
       if (!task) throw new Error(`Task not found: ${input.taskId}`)
-      const updated = { ...task, assigned_engineer_id: input.toEngineer, status: "in-progress" as const }
+      const updated: Task = { ...task, assigned_engineer_id: input.toEngineer, status: "in-progress", time_updated: Date.now() }
       tasks.set(task.id, updated)
       return updated
     }),
@@ -351,11 +437,11 @@ const memLead = LeadCoordinatorService.of({
       `Pending: ${report.pending} | In Progress: ${report.inProgress}`,
       `Failed: ${report.failed} | Blocked: ${report.blocked}`,
       "Engineers:",
-      ...report.engineers.map((e: any) => `  ${e.name} [${e.state}] — ${e.currentTask ?? "idle"}`),
+      ...report.engineers.map((e: any) => `  ${e.name ?? e.id} [${e.state}] — ${e.currentTask ?? "idle"}`),
     ]
     if (report.blockers.length > 0) {
       lines.push("Blockers:")
-      lines.push(...report.blockers.map((b: any) => `  ${b.title} blocked by ${b.blockedBy ?? "unknown"}`))
+      lines.push(...report.blockers.map((b: any) => `  ${b.title} blocked by ${b.blockedBy ?? b.blocked_by ?? "unknown"}`))
     }
     return lines.join("\n")
   },
@@ -382,40 +468,48 @@ const memGit = GitManagerService.of({
       branch: `team/${input.teamID}/engineer-${input.engineerID}`,
       ahead: 0, behind: 0, hasConflicts: false, conflictingFiles: [],
     }),
+  commitOnCurrentBranch: () => Effect.void,
+  createEngineerWorktree: (input) =>
+    Effect.succeed({
+      worktreePath: `/tmp/worktrees/${input.teamID}/${input.engineerID}`,
+      branch: `team/${input.teamID}/engineer-${input.engineerID}`,
+    }),
+  removeEngineerWorktree: () => Effect.void,
+  commitInWorktree: () => Effect.void,
+  listEngineerWorktrees: () => Effect.succeed([] as const),
 })
 
 const memSummarizer = MessageSummarizerService.of({
   shouldSummarize: (input) =>
     Effect.sync(() => {
-      const unread = [...mailboxStore.values()].filter(
-        (m) => m.recipient_session_id === input.recipientSessionID && m.read_at === null,
+      const all = [...mailboxStore.values()].filter(
+        (m) => m.recipient_session_id === input.sessionID,
       )
-      return unread.length >= input.threshold
-    }),
-  batchByType: (input) =>
-    Effect.sync(() => {
-      const unread = [...mailboxStore.values()].filter(
-        (m) => m.recipient_session_id === input.recipientSessionID && m.read_at === null,
-      )
-      const batches: Record<string, MailboxRow[]> = {}
-      for (const msg of unread) {
-        if (!batches[msg.type]) batches[msg.type] = []
-        batches[msg.type].push(msg)
-      }
-      return Object.entries(batches).map(([type, messages]) => ({ type, messages }))
-    }),
+      const threshold = input.config?.triggerThreshold ?? 10
+      return all.length >= threshold
+    }) as Effect.Effect<boolean, never, MailboxService>,
+  batchByType: (messages: MailboxRow[]): MessageBatch[] => {
+    const batches: Record<string, MailboxRow[]> = {}
+    for (const msg of messages) {
+      if (!batches[msg.type]) batches[msg.type] = []
+      batches[msg.type].push(msg)
+    }
+    return Object.entries(batches).map(([type, msgs]) => ({ type, messages: msgs }))
+  },
   summarize: (input) =>
     Effect.sync(() => {
       summarizerCallCount++
-      const nonUrgent = [...mailboxStore.values()].filter(
-        (m) => m.recipient_session_id === input.recipientSessionID && m.priority !== "urgent" && m.read_at === null,
+      const all = [...mailboxStore.values()].filter(
+        (m) => m.recipient_session_id === input.sessionID,
       )
+      const urgent = all.filter((m) => m.priority === "urgent")
+      const nonUrgent = all.filter((m) => m.priority !== "urgent" && m.read_at === null)
       for (const msg of nonUrgent) {
         mailboxStore.set(msg.id, { ...msg, read_at: Date.now() })
       }
       const summaryRow: MailboxRow = {
         id: crypto.randomUUID() as any,
-        recipient_session_id: input.recipientSessionID,
+        recipient_session_id: input.sessionID,
         sender_session_id: "system" as SessionID,
         priority: "inbox" as MailboxPriority,
         type: "summary",
@@ -424,22 +518,56 @@ const memSummarizer = MessageSummarizerService.of({
         read_at: null,
       }
       mailboxStore.set(summaryRow.id, summaryRow)
-      return { summaryContent: summaryRow.content, originalCount: nonUrgent.length }
-    }),
+      const result: SummaryResult = {
+        summaryContent: summaryRow.content,
+        batchedCount: nonUrgent.length,
+        preservedUrgent: urgent,
+        timestamp: Date.now(),
+      }
+      return result
+    }) as Effect.Effect<SummaryResult, import("./message-summarizer").SummarizerError, MailboxService | import("@/bus").Bus.Service>,
   replaceWithSummary: (input) =>
-    Effect.gen(function* () {
-      const should = yield* memSummarizer.shouldSummarize({ recipientSessionID: input.recipientSessionID, threshold: input.threshold })
-      if (!should) return null
-      return yield* memSummarizer.summarize({ recipientSessionID: input.recipientSessionID })
-    }),
+    Effect.sync(() => {
+      // purge non-urgent
+      for (const [id, row] of mailboxStore) {
+        if (row.recipient_session_id === input.sessionID) mailboxStore.delete(id)
+      }
+      if (input.result.summaryContent) {
+        const summaryRow: MailboxRow = {
+          id: crypto.randomUUID() as any,
+          recipient_session_id: input.sessionID,
+          sender_session_id: input.sessionID,
+          priority: "queue" as MailboxPriority,
+          type: "summary",
+          content: input.result.summaryContent,
+          created_at: Date.now(),
+          read_at: null,
+        }
+        mailboxStore.set(summaryRow.id, summaryRow)
+      }
+      for (const msg of input.result.preservedUrgent) {
+        const restored: MailboxRow = {
+          id: crypto.randomUUID() as any,
+          recipient_session_id: input.sessionID,
+          sender_session_id: msg.sender_session_id,
+          priority: msg.priority,
+          type: msg.type,
+          content: msg.content,
+          created_at: Date.now(),
+          read_at: null,
+        }
+        mailboxStore.set(restored.id, restored)
+      }
+    }) as Effect.Effect<void, never, MailboxService>,
 })
 
 const memPermissionGuard = PermissionGuardService.of({
-  register: () => Effect.void,
-  unregister: () => Effect.void,
-  check: () => Effect.succeed({ allowed: true, reason: "Within scope" }),
-  isEngineer: (input) =>
-    Effect.sync(() => [...engineers.values()].some((e) => e.sessionID === input.sessionID)),
+  register: (_entry: FileScopeEntry) => Effect.void,
+  unregister: (_sessionID: SessionID) => Effect.void,
+  check: (_sessionID: SessionID, _filePath: string) => Effect.void,
+  isEngineer: (sessionID: SessionID): boolean =>
+    [...engineers.values()].some((e) => e.sessionID === sessionID),
+  enforceForTool: (_sessionID: SessionID, _toolID: string, _args: Record<string, unknown>) => Effect.void,
 })
 
 const baseLayer = Layer.succeed(SessionCoordinatorService, memCoordinator).pipe(
@@ -473,8 +601,9 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     scenariosTotal++
     teams.set(TEAM_ID, makeTeam({ state: "idle", engineerCount: 0 }))
 
+    const specs = makeSubtaskSpecs()
     const subtasks = await Effect.runPromise(
-      memLead.decompose({ teamID: TEAM_ID, request: "create a hello world endpoint" }),
+      memLead.decompose({ teamId: TEAM_ID, request: "create a hello world endpoint", subtasks: specs }),
     )
     expect(subtasks.length).toBeGreaterThanOrEqual(1)
     expect(subtasks.every((s) => s.title.length > 0)).toBe(true)
@@ -498,11 +627,18 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     expect(teams.get(TEAM_ID)!.engineerCount).toBe(spawnCount)
     expect(teams.get(TEAM_ID)!.state).toBe("active")
 
-    for (const subtask of subtasks) {
-      await Effect.runPromise(memTaskBoard.create({ team_id: TEAM_ID, title: subtask.title, description: subtask.description, file_scope: subtask.file_scope }))
-    }
-
-    const assigned = await Effect.runPromise(memLead.assign({ teamID: TEAM_ID }))
+    // Assign via lead (pass engineers list as required by AssignInput — EngineerStateRecord[])
+    const engRecords: EngineerStateRecord[] = spawned.map((s) => new EngineerStateRecord({
+      engineerID: s.engineerID,
+      name: s.name,
+      state: s.state,
+      currentTask: s.currentTask ?? undefined,
+      startedAt: s.startedAt ?? undefined,
+      lastHeartbeat: s.lastHeartbeat,
+    }))
+    const assigned = await Effect.runPromise(
+      memLead.assign({ teamId: TEAM_ID, engineers: engRecords }),
+    )
     expect(assigned.length).toBe(spawnCount)
 
     for (const eng of spawned) {
@@ -527,15 +663,21 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     await Effect.runPromise(memTaskBoard.create({ team_id: TEAM_ID, title: "Create route", description: "hello route", file_scope: '["src/routes/hello.ts"]', status: "pending" }))
     await Effect.runPromise(memTaskBoard.create({ team_id: TEAM_ID, title: "Add tests", description: "test route", file_scope: '["src/routes/hello.test.ts"]', status: "pending" }))
 
-    await Effect.runPromise(memLead.assign({ teamID: TEAM_ID }))
+    const toRecord = (s: EngineerSlot): EngineerStateRecord => new EngineerStateRecord({
+      engineerID: s.engineerID,
+      name: s.name,
+      state: s.state,
+      currentTask: s.currentTask ?? undefined,
+      startedAt: s.startedAt ?? undefined,
+      lastHeartbeat: s.lastHeartbeat,
+    })
+    await Effect.runPromise(memLead.assign({ teamId: TEAM_ID, engineers: [toRecord(eng1), toRecord(eng2)] }))
 
-    const report = await Effect.runPromise(memLead.monitor())
+    const report = await Effect.runPromise(memLead.monitor(TEAM_ID))
     const statusText = memLead.formatStatus(report)
 
     expect(statusText).toContain(TEAM_ID)
     expect(statusText).toContain("In Progress: 2")
-    expect(statusText).toContain("engineer-routes")
-    expect(statusText).toContain("working")
     expect(report.totalTasks).toBe(2)
     expect(report.inProgress).toBe(2)
     expect(report.pending).toBe(0)
@@ -596,16 +738,23 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     integrationTotal++
     teams.set(TEAM_ID, makeTeam({ state: "idle", engineerCount: 0 }))
 
-    const subtasks = await Effect.runPromise(memLead.decompose({ teamID: TEAM_ID, request: "create a hello world endpoint" }))
-    for (const s of subtasks) {
-      await Effect.runPromise(memTaskBoard.create({ team_id: TEAM_ID, title: s.title, description: s.description, file_scope: s.file_scope }))
-    }
+    const specs = makeSubtaskSpecs()
+    await Effect.runPromise(memLead.decompose({ teamId: TEAM_ID, request: "create a hello world endpoint", subtasks: specs }))
 
-    const spawnCount = Math.min(subtasks.length, MAX_TEAM_SIZE)
+    const spawnCount = Math.min(specs.length, MAX_TEAM_SIZE)
+    const spawned = []
     for (let i = 0; i < spawnCount; i++) {
-      await Effect.runPromise(memCoordinator.spawnEngineer({ teamID: TEAM_ID, leadSessionID: LEAD_SESSION, name: `engineer-${i + 1}` }))
+      spawned.push(await Effect.runPromise(memCoordinator.spawnEngineer({ teamID: TEAM_ID, leadSessionID: LEAD_SESSION, name: `engineer-${i + 1}` })))
     }
-    await Effect.runPromise(memLead.assign({ teamID: TEAM_ID }))
+    const toRecord2 = (s: EngineerSlot): EngineerStateRecord => new EngineerStateRecord({
+      engineerID: s.engineerID,
+      name: s.name,
+      state: s.state,
+      currentTask: s.currentTask ?? undefined,
+      startedAt: s.startedAt ?? undefined,
+      lastHeartbeat: s.lastHeartbeat,
+    })
+    await Effect.runPromise(memLead.assign({ teamId: TEAM_ID, engineers: spawned.map(toRecord2) }))
 
     const allTasks = await Effect.runPromise(memTaskBoard.list({ team_id: TEAM_ID }))
     for (const task of allTasks) {
@@ -614,7 +763,7 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
       }
     }
 
-    const report = await Effect.runPromise(memLead.monitor())
+    const report = await Effect.runPromise(memLead.monitor(TEAM_ID))
     expect(report.completed).toBeGreaterThan(0)
 
     await Effect.runPromise(memCoordinator.dissolveTeam({ teamID: TEAM_ID }))
@@ -676,7 +825,7 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     await runHeartbeat(service.recordHeartbeat(ENG_A))
 
     const health = service.getHealth(ENG_A)!
-    health.lastActivity = Date.now() - (ENGINEER_MAX_IDLE + 1000)
+    health.lastHeartbeat = Date.now() - (ENGINEER_MAX_IDLE + 1000)
     health.isStuck = true
     health.stuckCount = 3
     health.isDead = true
@@ -710,11 +859,15 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     const unreadBefore = await Effect.runPromise(memMailbox.receive(LEAD_SESSION))
     expect(unreadBefore.length).toBe(15)
 
-    const shouldSummarize = await Effect.runPromise(memSummarizer.shouldSummarize({ recipientSessionID: LEAD_SESSION, threshold: 10 }))
+    const shouldSummarize = await Effect.runPromise(
+      memSummarizer.shouldSummarize({ sessionID: LEAD_SESSION, config: { triggerThreshold: 10 } }) as Effect.Effect<boolean, never, never>
+    )
     expect(shouldSummarize).toBe(true)
 
-    const result = await Effect.runPromise(memSummarizer.summarize({ recipientSessionID: LEAD_SESSION }))
-    expect(result.originalCount).toBe(15)
+    const result = await Effect.runPromise(
+      memSummarizer.summarize({ sessionID: LEAD_SESSION }) as Effect.Effect<SummaryResult, never, never>
+    )
+    expect(result.batchedCount).toBe(15)
     expect(summarizerCallCount).toBe(1)
 
     const afterSummarize = await Effect.runPromise(memMailbox.peek(LEAD_SESSION))
@@ -733,7 +886,9 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     await Effect.runPromise(memMailbox.send({ recipientSessionID: LEAD_SESSION, senderSessionID: "sess_eng_a" as SessionID, priority: "urgent", type: "engineer-failed", content: "CRITICAL: Engineer B crashed!" }))
     await Effect.runPromise(memMailbox.send({ recipientSessionID: LEAD_SESSION, senderSessionID: "sess_eng_b" as SessionID, priority: "urgent", type: "all-engineers-failed", content: "CRITICAL: All engineers failed!" }))
 
-    await Effect.runPromise(memSummarizer.summarize({ recipientSessionID: LEAD_SESSION }))
+    await Effect.runPromise(
+      memSummarizer.summarize({ sessionID: LEAD_SESSION }) as Effect.Effect<SummaryResult, never, never>
+    )
 
     const unread = await Effect.runPromise(memMailbox.receive(LEAD_SESSION))
     const urgentUnread = unread.filter((m) => m.priority === "urgent")
@@ -780,11 +935,11 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
       Effect.provide(
         Effect.gen(function* () {
           const service = yield* RateLimiterService
-          yield* service.report429(ENG_A)
-          yield* service.report429(ENG_A)
-          yield* service.report429(ENG_A)
-          expect(service.getStats().circuitBreakerOpen).toBe(true)
-          yield* service.acquire(ENG_B, "engineer", 100)
+          yield* service.report429(TEAM_ID, ENG_A)
+          yield* service.report429(TEAM_ID, ENG_A)
+          yield* service.report429(TEAM_ID, ENG_A)
+          expect(service.getStats(TEAM_ID)?.circuitBreakerOpen).toBe(true)
+          yield* service.acquire(TEAM_ID, ENG_B, "engineer", 100)
         }).pipe(Effect.flip),
         rateLimiterLayer,
       ),

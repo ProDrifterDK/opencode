@@ -1,30 +1,58 @@
 Team orchestration tools for multi-agent collaboration.
 
-These tools enable a lead session to create and coordinate a team of engineer agents working on complex tasks.
+These tools enable a lead session to create and coordinate a team of engineer
+agents working on complex tasks.
 
-IMPORTANT FOR LEAD: After spawning engineers, DO NOT poll team_monitor repeatedly.
-Engineers will send notifications via team_report when they complete/fail/block.
-You will receive these notifications automatically as system messages.
-Wait for engineer notifications instead of polling.
+WORKFLOW FOR LEAD:
+1. team_create — initialize a team for the goal
+2. team_decompose — break the goal into subtasks with file scopes
+3. team_agents — list configured agents (read their descriptions)
+4. Present plan to the user and wait for explicit confirmation
+5. team_spawn — create an engineer per subtask with an agent + task
+6. Wait for engineer messages via team_inbox (DO NOT poll team_monitor)
+7. team_commit — squash-merge each completed engineer's branch into the
+   lead's current branch using the engineer's task title as the commit
+   message; conflicts are surfaced and require manual resolution
+8. team_dissolve — shut down when all tasks are done
 
-Available tools:
+IMPORTANT: team_monitor is an aggregate roll-up, not a notification channel.
+Call it only on demand (blocked engineer, user-requested status, final
+pre-dissolve summary). Routine coordination happens through team_inbox and
+team_message.
+
+Available tools (16 total):
+
+Lead-only:
 - team_create: Initialize a new team for a goal
-- team_spawn: Create an engineer and assign a task (optional model selection)
+- team_agents: List configured agents for selection
 - team_decompose: Break a goal into subtasks with file scopes
+- team_spawn: Create an engineer with an agent and task (REQUIRES agent param)
 - team_assign: Auto-assign pending tasks to idle engineers
 - team_reassign: Move a task from one engineer to another
 - team_kill: Terminate a single engineer session
-- team_monitor: Get progress report for a team (includes unread inbox messages)
-- team_inbox: Check mailbox for new messages (fast, no status poll)
-- team_message: Send a message to another session (use engineer ID or "lead")
-- team_roster: List all teammates with their IDs and status (for messaging)
-- team_tasks: List available tasks (pending, unassigned) that can be claimed
-- team_claim: Claim an unassigned task to work on
-- team_status: (Engineers only) Report state and progress
-- team_report: (Engineers only) Report task completion/failure/blocked status
 - team_dissolve: Gracefully shut down a team
+- team_commit: Squash-merge each completed engineer's branch into the
+  lead's current branch using the engineer's task title as the commit
+  message. Conflicts are surfaced and require manual resolution.
 
-Role restrictions:
-- Lead-only: team_create, team_spawn, team_decompose, team_assign, team_reassign, team_kill, team_dissolve
-- Engineer-only: team_status, team_report, team_claim
-- Both: team_monitor, team_inbox, team_message, team_roster, team_tasks
+Engineer-only:
+- team_status: Report state and progress
+- team_report: Report task completion/failure/blocked status
+- team_claim: Claim an unassigned task to work on
+
+Both roles:
+- team_monitor: Get progress report (on-demand only, not for polling)
+- team_inbox: Read unread messages addressed to you
+- team_roster: List all teammates with IDs and status
+- team_tasks: List pending / unassigned tasks
+- team_message: Send a message to another session (use engineer ID or "lead")
+
+Agent Selection for Engineers (REQUIRED):
+You MUST specify an agent when spawning engineers. First call team_agents,
+then pick an agent whose `description` fits the subtask. Do NOT substring-
+match on agent names — names are user-configurable and carry no guaranteed
+meaning. Match on the description field instead.
+
+If no agent's description fits a subtask, ask the user before picking a
+fallback. Do NOT think about raw provider/model IDs — each agent already
+has its model, permissions, and capabilities pinned by the user.

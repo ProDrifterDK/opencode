@@ -1,18 +1,24 @@
 import { eq, and, asc, isNull, sql } from "drizzle-orm"
 import z from "zod"
+import { Effect, Layer, Context } from "effect"
+import { Schema } from "effect"
 import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
 import { Database } from "@/storage"
-import { Effect, Layer, Context } from "effect"
 import { SessionID } from "../session/schema"
 import { MailboxTable, type MailboxID, type MailboxPriority, type MailboxRow } from "./mailbox.sql"
 import { MAILBOX_QUEUE_DEPTH } from "./constants"
+
+export class DbError extends Schema.TaggedErrorClass<DbError>()("Mailbox.DbError", {
+  message: Schema.String,
+}) {}
 
 export const Event = {
   Received: BusEvent.define(
     "mailbox.message.received",
     z.object({
       messageID: z.string(),
+      senderSessionID: z.string(),
       recipientSessionID: z.string(),
       priority: z.enum(["urgent", "inbox", "queue"]),
     }),
@@ -24,24 +30,6 @@ export const Event = {
       recipientSessionID: z.string(),
     }),
   ),
-  EngineerMessageSent: BusEvent.define(
-    "team.engineer.message_sent",
-    z.object({
-      messageID: z.string(),
-      senderSessionID: z.string(),
-      recipientSessionID: z.string(),
-      priority: z.enum(["urgent", "inbox", "queue"]),
-    }),
-  ),
-  LeadMessageReceived: BusEvent.define(
-    "team.lead.message_received",
-    z.object({
-      messageID: z.string(),
-      leadSessionID: z.string(),
-      senderSessionID: z.string(),
-      priority: z.enum(["urgent", "inbox", "queue"]),
-    }),
-  ),
 }
 
 export interface Interface {
@@ -51,19 +39,19 @@ export interface Interface {
     priority: MailboxPriority
     type: string
     content: string
-  }) => Effect.Effect<MailboxRow>
-  readonly receive: (recipientSessionID: SessionID) => Effect.Effect<MailboxRow[]>
+  }) => Effect.Effect<MailboxRow, DbError>
+  readonly receive: (recipientSessionID: SessionID) => Effect.Effect<MailboxRow[], DbError>
   readonly receiveByPriority: (input: {
     recipientSessionID: SessionID
     priority: MailboxPriority
-  }) => Effect.Effect<MailboxRow[]>
-  readonly peek: (recipientSessionID: SessionID) => Effect.Effect<MailboxRow[]>
-  readonly markRead: (input: { messageID: MailboxID; recipientSessionID: SessionID }) => Effect.Effect<void>
-  readonly purge: (recipientSessionID: SessionID) => Effect.Effect<void>
+  }) => Effect.Effect<MailboxRow[], DbError>
+  readonly peek: (recipientSessionID: SessionID) => Effect.Effect<MailboxRow[], DbError>
+  readonly markRead: (input: { messageID: MailboxID; recipientSessionID: SessionID }) => Effect.Effect<void, DbError>
+  readonly purge: (recipientSessionID: SessionID) => Effect.Effect<void, DbError>
   readonly hasUnread: (input: {
     recipientSessionID: SessionID
     priority?: MailboxPriority
-  }) => Effect.Effect<boolean>
+  }) => Effect.Effect<boolean, DbError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Mailbox") {}
@@ -73,11 +61,11 @@ type DbClient = Parameters<typeof Database.use>[0] extends (db: infer T) => unkn
 type NotPromise<T> = T extends Promise<any> ? never : T
 
 function dbQuery<A>(f: (db: DbClient) => NotPromise<A>) {
-  return Effect.try({ try: () => Database.use(f), catch: (cause) => new Error(String(cause)) }).pipe(Effect.orDie)
+  return Effect.try({ try: () => Database.use(f), catch: (cause) => new DbError({ message: String(cause) }) })
 }
 
 function dbTx<A>(f: (db: DbClient) => NotPromise<A>) {
-  return Effect.try({ try: () => Database.transaction(f), catch: (cause) => new Error(String(cause)) }).pipe(Effect.orDie)
+  return Effect.try({ try: () => Database.transaction(f), catch: (cause) => new DbError({ message: String(cause) }) })
 }
 
 export const layer = Layer.effect(
@@ -137,21 +125,8 @@ export const layer = Layer.effect(
 
       yield* bus.publish(Event.Received, {
         messageID: id,
-        recipientSessionID: input.recipientSessionID,
-        priority: input.priority,
-      })
-
-      yield* bus.publish(Event.EngineerMessageSent, {
-        messageID: id,
         senderSessionID: input.senderSessionID,
         recipientSessionID: input.recipientSessionID,
-        priority: input.priority,
-      })
-
-      yield* bus.publish(Event.LeadMessageReceived, {
-        messageID: id,
-        leadSessionID: input.recipientSessionID,
-        senderSessionID: input.senderSessionID,
         priority: input.priority,
       })
 

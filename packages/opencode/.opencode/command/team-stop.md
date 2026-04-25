@@ -5,55 +5,86 @@ subtask: false
 
 # Team Stop
 
-Stop team execution. This command supports two modes:
+Stop team execution using the `team_*` LLM tools. You are the Lead;
+only the Lead can kill engineers or dissolve a team.
 
-## Mode 1: Stop Specific Engineer
+This command has two modes, chosen by inspecting `$ARGUMENTS`.
 
-If `$ARGUMENTS` contains an engineer ID (format: `eng_*`), stop only that engineer:
+## Mode 1: Stop a Single Engineer
 
-1. Use `SessionCoordinator.killEngineer({ engineerID, teamID })` to:
-   - Remove the engineer's session
-   - Purge their mailbox
-   - Update the team's engineer count
-   - If this was the last engineer, set the team state to "idle"
+If `$ARGUMENTS` matches an engineer ID (format: `eng_*`), call:
 
-2. Reassign any tasks that were assigned to the killed engineer:
-   - Find tasks assigned to the engineer using `TaskBoardService.listByEngineer(teamID, engineerID)`
-   - Reset those tasks to "pending" status with no assigned engineer
-   - Optionally attempt reassignment using `LeadCoordinator.assign()`
-
-3. Display confirmation:
 ```
-Engineer stopped: <engineerID> (<name>)
-Reassigned <count> tasks back to pending queue.
+team_kill({ engineerID: "<eng_...>" })
+```
+
+`team_kill` derives the team automatically from the engineer's slot,
+releases the engineer's current task back to `pending`, removes the
+session, purges the mailbox, and decrements the team's engineer count.
+If this was the last engineer, the team state flips to `idle`. The tool
+output reports these effects — surface that output to the user. This
+replaces the older direct-service call that was documented as
+`killEngineer({ engineerID, teamID })`.
+
+Display confirmation based on the tool's output, e.g.:
+
+```
+Engineer stopped: <engineerID>
+Released <count> tasks back to pending.
 Team state: <idle|active> (<remaining> engineers)
 ```
 
-## Mode 2: Dissolve Entire Team
+## Mode 2: Dissolve the Entire Team
 
-If `$ARGUMENTS` is empty or does not match an engineer ID, dissolve the entire team:
+If `$ARGUMENTS` is empty or looks like a team ID (format: `tm_*`),
+dissolve the whole team.
 
-1. Find the active team by querying `SessionCoordinator.getTeam()` for known team IDs.
+1. Resolve the team ID:
+   - If `$ARGUMENTS` is a team ID, use it.
+   - If empty, use the team ID known from this conversation (from the
+     most recent `team_create` result).
+   - If no team ID is available, tell the user: "No team to stop. Pass
+     a team ID: `/team-stop <tm_...>`."
 
-2. Use `SessionCoordinator.dissolveTeam({ teamID })` to:
-   - Set team state to "dissolving"
-   - Kill all engineer sessions and purge their mailboxes
-   - Delete all task board entries for the team
-   - Remove the team record entirely
+2. Check for in-progress work before destructively dissolving. You can
+   call `team_monitor({ teamID })` to get task counts. If `inProgress`
+   or `blocked` counts are non-zero, ask the user to confirm before
+   proceeding.
 
-3. Display confirmation:
+3. Call:
+
+```
+team_dissolve({ teamID, force: <true_if_user_confirmed_destructive> })
+```
+
+`team_dissolve` sets state to `dissolving`, kills all engineers, purges
+their mailboxes, deletes task board entries, and cleans up team git
+branches (via `GitManager.cleanupBranches`). This replaces the older
+`dissolveTeam({ teamID })` service call.
+
+Without `force: true` the tool refuses when in-progress tasks exist.
+Use the tool's error message verbatim — do not try to batch-kill
+engineers manually as a workaround.
+
+Display confirmation based on the tool's output, e.g.:
+
 ```
 Team dissolved: <teamID>
 Engineers stopped: <count>
-Tasks cleaned up: <count>
+Branches cleaned: <yes|no>
 ```
 
 ## Error Handling
 
-- If engineer ID is provided but not found: "Engineer not found: <engineerID>"
-- If no active team exists: "No active team to stop."
-- If dissolution fails partway through, report which engineers were stopped and which remain.
+- `Engineer not found`: the engineer ID was wrong or already killed —
+  tell the user and stop.
+- `Only the lead can …`: this session is not the Lead — tell the user.
+- `Cannot dissolve: N tasks in progress`: tell the user the count and
+  offer to re-run with `force`.
 
 ## Safety
 
-Before dissolving a team with in-progress tasks, confirm with the user if there are tasks in "in-progress" or "blocked" state. Show the count of affected tasks and ask for confirmation.
+Dissolving a team is destructive. When in-progress tasks exist, always
+confirm with the user before passing `force: true` — their
+in-progress work will be marked `failed` and the engineers terminated
+mid-execution.

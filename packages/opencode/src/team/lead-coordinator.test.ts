@@ -25,6 +25,7 @@ const makeMemoryTaskBoard = () => {
           file_scope: input.file_scope ?? null,
           blocked_by: input.blocked_by ?? null,
           parent_task_id: input.parent_task_id ?? null,
+          dependencies: input.dependencies ?? [],
           time_created: now,
           time_updated: now,
           completed_at: null,
@@ -47,6 +48,7 @@ const makeMemoryTaskBoard = () => {
           blocked_by: input.blocked_by !== undefined ? input.blocked_by : existing.blocked_by,
           parent_task_id: input.parent_task_id !== undefined ? input.parent_task_id : existing.parent_task_id,
           completed_at: input.completed_at !== undefined ? input.completed_at : existing.completed_at,
+          dependencies: input.dependencies !== undefined ? input.dependencies : existing.dependencies,
           time_updated: Date.now(),
         }
         tasks.set(taskId, updated)
@@ -68,6 +70,18 @@ const makeMemoryTaskBoard = () => {
 
     delete: (taskId: TaskBoardID) =>
       Effect.sync(() => { tasks.delete(taskId) }),
+
+    listReadyTasks: (teamId: TeamID) =>
+      Effect.sync(() => {
+        const all = [...tasks.values()].filter((t) => t.team_id === teamId)
+        const completedIds = new Set(all.filter((t) => t.status === "completed").map((t) => t.id))
+        return all.filter(
+          (t) =>
+            t.status === "pending" &&
+            !t.assigned_engineer_id &&
+            t.dependencies.every((depId) => completedIds.has(depId)),
+        )
+      }),
   })
 }
 

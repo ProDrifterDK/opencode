@@ -104,7 +104,7 @@ export class EngineerStateRecord extends Schema.Class<EngineerStateRecord>("Engi
 export class TeamStateRecord extends Schema.Class<TeamStateRecord>("TeamStateRecord")({
   teamID: TeamID,
   state: TeamState,
-  leadEngineerID: EngineerID,
+  leadSessionID: Schema.String,
   engineerCount: Schema.Number,
   createdAt: Schema.Number,
   updatedAt: Schema.Number,

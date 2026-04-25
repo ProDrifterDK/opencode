@@ -19,10 +19,17 @@ export class FileScopeConflictError extends Schema.TaggedErrorClass<FileScopeCon
   { message: Schema.String, conflictingFiles: Schema.Array(Schema.String) },
 ) {}
 
+export class CyclicDependenciesError extends Schema.TaggedErrorClass<CyclicDependenciesError>()(
+  "CyclicDependenciesError",
+  { message: Schema.String, cycle: Schema.Array(Schema.String) },
+) {}
+
 export interface SubtaskSpec {
+  id?: string
   title: string
   description: string
   files: string[]
+  dependencies?: string[]
 }
 
 export interface DecomposeInput {
@@ -74,7 +81,7 @@ const filesOverlap = (a: string[], b: string[]): string[] =>
   a.filter((f) => b.includes(f))
 
 
-type Err = LeadCoordinatorError | FileScopeConflictError | TaskBoardRepoError
+type Err = LeadCoordinatorError | FileScopeConflictError | CyclicDependenciesError | TaskBoardRepoError
 
 export interface Interface {
   readonly decompose: (
@@ -107,6 +114,74 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
     const decompose = Effect.fn("LeadCoordinator.decompose")(
       function* (input: DecomposeInput) {
         const specs = input.subtasks
+
+        // ── Validate client-side IDs are unique ────────────────────────────
+        const clientIdSet = new Set<string>()
+        for (const spec of specs) {
+          if (spec.id !== undefined) {
+            if (clientIdSet.has(spec.id)) {
+              yield* new LeadCoordinatorError({
+                message: `Duplicate subtask id: "${spec.id}"`,
+              })
+            }
+            clientIdSet.add(spec.id)
+          }
+        }
+
+        // ── Validate dependency references exist ───────────────────────────
+        for (const spec of specs) {
+          for (const dep of spec.dependencies ?? []) {
+            if (!clientIdSet.has(dep)) {
+              yield* new LeadCoordinatorError({
+                message: `Subtask "${spec.title}" depends on unknown id "${dep}"`,
+              })
+            }
+          }
+        }
+
+        // ── Cycle detection via Kahn's algorithm ───────────────────────────
+        // Build adjacency and in-degree maps on client-side IDs
+        const adj = new Map<string, string[]>()
+        const inDegree = new Map<string, number>()
+        for (const spec of specs) {
+          const nodeId = spec.id ?? spec.title
+          adj.set(nodeId, [])
+          inDegree.set(nodeId, 0)
+        }
+        for (const spec of specs) {
+          const nodeId = spec.id ?? spec.title
+          for (const dep of spec.dependencies ?? []) {
+            // dep must complete before nodeId — edge: dep → nodeId
+            adj.get(dep)!.push(nodeId)
+            inDegree.set(nodeId, (inDegree.get(nodeId) ?? 0) + 1)
+          }
+        }
+        const queue: string[] = []
+        for (const [id, deg] of inDegree) {
+          if (deg === 0) queue.push(id)
+        }
+        let processed = 0
+        while (queue.length > 0) {
+          const node = queue.shift()!
+          processed++
+          for (const neighbor of adj.get(node) ?? []) {
+            const newDeg = (inDegree.get(neighbor) ?? 0) - 1
+            inDegree.set(neighbor, newDeg)
+            if (newDeg === 0) queue.push(neighbor)
+          }
+        }
+        if (processed < specs.length) {
+          // Cycle exists — collect nodes still in cycle
+          const cycleNodes = [...inDegree.entries()]
+            .filter(([, deg]) => deg > 0)
+            .map(([id]) => id)
+          yield* new CyclicDependenciesError({
+            message: `Cyclic dependencies detected among subtasks: ${cycleNodes.join(" → ")}`,
+            cycle: cycleNodes,
+          })
+        }
+
+        // ── File scope conflict check ──────────────────────────────────────
         const allFiles: string[] = []
         for (const spec of specs) {
           const overlap = filesOverlap(spec.files, allFiles)
@@ -126,7 +201,12 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
           })
         }
 
+        // ── Create tasks, then build client-id → TaskBoardID map ──────────
+        // Two-pass: first create all tasks, then we have the real IDs
+        const clientIdToTaskId = new Map<string, TaskBoardID>()
         const created: Task[] = []
+
+        // First pass: create tasks without dependencies (resolve after)
         for (const spec of specs) {
           const task = yield* taskBoard.create({
             team_id: input.teamId,
@@ -134,17 +214,28 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
             description: spec.description,
             file_scope: spec.files.length > 0 ? encodeFiles(spec.files) : null,
             status: "pending",
+            dependencies: [],
           })
+          const clientId = spec.id ?? spec.title
+          clientIdToTaskId.set(clientId, task.id)
           created.push(task)
         }
 
-        void publishTeamEvent(Event.TeamCreated, {
-          teamID: input.teamId,
-          leadSessionID: input.teamId,
-          goal: input.request,
-        })
+        // Second pass: update dependencies using real TaskBoardIDs
+        const updated: Task[] = []
+        for (let i = 0; i < specs.length; i++) {
+          const spec = specs[i]
+          const clientId = spec.id ?? spec.title
+          const deps = (spec.dependencies ?? []).map((depClientId) => clientIdToTaskId.get(depClientId)!)
+          if (deps.length > 0) {
+            const updatedTask = yield* taskBoard.update(created[i].id, { dependencies: deps })
+            updated.push(updatedTask)
+          } else {
+            updated.push(created[i])
+          }
+        }
 
-        return created
+        return updated
       },
     )
 
@@ -152,9 +243,8 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
       function* (input: AssignInput) {
         const allTasks = yield* taskBoard.list({ team_id: input.teamId })
 
-        const pending = allTasks.filter(
-          (t) => t.status === "pending" && !t.assigned_engineer_id,
-        )
+        // Only assign tasks whose dependencies are all completed (ready tasks)
+        const pending = yield* taskBoard.listReadyTasks(input.teamId)
         if (pending.length === 0) return []
 
         const activeEngineerIds = new Set<EngineerID>()

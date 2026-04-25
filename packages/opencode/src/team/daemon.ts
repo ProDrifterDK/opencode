@@ -4,30 +4,41 @@ import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Event, publishTeamEvent } from "./events"
-import { SessionCoordinator } from "./session-coordinator"
+import { SessionCoordinator, type EngineerSlot } from "./session-coordinator"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Mailbox, Event as MailboxEvent } from "./mailbox"
 import { TaskBoardRepo } from "./task-board"
 import { Database } from "@/storage"
 import { EngineerSlotTable, TeamStateTable } from "./session-coordinator.sql"
 import { TaskBoardTable } from "./task-board.sql"
-import { eq, and } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 import { Event as MessageEvent } from "@/session/message-v2"
+import { ENGINEER_MAX_RUNTIME, HEARTBEAT_UPDATE_INTERVAL, HEARTBEAT_CHECK_INTERVAL, HEARTBEAT_TIMEOUT } from "./constants"
+import { RateLimiter } from "./rate-limiter"
+import { Service as HeartbeatMonitorService, layer as heartbeatLayer } from "./heartbeat"
+import { LeadCoordinator } from "./lead-coordinator"
+import { GitManager } from "./git-manager"
+import { InstanceRef } from "@/effect/instance-ref"
+import { Instance, type InstanceContext } from "@/project/instance"
+import { LocalContext } from "@/util"
+import type { EngineerID, TeamID } from "./types"
+import type { TaskBoardID } from "./task-board.sql"
+import {
+  type RunningEngineer,
+  running,
+  setRunning,
+  getRunningEngineer,
+  deleteRunning,
+  iterAllRunning,
+  countAllRunning,
+} from "./daemon-running"
 
 const log = Log.create({ service: "team.daemon" })
 
-// Heartbeat configuration
-const HEARTBEAT_UPDATE_INTERVAL = 30_000 // Update heartbeats every 30 seconds
-const HEARTBEAT_CHECK_INTERVAL = 60_000 // Check for stale engineers every 60 seconds
-const HEARTBEAT_TIMEOUT = 300_000 // Consider engineer stale after 5 minutes without heartbeat
-
-type RunningEngineer = {
-  engineerID: string
-  sessionID: SessionID
-  teamID: string
-  fiber: Fiber.RuntimeFiber<any, any>
-  startedAt: number
-}
+// Heartbeat constants are defined in ./constants and imported above.
+// The daemon's setInterval sweep acts as a backstop for teams that
+// HeartbeatMonitor is not actively watching. For teams with an active
+// HeartbeatMonitor scope the sweep is skipped (isMonitoring returns true).
 
 interface Interface {
   readonly start: () => Effect.Effect<void>
@@ -37,7 +48,6 @@ interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/TeamDaemon") {}
 
-const running = new Map<string, RunningEngineer>()
 let heartbeatUpdateInterval: ReturnType<typeof setInterval> | null = null
 let heartbeatCheckInterval: ReturnType<typeof setInterval> | null = null
 let sigintHandlerRegistered = false
@@ -47,9 +57,8 @@ let sigintHandlerRegistered = false
  * This runs synchronously outside the Effect runtime.
  */
 export function gracefulShutdown(): void {
-  log.info("graceful shutdown initiated", { runningEngineers: running.size })
+  log.info("graceful shutdown initiated", { runningEngineers: countAllRunning() })
 
-  // Clear intervals
   if (heartbeatUpdateInterval) {
     clearInterval(heartbeatUpdateInterval)
     heartbeatUpdateInterval = null
@@ -92,17 +101,20 @@ export function gracefulShutdown(): void {
               assigned_engineer_id: null,
               time_updated: now,
             })
-            .where(eq(TaskBoardTable.id, engineer.current_task))
+            .where(eq(TaskBoardTable.id, engineer.current_task as TaskBoardID))
             .run()
 
           log.info("released task to pending", { taskID: engineer.current_task })
         }
       }
 
-      // Mark all active teams as completed (so they don't appear as orphaned)
+      // Mark all active teams as terminated (abrupt shutdown, distinct from
+      // user-initiated "dissolving"). "terminated" is a valid TeamState; prior
+      // code wrote "completed" which was NOT in the enum and caused downstream
+      // validation to misbehave.
       db.update(TeamStateTable)
         .set({
-          state: "completed",
+          state: "terminated",
           time_updated: now,
         })
         .where(eq(TeamStateTable.state, "active"))
@@ -118,17 +130,27 @@ export function gracefulShutdown(): void {
   running.clear()
 }
 
+// Rough token estimate per engineer lifetime. Used only as a budget hint
+// for the rate limiter's per-minute token window — the exact number matters
+// less than the fact that we reserve *some* budget so N engineers can't
+// spawn unlimited LLM traffic. If we ever get real token accounting back
+// from the LLM service, pass it to release() instead.
+const ENGINEER_TOKEN_ESTIMATE = 8000
+
 const createEngineerLoopEffect = (input: {
   teamID: string
   engineerID: string
   sessionID: SessionID
   name: string
+  taskId: string
   taskTitle: string
   taskDescription: string
   providerID?: string
   modelID?: string
+  teammates?: Array<{ name: string; engineerID: string; task?: string }>
 }) =>
   Effect.gen(function* () {
+    const rateLimiter = yield* RateLimiter.Service
     const promptService = yield* SessionPrompt.Service
 
     log.info("starting engineer loop", {
@@ -137,6 +159,19 @@ const createEngineerLoopEffect = (input: {
       model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
     })
 
+    // Acquire a rate-limit slot. Blocks while the queue is full; fails
+    // fast with CircuitBreakerOpenError if too many consecutive 429s have
+    // been reported. `release` only runs if acquire succeeds (via the
+    // `ensuring` on the body below — if acquire throws, control exits
+    // this gen before reaching the ensuring guard).
+    yield* rateLimiter.acquire(
+      input.teamID as TeamID,
+      input.engineerID as EngineerID,
+      "engineer",
+      ENGINEER_TOKEN_ESTIMATE,
+    )
+
+    yield* Effect.gen(function* () {
     // Emit initial progress
     publishTeamEvent(Event.EngineerProgress, {
       teamID: input.teamID,
@@ -145,8 +180,19 @@ const createEngineerLoopEffect = (input: {
       timestamp: Date.now(),
     })
 
+    // Build teammates section if we have teammates
+    const teammatesSection = input.teammates && input.teammates.length > 0
+      ? [
+          ``,
+          `Your teammates:`,
+          ...input.teammates.map((t) => `- ${t.name} (ID: ${t.engineerID})${t.task ? ` - working on: ${t.task}` : ""}`),
+          `Use team_message with recipientID to collaborate with them.`,
+        ]
+      : []
+
     const engineerPrompt = [
       `You are an engineer on team ${input.teamID}. Your name is ${input.name}.`,
+      ...teammatesSection,
       ``,
       `Your assigned task:`,
       `Title: ${input.taskTitle}`,
@@ -198,41 +244,90 @@ const createEngineerLoopEffect = (input: {
     yield* promptService.loop({ sessionID: input.sessionID })
     log.info("engineer loop completed", { engineerID: input.engineerID })
 
-    running.delete(input.engineerID)
+    deleteRunning(input.teamID as TeamID, input.engineerID as EngineerID)
     publishTeamEvent(Event.EngineerCompleted, {
       teamID: input.teamID,
       engineerID: input.engineerID,
-      taskId: input.taskTitle,
+      taskId: input.taskId,
     })
+    }).pipe(
+      // Release the rate-limit slot on ANY exit of the body (success,
+      // failure, or interruption from checkForStaleEngineers). Errors from
+      // release itself are swallowed — losing a slot is better than
+      // compounding a failure. The outer acquire lives above this ensuring,
+      // so if acquire itself fails, release never runs (correct).
+      Effect.ensuring(
+        rateLimiter
+          .release(input.teamID as TeamID, input.engineerID as EngineerID, ENGINEER_TOKEN_ESTIMATE)
+          .pipe(Effect.ignore),
+      ),
+    )
   })
+
+// Capture the current Instance context at call time (synchronous, outside Effect.gen)
+// so the engineer fiber can be forked with its worktree directory overriding ctx.directory.
+function resolveEngineerCtx(worktreePath: string): InstanceContext | undefined {
+  try {
+    return { ...Instance.current, directory: worktreePath }
+  } catch (err) {
+    if (err instanceof LocalContext.NotFound) return undefined
+    throw err
+  }
+}
 
 const startEngineerInBackground = (input: {
   teamID: string
   engineerID: string
   sessionID: SessionID
   name: string
+  taskId: string
   taskTitle: string
   taskDescription: string
   providerID?: string
   modelID?: string
-}) => {
-  log.info("forking engineer loop in background", {
-    engineerID: input.engineerID,
-    model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
+  teammates?: Array<{ name: string; engineerID: string; task?: string }>
+}) =>
+  Effect.gen(function* () {
+    const gitManager = yield* GitManager.Service
+
+    log.info("creating worktree for engineer", {
+      engineerID: input.engineerID,
+      teamID: input.teamID,
+    })
+
+    const { worktreePath, branch } = yield* gitManager.createEngineerWorktree({
+      teamID: input.teamID as TeamID,
+      engineerID: input.engineerID as EngineerID,
+    })
+
+    log.info("forking engineer loop in background", {
+      engineerID: input.engineerID,
+      worktreePath,
+      branch,
+      model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
+    })
+
+    // Override InstanceRef so tools in this engineer's fiber use the worktree directory.
+    // resolveEngineerCtx is called synchronously here (outside try/catch inside gen).
+    const engineerCtx = resolveEngineerCtx(worktreePath)
+    const loopEffect = engineerCtx
+      ? createEngineerLoopEffect(input).pipe(Effect.provideService(InstanceRef, engineerCtx))
+      : createEngineerLoopEffect(input)
+
+    const fiber = AppRuntime.runFork(loopEffect)
+
+    setRunning(input.teamID as TeamID, input.engineerID as EngineerID, {
+      engineerID: input.engineerID,
+      sessionID: input.sessionID,
+      teamID: input.teamID,
+      fiber,
+      startedAt: Date.now(),
+      worktreePath,
+      branch,
+    })
+
+    log.info("engineer loop forked", { engineerID: input.engineerID, running: countAllRunning() })
   })
-
-  const fiber = AppRuntime.runFork(createEngineerLoopEffect(input))
-
-  running.set(input.engineerID, {
-    engineerID: input.engineerID,
-    sessionID: input.sessionID,
-    teamID: input.teamID,
-    fiber,
-    startedAt: Date.now(),
-  })
-
-  log.info("engineer loop forked", { engineerID: input.engineerID, running: running.size })
-}
 
 export const layer = Layer.effect(
   Service,
@@ -242,26 +337,78 @@ export const layer = Layer.effect(
     const promptService = yield* SessionPrompt.Service
     const mailbox = yield* Mailbox.Service
     const taskBoard = yield* TaskBoardRepo.Service
+    const heartbeatMonitor = yield* HeartbeatMonitorService
 
     let unsubscribers: Array<() => void> = []
 
-    // Update heartbeats for all running engineers
+    // Update heartbeats for all running engineers so stale-detection
+    // doesn't misfire on a healthy but quiet fiber. Best-effort: a
+    // failed update is logged but never thrown.
+    // Backstop only: skips teams already covered by HeartbeatMonitor.
     const updateRunningHeartbeats = () => {
       if (running.size === 0) return
 
       AppRuntime.runFork(Effect.gen(function* () {
-        for (const [engineerID] of running) {
-          try {
-            yield* coordinator.updateEngineer(engineerID, {})
-            log.debug("updated heartbeat", { engineerID })
-          } catch (err) {
-            log.warn("failed to update heartbeat", { engineerID, error: String(err) })
-          }
+        for (const [teamID, engineerID] of iterAllRunning()) {
+          const monitored = yield* heartbeatMonitor.isMonitoring(teamID)
+          if (monitored) continue
+          yield* coordinator
+            .updateEngineer(engineerID as EngineerID, {})
+            .pipe(Effect.catchCause(() => Effect.void))
         }
       }))
     }
 
-    // Check for stale engineers and handle them
+    const terminateEngineer = (
+      engineer: EngineerSlot,
+      reason: string,
+      progressText: string,
+    ) =>
+      Effect.gen(function* () {
+        log.warn("terminating engineer", { engineerID: engineer.engineerID, reason })
+
+        // Release task back to pending so another engineer can claim it.
+        if (engineer.currentTask) {
+          yield* taskBoard.update(engineer.currentTask as TaskBoardID, {
+            status: "pending",
+            assigned_engineer_id: null,
+          })
+          log.info("released task", {
+            engineerID: engineer.engineerID,
+            taskID: engineer.currentTask,
+          })
+        }
+
+        publishTeamEvent(Event.EngineerFailed, {
+          teamID: engineer.teamID,
+          engineerID: engineer.engineerID,
+          taskId: engineer.currentTask ?? "unknown",
+          error: reason,
+        })
+        publishTeamEvent(Event.EngineerProgress, {
+          teamID: engineer.teamID,
+          engineerID: engineer.engineerID,
+          progressText,
+          timestamp: Date.now(),
+        })
+
+        yield* coordinator.killEngineer({
+          engineerID: engineer.engineerID,
+          teamID: engineer.teamID,
+        })
+
+        const runningEngineer = getRunningEngineer(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
+        if (runningEngineer) {
+          log.info("interrupting engineer fiber", { engineerID: engineer.engineerID })
+          yield* Fiber.interrupt(runningEngineer.fiber)
+          deleteRunning(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
+        }
+      })
+
+    // Sweep for engineers whose heartbeat has gone silent or whose
+    // total runtime has passed ENGINEER_MAX_RUNTIME, and terminate
+    // them. Driven by the setInterval registered in `start()` below.
+    // Backstop only: skips teams already covered by HeartbeatMonitor.
     const checkForStaleEngineers = () => {
       AppRuntime.runFork(Effect.gen(function* () {
         const now = Date.now()
@@ -270,6 +417,10 @@ export const layer = Layer.effect(
         for (const engineer of allEngineers) {
           if (engineer.state !== "working") continue
 
+          // Skip engineers whose team has an active HeartbeatMonitor scope
+          const monitored = yield* heartbeatMonitor.isMonitoring(engineer.teamID as TeamID)
+          if (monitored) continue
+
           const timeSinceHeartbeat = now - engineer.lastHeartbeat
           if (timeSinceHeartbeat > HEARTBEAT_TIMEOUT) {
             log.warn("engineer heartbeat timeout", {
@@ -277,48 +428,26 @@ export const layer = Layer.effect(
               lastHeartbeat: new Date(engineer.lastHeartbeat).toISOString(),
               timeSinceHeartbeat: Math.round(timeSinceHeartbeat / 1000) + "s",
             })
+            yield* terminateEngineer(
+              engineer,
+              "Heartbeat timeout - engineer unresponsive",
+              "❌ Timeout: unresponsive",
+            )
+            continue
+          }
 
-            // Mark engineer as failed
-            yield* coordinator.updateEngineer(engineer.engineerID, {
-              state: "failed",
-              currentTask: null,
-            })
-
-            // Mark their task as pending so it can be reclaimed
-            if (engineer.currentTask) {
-              yield* taskBoard.update(engineer.currentTask as any, {
-                status: "pending",
-                assigned_engineer_id: null,
-              })
-              log.info("released task from stale engineer", {
-                engineerID: engineer.engineerID,
-                taskID: engineer.currentTask,
-              })
-            }
-
-            // Publish failure event
-            publishTeamEvent(Event.EngineerFailed, {
-              teamID: engineer.teamID,
+          if (engineer.startedAt && now - engineer.startedAt > ENGINEER_MAX_RUNTIME) {
+            const runtimeMin = Math.round((now - engineer.startedAt) / 60000)
+            log.warn("engineer max runtime exceeded", {
               engineerID: engineer.engineerID,
-              taskId: engineer.currentTask ?? "unknown",
-              error: "Heartbeat timeout - engineer unresponsive",
+              runtimeMin,
+              limitMin: Math.round(ENGINEER_MAX_RUNTIME / 60000),
             })
-
-            // Publish progress event for UI
-            publishTeamEvent(Event.EngineerProgress, {
-              teamID: engineer.teamID,
-              engineerID: engineer.engineerID,
-              progressText: "❌ Timeout: unresponsive",
-              timestamp: now,
-            })
-
-            // Interrupt the fiber if it's still in our running map
-            const runningEngineer = running.get(engineer.engineerID)
-            if (runningEngineer) {
-              log.info("interrupting stale engineer fiber", { engineerID: engineer.engineerID })
-              Fiber.interruptFork(runningEngineer.fiber)
-              running.delete(engineer.engineerID)
-            }
+            yield* terminateEngineer(
+              engineer,
+              `Max runtime exceeded (${runtimeMin} min)`,
+              "❌ Max runtime exceeded",
+            )
           }
         }
       }))
@@ -328,28 +457,21 @@ export const layer = Layer.effect(
       type: string
       properties: {
         messageID: string
-        leadSessionID: string
+        recipientSessionID: string
         senderSessionID: string
         priority: "urgent" | "inbox" | "queue"
       }
     }) => {
       log.info("received lead message event", {
-        leadSessionID: event.properties.leadSessionID,
+        recipientSessionID: event.properties.recipientSessionID,
         priority: event.properties.priority,
       })
 
       // Inject notification into lead's session
       const injectNotification = Effect.gen(function* () {
-        // Check if this session is actually a lead
-        const isLead = yield* coordinator.isLead(event.properties.leadSessionID as SessionID)
-        if (!isLead) {
-          log.info("session is not a lead, skipping notification")
-          return
-        }
-
         // Fetch the message from mailbox
         const messages = yield* mailbox.receiveByPriority({
-          recipientSessionID: event.properties.leadSessionID as SessionID,
+          recipientSessionID: event.properties.recipientSessionID as SessionID,
           priority: event.properties.priority,
         })
 
@@ -361,7 +483,7 @@ export const layer = Layer.effect(
         const msg = messages[0]
         yield* mailbox.markRead({
           messageID: msg.id,
-          recipientSessionID: event.properties.leadSessionID as SessionID,
+          recipientSessionID: event.properties.recipientSessionID as SessionID,
         })
 
         const label = event.properties.priority === "urgent"
@@ -373,13 +495,13 @@ export const layer = Layer.effect(
         const notificationText = `${label}\n${msg.content}\n\nRespond to acknowledge and take action.`
 
         log.info("injecting notification into lead session", {
-          leadSessionID: event.properties.leadSessionID,
+          leadSessionID: event.properties.recipientSessionID,
           contentLength: notificationText.length,
         })
 
         // Inject as a new prompt to wake up the lead
         yield* promptService.prompt({
-          sessionID: event.properties.leadSessionID as SessionID,
+          sessionID: event.properties.recipientSessionID as SessionID,
           parts: [{ type: "text", text: notificationText }],
         })
 
@@ -388,6 +510,38 @@ export const layer = Layer.effect(
 
       // Run in background to not block the event handler
       AppRuntime.runFork(injectNotification)
+    }
+
+    // Single dispatcher for mailbox.message.received — checks recipient role
+    // and forwards to the appropriate lead/engineer handler. Replaces the
+    // duplicate EngineerMessageSent + LeadMessageReceived publishes that used
+    // to fire for every send regardless of recipient role.
+    const handleMailboxReceived = (event: {
+      type: string
+      properties: {
+        messageID: string
+        senderSessionID: string
+        recipientSessionID: string
+        priority: "urgent" | "inbox" | "queue"
+      }
+    }) => {
+      AppRuntime.runFork(Effect.gen(function* () {
+        const recipient = event.properties.recipientSessionID as SessionID
+        const isLead = yield* coordinator.isLead(recipient)
+        if (isLead) {
+          handleLeadMessageReceived(event)
+          return
+        }
+        const isEngineer = yield* coordinator.isEngineer(recipient)
+        if (isEngineer) {
+          handleEngineerMessageReceived(event)
+          return
+        }
+        log.debug("mailbox message to unknown role, ignoring", {
+          recipient,
+          messageID: event.properties.messageID,
+        })
+      }))
     }
 
     const handleEngineerMessageReceived = (event: {
@@ -479,20 +633,62 @@ export const layer = Layer.effect(
           : "(default)",
       })
 
-      try {
-        startEngineerInBackground({
+      // Fetch teammates and start the engineer loop
+      const startWithTeammates = Effect.gen(function* () {
+        const teammates = yield* coordinator.listTeamEngineers(event.properties.teamID as unknown as TeamID)
+        const otherEngineers = teammates
+          .filter((e) => e.engineerID !== event.properties.engineerID)
+          .map((e) => ({
+            name: e.name,
+            engineerID: e.engineerID,
+            task: e.currentTask ?? undefined,
+          }))
+
+        yield* startEngineerInBackground({
           teamID: event.properties.teamID,
           engineerID: event.properties.engineerID,
           sessionID: event.properties.sessionID as SessionID,
           name: event.properties.name,
+          taskId: event.properties.taskID,
           taskTitle: event.properties.taskTitle,
           taskDescription: event.properties.taskDescription,
           providerID: event.properties.providerID,
           modelID: event.properties.modelID,
+          teammates: otherEngineers,
         })
-      } catch (err) {
-        log.error("failed to start engineer loop", { engineerID: event.properties.engineerID, error: String(err) })
-      }
+      })
+
+      AppRuntime.runFork(startWithTeammates.pipe(
+        Effect.catch((err: unknown) =>
+          Effect.gen(function* () {
+            log.error("failed to start engineer loop", {
+              engineerID: event.properties.engineerID,
+              error: String(err),
+            })
+            // Emit a failure event so the Lead (and TUI) observe the abort
+            // instead of the slot hanging in "working" forever.
+            publishTeamEvent(Event.EngineerFailed, {
+              teamID: event.properties.teamID,
+              engineerID: event.properties.engineerID,
+              taskId: event.properties.taskID,
+              error: String(err),
+            })
+            publishTeamEvent(Event.EngineerProgress, {
+              teamID: event.properties.teamID,
+              engineerID: event.properties.engineerID,
+              progressText: "❌ Failed to start (rate-limited or spawn error)",
+              timestamp: Date.now(),
+            })
+            // Free the slot so the capacity cap doesn't leak. If this
+            // itself fails we've done all we can; swallow and move on.
+            yield* coordinator.killEngineer({
+              engineerID: event.properties.engineerID as unknown as EngineerID,
+              teamID: event.properties.teamID as unknown as TeamID,
+            }).pipe(Effect.ignore)
+            deleteRunning(event.properties.teamID as TeamID, event.properties.engineerID as EngineerID)
+          }),
+        ),
+      ))
     }
 
     // Track last emitted tool per engineer to avoid duplicate progress updates
@@ -518,12 +714,19 @@ export const layer = Layer.effect(
       if (!toolName) return
 
       // Check if this session belongs to a running engineer
-      const engineerEntry = [...running.entries()].find(
-        ([, eng]) => eng.sessionID === event.properties.sessionID
-      )
-      if (!engineerEntry) return
+      let foundEngineerID: string | undefined
+      let foundEngineer: RunningEngineer | undefined
+      for (const [, eid, eng] of iterAllRunning()) {
+        if (eng.sessionID === event.properties.sessionID) {
+          foundEngineerID = eid
+          foundEngineer = eng
+          break
+        }
+      }
+      if (!foundEngineerID || !foundEngineer) return
 
-      const [engineerID, engineer] = engineerEntry
+      const engineerID = foundEngineerID
+      const engineer = foundEngineer
 
       // Skip if we already emitted this tool for this engineer
       const lastTool = lastToolPerEngineer.get(engineerID)
@@ -557,20 +760,15 @@ export const layer = Layer.effect(
       const unsubSpawned = yield* bus.subscribeCallback(Event.EngineerSpawned, handleEngineerSpawned)
       unsubscribers.push(unsubSpawned)
 
-      const unsubLeadMessage = yield* bus.subscribeCallback(MailboxEvent.LeadMessageReceived, handleLeadMessageReceived)
-      unsubscribers.push(unsubLeadMessage)
-
-      const unsubEngineerMessage = yield* bus.subscribeCallback(MailboxEvent.EngineerMessageSent, handleEngineerMessageReceived)
-      unsubscribers.push(unsubEngineerMessage)
+      const unsubMailbox = yield* bus.subscribeCallback(MailboxEvent.Received, handleMailboxReceived)
+      unsubscribers.push(unsubMailbox)
 
       const unsubPartUpdated = yield* bus.subscribeCallback(MessageEvent.PartUpdated, handlePartUpdated)
       unsubscribers.push(unsubPartUpdated)
 
-      // Start heartbeat monitoring
       heartbeatUpdateInterval = setInterval(updateRunningHeartbeats, HEARTBEAT_UPDATE_INTERVAL)
       heartbeatCheckInterval = setInterval(checkForStaleEngineers, HEARTBEAT_CHECK_INTERVAL)
 
-      // Register SIGINT handler for graceful shutdown (only once)
       if (!sigintHandlerRegistered) {
         sigintHandlerRegistered = true
         process.on("SIGINT", () => {
@@ -593,7 +791,6 @@ export const layer = Layer.effect(
     const stop = Effect.fn("TeamDaemon.stop")(function* () {
       log.info("stopping team daemon")
 
-      // Clear heartbeat intervals
       if (heartbeatUpdateInterval) {
         clearInterval(heartbeatUpdateInterval)
         heartbeatUpdateInterval = null
@@ -608,7 +805,7 @@ export const layer = Layer.effect(
       }
       unsubscribers = []
 
-      for (const [engineerID, engineer] of running) {
+      for (const [, engineerID, engineer] of iterAllRunning()) {
         log.info("interrupting engineer", { engineerID })
         yield* Fiber.interrupt(engineer.fiber)
       }
@@ -618,25 +815,36 @@ export const layer = Layer.effect(
     })
 
     const getRunning = Effect.fn("TeamDaemon.getRunning")(function* () {
-      return Array.from(running.values())
+      const result: RunningEngineer[] = []
+      for (const [, , eng] of iterAllRunning()) result.push(eng)
+      return result
     })
 
-    // Auto-start the daemon when the layer is built
-    yield* start()
+    // NOTE: Daemon is NOT auto-started. Call start() explicitly when needed
+    // (e.g., from team_create). This prevents issues in CLI commands that
+    // don't have instance context.
 
-    // Clean up on shutdown
+    // Clean up on shutdown (if start() was called)
     yield* Effect.addFinalizer(() => stop())
 
     return Service.of({ start, stop, getRunning })
   }),
 )
 
+const heartbeatDefaultLayer = heartbeatLayer.pipe(
+  Layer.provide(SessionCoordinator.defaultLayer),
+  Layer.provide(LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer))),
+  Layer.provide(Mailbox.defaultLayer),
+)
+
 export const defaultLayer = layer.pipe(
+  Layer.provide(heartbeatDefaultLayer),
   Layer.provide(Bus.defaultLayer),
   Layer.provide(SessionPrompt.defaultLayer),
   Layer.provide(SessionCoordinator.defaultLayer),
   Layer.provide(Mailbox.defaultLayer),
   Layer.provide(TaskBoardRepo.layer),
+  Layer.provide(RateLimiter.layer),
 )
 
 export * as TeamDaemon from "./daemon"

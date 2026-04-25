@@ -1,8 +1,9 @@
-import { Effect, Layer, Context, Schema, Schedule, Scope } from "effect"
+import { Effect, Layer, Context, Schema, Schedule, Scope, Exit } from "effect"
 import { Service as SessionCoordinatorService, type EngineerSlot } from "./session-coordinator"
 import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as MailboxService } from "./mailbox"
-import { HEARTBEAT_INTERVAL, ENGINEER_MAX_IDLE } from "./constants"
+import { HEARTBEAT_INTERVAL, ENGINEER_MAX_IDLE, HEARTBEAT_UPDATE_INTERVAL, HEARTBEAT_CHECK_INTERVAL, HEARTBEAT_TIMEOUT } from "./constants"
+import { iterAllRunning } from "./daemon-running"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
 
@@ -47,6 +48,9 @@ export interface OrphanStatus {
 export interface Interface {
   readonly startMonitoring: (teamID: TeamID, leadSessionID: SessionID) => Effect.Effect<void, never, Scope.Scope>
   readonly stopMonitoring: (teamID: TeamID) => Effect.Effect<void>
+  readonly startTeamMonitoring: (teamID: TeamID, leadSessionID: SessionID) => Effect.Effect<void>
+  readonly stopTeamMonitoring: (teamID: TeamID) => Effect.Effect<void>
+  readonly isMonitoring: (teamID: TeamID) => Effect.Effect<boolean>
   readonly recordHeartbeat: (engineerID: EngineerID) => Effect.Effect<void, HeartbeatError>
   readonly checkHealth: (teamID: TeamID) => Effect.Effect<EngineerHealth[], HeartbeatError>
   readonly runDiagnostic: (engineerID: EngineerID, teamID: TeamID) => Effect.Effect<DiagnosticResult, HeartbeatError>
@@ -347,7 +351,38 @@ export const layer = Layer.effect(
       function* (teamID: TeamID, leadSessionID: SessionID) {
         leadAliveMap.set(teamID, { sessionID: leadSessionID, lastSeen: Date.now() })
 
-        const heartbeatLoop = Effect.gen(function* () {
+        // Primary: write alive timestamps for all running engineers in this team
+        const updateHeartbeatsLoop = Effect.gen(function* () {
+          for (const [tid, , eng] of iterAllRunning()) {
+            if (tid !== teamID) continue
+            yield* coordinator
+              .updateEngineer(eng.engineerID as EngineerID, {})
+              .pipe(Effect.catchCause(() => Effect.void))
+          }
+        })
+
+        // Primary: mark unresponsive engineers stale / terminate them
+        const checkStaleLoop = Effect.gen(function* () {
+          const now = Date.now()
+          const teamEngineers = yield* coordinator.listTeamEngineers(teamID).pipe(
+            Effect.orElseSucceed(() => [] as EngineerSlot[]),
+          )
+          for (const engineer of teamEngineers) {
+            if (engineer.state !== "working") continue
+            const timeSinceHeartbeat = now - engineer.lastHeartbeat
+            if (timeSinceHeartbeat > HEARTBEAT_TIMEOUT) {
+              const health = getOrCreateHealth(engineer.engineerID)
+              health.isStuck = true
+              health.stuckCount++
+              health.isDead = health.stuckCount >= 3
+              yield* runDiagnostic(engineer.engineerID, teamID).pipe(
+                Effect.catchCause(() => Effect.void),
+              )
+            }
+          }
+        })
+
+        const heartbeatCheckLoop = Effect.gen(function* () {
           const healthResults = yield* checkHealth(teamID)
 
           for (const health of healthResults) {
@@ -365,8 +400,22 @@ export const layer = Layer.effect(
           )
         })
 
+        // Every HEARTBEAT_UPDATE_INTERVAL: refresh alive timestamps (primary)
         yield* Effect.forkScoped(
-          heartbeatLoop.pipe(
+          updateHeartbeatsLoop.pipe(
+            Effect.repeat(Schedule.spaced(HEARTBEAT_UPDATE_INTERVAL)),
+          ),
+        )
+
+        // Every HEARTBEAT_CHECK_INTERVAL: terminate stale engineers (primary)
+        yield* Effect.forkScoped(
+          checkStaleLoop.pipe(
+            Effect.repeat(Schedule.spaced(HEARTBEAT_CHECK_INTERVAL)),
+          ),
+        )
+
+        yield* Effect.forkScoped(
+          heartbeatCheckLoop.pipe(
             Effect.repeat(Schedule.spaced(HEARTBEAT_INTERVAL)),
           ),
         )
@@ -393,12 +442,43 @@ export const layer = Layer.effect(
       },
     )
 
+    // Per-team scope registry. The scope must outlive `startMonitoring`'s
+    // effect so its `Effect.forkScoped` fibers stay alive. We close it on
+    // `stopTeamMonitoring` to interrupt those fibers.
+    const monitoringScopes = new Map<TeamID, Scope.Closeable>()
+
+    /** Returns true if a HeartbeatMonitor scope is active for this team. */
+    const isMonitoring = (teamID: TeamID): Effect.Effect<boolean> =>
+      Effect.sync(() => monitoringScopes.has(teamID))
+
+    const startTeamMonitoring = Effect.fn("HeartbeatMonitor.startTeamMonitoring")(
+      function* (teamID: TeamID, leadSessionID: SessionID) {
+        if (monitoringScopes.has(teamID)) return
+        const scope = yield* Scope.make()
+        monitoringScopes.set(teamID, scope)
+        yield* startMonitoring(teamID, leadSessionID).pipe(Scope.provide(scope))
+      },
+    )
+
+    const stopTeamMonitoring = Effect.fn("HeartbeatMonitor.stopTeamMonitoring")(
+      function* (teamID: TeamID) {
+        const scope = monitoringScopes.get(teamID)
+        if (!scope) return
+        monitoringScopes.delete(teamID)
+        yield* stopMonitoring(teamID)
+        yield* Scope.close(scope, Exit.void)
+      },
+    )
+
     const getHealth = (engineerID: EngineerID): EngineerHealth | null =>
       healthMap.get(engineerID) ?? null
 
     return Service.of({
       startMonitoring,
       stopMonitoring,
+      startTeamMonitoring,
+      stopTeamMonitoring,
+      isMonitoring,
       recordHeartbeat,
       checkHealth,
       runDiagnostic,

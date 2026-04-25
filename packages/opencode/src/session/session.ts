@@ -519,8 +519,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       title?: string
       permission?: Permission.Ruleset
       workspaceID?: WorkspaceID
+      directory?: string
     }) {
-      const directory = yield* InstanceState.directory
+      const directory = input?.directory ?? (yield* InstanceState.directory)
       const workspace = yield* InstanceState.workspaceID
       return yield* createNext({
         parentID: input?.parentID,

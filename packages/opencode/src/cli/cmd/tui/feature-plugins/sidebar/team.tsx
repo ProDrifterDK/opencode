@@ -5,6 +5,36 @@ const id = "internal:sidebar-team"
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+const ENGINEER_COLORS = [
+  "#ff6b6b", // coral red
+  "#4ecdc4", // teal
+  "#ffe66d", // yellow
+  "#95e1d3", // mint
+  "#f38181", // salmon
+  "#aa96da", // lavender
+  "#fcbad3", // pink
+  "#a8d8ea", // sky blue
+  "#ffd93d", // gold
+  "#6bcb77", // green
+  "#c9b1ff", // purple
+  "#ff9f45", // orange
+]
+
+function hashString(str: string): number {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i)
+    hash = hash & hash
+  }
+  return Math.abs(hash)
+}
+
+function getEngineerColor(name: string, agentName?: string): string {
+  const key = agentName || name
+  const index = hashString(key) % ENGINEER_COLORS.length
+  return ENGINEER_COLORS[index]
+}
+
 function View(props: { api: TuiPluginApi }) {
   const [open, setOpen] = createSignal(true)
   const [spinnerIdx, setSpinnerIdx] = createSignal(0)
@@ -66,8 +96,12 @@ function View(props: { api: TuiPluginApi }) {
                 >
                   {eng.state === "working" ? spinner() : "•"}
                 </text>
-                <text fg={theme().text} wrapMode="word">
-                  {eng.name}{" "}
+                <text fg={eng.agentColor || getEngineerColor(eng.name, eng.agentName)} wrapMode="word">
+                  {eng.name}
+                  <Show when={eng.agentName}>
+                    <span style={{ fg: theme().textMuted }}> ({eng.agentName})</span>
+                  </Show>
+                  {" "}
                   <span style={{ fg: theme().textMuted }}>
                     <Switch fallback={stateLabel(eng.state)}>
                       <Match when={eng.progressText}>

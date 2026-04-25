@@ -14,6 +14,12 @@ export const TASK_BOARD_MAX_TASKS = 100
 
 export const HEARTBEAT_INTERVAL = 30 * 1000
 
+// Daemon-level heartbeat sweep constants. Used by both HeartbeatMonitor
+// (primary, per-team) and TeamDaemon's setInterval backstop.
+export const HEARTBEAT_UPDATE_INTERVAL = 30_000
+export const HEARTBEAT_CHECK_INTERVAL = 60_000
+export const HEARTBEAT_TIMEOUT = 300_000
+
 export const LEAD_DAEMON_POLL_INTERVAL = 5 * 1000
 
 export const GIT_BRANCH_PREFIX = "team"

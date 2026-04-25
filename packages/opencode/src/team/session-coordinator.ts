@@ -1,10 +1,11 @@
 import { eq } from "drizzle-orm"
-import { Effect, Layer, Context, Schema } from "effect"
+import { Effect, Layer, Context, Schema, Cause } from "effect"
 import { Database } from "@/storage"
 import { Service as SessionService, defaultLayer as sessionDefaultLayer } from "@/session/session"
 import { Service as MailboxService, defaultLayer as mailboxDefaultLayer } from "./mailbox"
 import { Service as TaskBoardService, layer as taskBoardLayer } from "./task-board"
-import { TeamStateTable, EngineerSlotTable } from "./session-coordinator.sql"
+import { TeamStateTable, EngineerSlotTable, type EngineerSlotRow, type TeamStateRow } from "./session-coordinator.sql"
+import type { TaskBoardID } from "./task-board.sql"
 import { TeamID, EngineerID, type EngineerState } from "./types"
 import { MAX_TEAM_SIZE } from "./constants"
 import { Event, publishTeamEvent } from "./events"
@@ -21,13 +22,15 @@ export interface EngineerSlot {
   name: string
   state: EngineerState
   currentTask: string | null
+  agentName: string | null
+  agentColor: string | null
   startedAt: number | null
   lastHeartbeat: number
 }
 
 export interface TeamRecord {
   teamID: TeamID
-  state: "idle" | "active" | "dissolving"
+  state: "idle" | "active" | "dissolving" | "terminated"
   leadSessionID: SessionID
   engineerCount: number
   createdAt: number
@@ -44,6 +47,8 @@ export interface Interface {
     teamID: TeamID
     leadSessionID: SessionID
     name?: string
+    agentName?: string
+    agentColor?: string
   }) => Effect.Effect<EngineerSlot, CoordinatorError>
   readonly resumeEngineer: (input: {
     engineerID: EngineerID
@@ -83,8 +88,41 @@ function dbTx<A>(f: (db: DbClient) => NotPromise<A>) {
   return Effect.try({ try: () => Database.transaction(f), catch: (cause) => new CoordinatorError({ message: String(cause) }) })
 }
 
+// Translate SQL rows to the coordinator's domain types. These used to
+// live inline in `hydrateFromDb`, and the engineer translator silently
+// dropped `agent_name` / `agent_color` — after a process restart, every
+// slot lost its agent metadata. Centralising the mapping here means the
+// bug can't recur per-method.
+const rowToSlot = (row: EngineerSlotRow): EngineerSlot => ({
+  engineerID: row.id,
+  teamID: row.team_id,
+  sessionID: row.session_id,
+  name: row.name,
+  state: row.state as EngineerState,
+  currentTask: row.current_task,
+  agentName: row.agent_name,
+  agentColor: row.agent_color,
+  startedAt: row.started_at,
+  lastHeartbeat: row.last_heartbeat,
+})
+
+const rowToTeam = (row: TeamStateRow): TeamRecord => ({
+  teamID: row.team_id,
+  state: row.state,
+  leadSessionID: row.lead_session_id,
+  engineerCount: row.engineer_count,
+  createdAt: row.time_created,
+  updatedAt: row.time_updated,
+})
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCoordinator") {}
 
+// All reads and writes go through the SQLite database — no in-memory
+// mirror. The previous implementation kept two `Map`s hydrated once at
+// layer init; any write that bypassed the service (for example the
+// synchronous SIGINT path in daemon.ts) would leave the maps lying
+// about reality until restart. The DB is now the single source of
+// truth, so that class of drift is impossible.
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -92,49 +130,28 @@ export const layer = Layer.effect(
     const mailbox = yield* MailboxService
     const taskBoard = yield* TaskBoardService
 
-    const teams = new Map<TeamID, TeamRecord>()
-    const engineers = new Map<EngineerID, EngineerSlot>()
+    const fetchTeam = (teamID: TeamID) =>
+      dbQuery((db) =>
+        db.select().from(TeamStateTable).where(eq(TeamStateTable.team_id, teamID)).all(),
+      ).pipe(Effect.map((rows) => (rows.length > 0 ? rowToTeam(rows[0]) : null)))
 
-    const hydrateFromDb = Effect.fnUntraced(function* () {
-      const teamRows = yield* dbQuery((db) =>
-        db.select().from(TeamStateTable).all(),
-      )
-      for (const row of teamRows) {
-        teams.set(row.team_id, {
-          teamID: row.team_id,
-          state: row.state,
-          leadSessionID: row.lead_session_id,
-          engineerCount: row.engineer_count,
-          createdAt: row.time_created,
-          updatedAt: row.time_updated,
-        })
-      }
+    const fetchEngineer = (engineerID: EngineerID) =>
+      dbQuery((db) =>
+        db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.id, engineerID)).all(),
+      ).pipe(Effect.map((rows) => (rows.length > 0 ? rowToSlot(rows[0]) : null)))
 
-      const engRows = yield* dbQuery((db) =>
-        db.select().from(EngineerSlotTable).all(),
-      )
-      for (const row of engRows) {
-        engineers.set(row.id, {
-          engineerID: row.id,
-          teamID: row.team_id,
-          sessionID: row.session_id,
-          name: row.name,
-          state: row.state as EngineerState,
-          currentTask: row.current_task,
-          startedAt: row.started_at,
-          lastHeartbeat: row.last_heartbeat,
-        })
-      }
-    })
-
-    yield* hydrateFromDb()
+    const countTeamEngineers = (teamID: TeamID) =>
+      dbQuery((db) =>
+        db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.team_id, teamID)).all(),
+      ).pipe(Effect.map((rows) => rows.length))
 
     const createTeam = Effect.fn("SessionCoordinator.createTeam")(function* (input: {
       teamID: TeamID
       leadSessionID: SessionID
       goal?: string
     }) {
-      if (teams.has(input.teamID)) {
+      const existing = yield* fetchTeam(input.teamID)
+      if (existing) {
         return yield* Effect.fail(new CoordinatorError({ message: `Team already exists: ${input.teamID}` }))
       }
 
@@ -150,16 +167,14 @@ export const layer = Layer.effect(
 
       yield* dbTx((db) => {
         db.insert(TeamStateTable).values({
-          team_id: record.teamID as any,
+          team_id: record.teamID,
           state: record.state,
-          lead_session_id: record.leadSessionID as any,
+          lead_session_id: record.leadSessionID,
           engineer_count: record.engineerCount,
           time_created: now,
           time_updated: now,
         }).run()
       })
-
-      teams.set(input.teamID, record)
 
       void publishTeamEvent(Event.TeamCreated, {
         teamID: input.teamID,
@@ -174,14 +189,16 @@ export const layer = Layer.effect(
       teamID: TeamID
       leadSessionID: SessionID
       name?: string
+      agentName?: string
+      agentColor?: string
     }) {
-      const team = teams.get(input.teamID)
+      const team = yield* fetchTeam(input.teamID)
       if (!team) {
         return yield* Effect.fail(new CoordinatorError({ message: `Team not found: ${input.teamID}` }))
       }
 
-      const teamEngineers = [...engineers.values()].filter((e) => e.teamID === input.teamID)
-      if (teamEngineers.length >= MAX_TEAM_SIZE) {
+      const currentCount = yield* countTeamEngineers(input.teamID)
+      if (currentCount >= MAX_TEAM_SIZE) {
         return yield* Effect.fail(new CoordinatorError({ message: `Team ${input.teamID} has reached max size (${MAX_TEAM_SIZE})` }))
       }
 
@@ -192,7 +209,7 @@ export const layer = Layer.effect(
 
       const engineerID = EngineerID.ascending() as EngineerID
       const now = Date.now()
-      const engName = input.name ?? `engineer-${teamEngineers.length + 1}`
+      const engName = input.name ?? `engineer-${currentCount + 1}`
 
       const slot: EngineerSlot = {
         engineerID,
@@ -201,6 +218,8 @@ export const layer = Layer.effect(
         name: engName,
         state: "idle",
         currentTask: null,
+        agentName: input.agentName ?? null,
+        agentColor: input.agentColor ?? null,
         startedAt: now,
         lastHeartbeat: now,
       }
@@ -213,6 +232,8 @@ export const layer = Layer.effect(
           name: slot.name,
           state: slot.state,
           current_task: slot.currentTask,
+          agent_name: slot.agentName,
+          agent_color: slot.agentColor,
           started_at: slot.startedAt,
           last_heartbeat: slot.lastHeartbeat,
           time_created: now,
@@ -221,18 +242,13 @@ export const layer = Layer.effect(
 
         db.update(TeamStateTable)
           .set({
-            engineer_count: teamEngineers.length + 1,
+            engineer_count: currentCount + 1,
             state: "active",
             time_updated: now,
           })
           .where(eq(TeamStateTable.team_id, input.teamID))
           .run()
       })
-
-      engineers.set(engineerID, slot)
-      team.engineerCount = teamEngineers.length + 1
-      team.state = "active"
-      team.updatedAt = now
 
       // Note: EngineerSpawned event is published by team_spawn tool
       // which has full task details (title, description)
@@ -244,7 +260,7 @@ export const layer = Layer.effect(
       engineerID: EngineerID
       taskID: string
     }) {
-      const slot = engineers.get(input.engineerID)
+      const slot = yield* fetchEngineer(input.engineerID)
       if (!slot) {
         return yield* Effect.fail(new CoordinatorError({ message: `Engineer not found: ${input.engineerID}` }))
       }
@@ -273,7 +289,6 @@ export const layer = Layer.effect(
           .run()
       })
 
-      engineers.set(input.engineerID, updated)
       return updated
     })
 
@@ -281,17 +296,23 @@ export const layer = Layer.effect(
       engineerID: EngineerID
       teamID: TeamID
     }) {
-      const slot = engineers.get(input.engineerID)
+      const slot = yield* fetchEngineer(input.engineerID)
       if (!slot) {
         return yield* Effect.fail(new CoordinatorError({ message: `Engineer not found: ${input.engineerID}` }))
       }
 
       yield* session.remove(slot.sessionID).pipe(
-        Effect.catchCause(() => Effect.void),
+        Effect.catchCause((cause) => {
+          console.error("[Coordinator] Failed to remove session:", Cause.pretty(cause))
+          return Effect.void
+        }),
       )
 
       yield* mailbox.purge(slot.sessionID).pipe(
-        Effect.catchCause(() => Effect.void),
+        Effect.catchCause((cause) => {
+          console.error("[Coordinator] Failed to purge mailbox:", Cause.pretty(cause))
+          return Effect.void
+        }),
       )
 
       const now = Date.now()
@@ -300,9 +321,14 @@ export const layer = Layer.effect(
           .where(eq(EngineerSlotTable.id, input.engineerID))
           .run()
 
-        const remaining = [...engineers.values()].filter(
-          (e) => e.teamID === input.teamID && e.engineerID !== input.engineerID,
-        )
+        // Recompute the remaining count straight from SQL so the team
+        // row stays consistent even if another concurrent write raced
+        // with us.
+        const remaining = db
+          .select()
+          .from(EngineerSlotTable)
+          .where(eq(EngineerSlotTable.team_id, input.teamID))
+          .all()
         db.update(TeamStateTable)
           .set({
             engineer_count: remaining.length,
@@ -312,15 +338,6 @@ export const layer = Layer.effect(
           .where(eq(TeamStateTable.team_id, input.teamID))
           .run()
       })
-
-      engineers.delete(input.engineerID)
-
-      const team = teams.get(input.teamID)
-      if (team) {
-        team.engineerCount = Math.max(0, team.engineerCount - 1)
-        if (team.engineerCount === 0) team.state = "idle"
-        team.updatedAt = now
-      }
 
       void publishTeamEvent(Event.EngineerFailed, {
         teamID: input.teamID,
@@ -333,7 +350,7 @@ export const layer = Layer.effect(
     const dissolveTeam = Effect.fn("SessionCoordinator.dissolveTeam")(function* (input: {
       teamID: TeamID
     }) {
-      const team = teams.get(input.teamID)
+      const team = yield* fetchTeam(input.teamID)
       if (!team) {
         return yield* Effect.fail(new CoordinatorError({ message: `Team not found: ${input.teamID}` }))
       }
@@ -344,30 +361,42 @@ export const layer = Layer.effect(
           .where(eq(TeamStateTable.team_id, input.teamID))
           .run()
       })
-      team.state = "dissolving"
 
-      const teamEngineers = [...engineers.values()].filter((e) => e.teamID === input.teamID)
+      const engineerRows = yield* dbQuery((db) =>
+        db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.team_id, input.teamID)).all(),
+      )
 
-      for (const eng of teamEngineers) {
-        yield* session.remove(eng.sessionID).pipe(
-          Effect.catchCause(() => Effect.void),
-        )
-
-        yield* mailbox.purge(eng.sessionID).pipe(
-          Effect.catchCause(() => Effect.void),
-        )
-
-        engineers.delete(eng.engineerID)
-      }
+      yield* Effect.forEach(engineerRows, (row) =>
+        Effect.all([
+          session.remove(row.session_id).pipe(
+            Effect.catchCause((cause) => {
+              console.error("[Coordinator] Failed to remove session:", Cause.pretty(cause))
+              return Effect.void
+            }),
+          ),
+          mailbox.purge(row.session_id).pipe(
+            Effect.catchCause((cause) => {
+              console.error("[Coordinator] Failed to purge mailbox:", Cause.pretty(cause))
+              return Effect.void
+            }),
+          ),
+        ]),
+      )
 
       const allTasks = yield* taskBoard.list({ team_id: input.teamID }).pipe(
-        Effect.catchCause(() => Effect.succeed([] as any[])),
+        Effect.catchCause((cause) => {
+          console.error("[Coordinator] Failed to list tasks:", Cause.pretty(cause))
+          return Effect.succeed([] as { id: TaskBoardID }[])
+        }),
       )
-      for (const task of allTasks) {
-        yield* taskBoard.delete(task.id).pipe(
-          Effect.catchCause(() => Effect.void),
-        )
-      }
+      yield* Effect.forEach(allTasks, (task) =>
+        taskBoard.delete(task.id).pipe(
+          Effect.catchCause((cause) => {
+            console.error("[Coordinator] Failed to delete task:", Cause.pretty(cause))
+            return Effect.void
+          }),
+        ),
+      )
 
       yield* dbTx((db) => {
         db.delete(EngineerSlotTable)
@@ -378,59 +407,91 @@ export const layer = Layer.effect(
           .run()
       })
 
-      teams.delete(input.teamID)
-
       void publishTeamEvent(Event.TeamDissolved, {
         teamID: input.teamID,
         reason: "dissolved by lead",
       })
     })
 
-    const getTeam = Effect.fn("SessionCoordinator.getTeam")((teamID: TeamID) =>
-      Effect.sync(() => teams.get(teamID) ?? null),
-    )
+    const getTeam = Effect.fn("SessionCoordinator.getTeam")((teamID: TeamID) => fetchTeam(teamID))
 
     const getEngineer = Effect.fn("SessionCoordinator.getEngineer")((engineerID: EngineerID) =>
-      Effect.sync(() => engineers.get(engineerID) ?? null),
+      fetchEngineer(engineerID),
     )
 
     const listTeamEngineers = Effect.fn("SessionCoordinator.listTeamEngineers")((teamID: TeamID) =>
-      Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+      dbQuery((db) =>
+        db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.team_id, teamID)).all(),
+      ).pipe(Effect.map((rows) => rows.map(rowToSlot))),
     )
 
     const listAllEngineers = Effect.fn("SessionCoordinator.listAllEngineers")(() =>
-      Effect.sync(() => [...engineers.values()]),
+      dbQuery((db) => db.select().from(EngineerSlotTable).all()).pipe(
+        Effect.map((rows) => rows.map(rowToSlot)),
+      ),
     )
 
     const listTeams = Effect.fn("SessionCoordinator.listTeams")(() =>
-      Effect.sync(() => [...teams.values()].map((t) => ({
-        teamID: t.teamID,
-        state: t.state,
-        leadSessionID: t.leadSessionID,
-        engineerCount: t.engineerCount,
-        createdAt: t.createdAt,
-        updatedAt: t.updatedAt,
-      }))),
+      dbQuery((db) => db.select().from(TeamStateTable).all()).pipe(
+        Effect.map((rows) => rows.map(rowToTeam)),
+      ),
     )
 
     const isLead = Effect.fn("SessionCoordinator.isLead")((sessionID: SessionID) =>
-      Effect.sync(() => [...teams.values()].some((t) => t.leadSessionID === sessionID)),
+      dbQuery((db) =>
+        db
+          .select()
+          .from(TeamStateTable)
+          .where(eq(TeamStateTable.lead_session_id, sessionID))
+          .limit(1)
+          .all(),
+      ).pipe(Effect.map((rows) => rows.length > 0)),
     )
 
     const isEngineer = Effect.fn("SessionCoordinator.isEngineer")((sessionID: SessionID) =>
-      Effect.sync(() => [...engineers.values()].some((e) => e.sessionID === sessionID)),
+      dbQuery((db) =>
+        db
+          .select()
+          .from(EngineerSlotTable)
+          .where(eq(EngineerSlotTable.session_id, sessionID))
+          .limit(1)
+          .all(),
+      ).pipe(Effect.map((rows) => rows.length > 0)),
     )
 
     const getEngineerBySession = Effect.fn("SessionCoordinator.getEngineerBySession")((sessionID: SessionID) =>
-      Effect.sync(() => [...engineers.values()].find((e) => e.sessionID === sessionID) ?? null),
+      dbQuery((db) =>
+        db
+          .select()
+          .from(EngineerSlotTable)
+          .where(eq(EngineerSlotTable.session_id, sessionID))
+          .limit(1)
+          .all(),
+      ).pipe(Effect.map((rows) => (rows.length > 0 ? rowToSlot(rows[0]) : null))),
     )
 
     const getTeamForSession = Effect.fn("SessionCoordinator.getTeamForSession")((sessionID: SessionID) =>
-      Effect.sync(() => {
-        const asLead = [...teams.values()].find((t) => t.leadSessionID === sessionID)
-        if (asLead) return asLead.teamID
-        const asEngineer = [...engineers.values()].find((e) => e.sessionID === sessionID)
-        if (asEngineer) return asEngineer.teamID
+      Effect.gen(function* () {
+        const asLead = yield* dbQuery((db) =>
+          db
+            .select()
+            .from(TeamStateTable)
+            .where(eq(TeamStateTable.lead_session_id, sessionID))
+            .limit(1)
+            .all(),
+        )
+        if (asLead.length > 0) return asLead[0].team_id
+
+        const asEngineer = yield* dbQuery((db) =>
+          db
+            .select()
+            .from(EngineerSlotTable)
+            .where(eq(EngineerSlotTable.session_id, sessionID))
+            .limit(1)
+            .all(),
+        )
+        if (asEngineer.length > 0) return asEngineer[0].team_id
+
         return null
       }),
     )
@@ -439,7 +500,7 @@ export const layer = Layer.effect(
       engineerID: EngineerID,
       updates: { state?: EngineerState; currentTask?: string | null; lastHeartbeat?: number },
     ) {
-      const slot = engineers.get(engineerID)
+      const slot = yield* fetchEngineer(engineerID)
       if (!slot) {
         return yield* Effect.fail(new CoordinatorError({ message: `Engineer not found: ${engineerID}` }))
       }
@@ -464,7 +525,6 @@ export const layer = Layer.effect(
           .run()
       })
 
-      engineers.set(engineerID, updated)
       return updated
     })
 

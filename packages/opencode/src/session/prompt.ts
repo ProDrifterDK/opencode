@@ -51,6 +51,7 @@ import { SessionRunState } from "./run-state"
 import { EffectBridge } from "@/effect"
 import { Mailbox } from "@/team/mailbox"
 import { SessionCoordinator } from "@/team/session-coordinator"
+import { PermissionGuard } from "@/team/permission-guard"
 import { AutoTeam } from "@/team/auto-team"
 import { TeamID } from "@/team/types"
 import { LEAD_DAEMON_POLL_INTERVAL } from "@/team/constants"
@@ -416,6 +417,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             return run.promise(
               Effect.gen(function* () {
                 const ctx = context(args, options)
+                const guardOpt = yield* Effect.serviceOption(PermissionGuard.Service)
+                if (Option.isSome(guardOpt)) {
+                  yield* guardOpt.value.enforceForTool(ctx.sessionID, item.id, args as Record<string, unknown>)
+                }
                 yield* plugin.trigger(
                   "tool.execute.before",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -457,6 +462,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           run.promise(
             Effect.gen(function* () {
               const ctx = context(args, opts)
+              const guardOpt = yield* Effect.serviceOption(PermissionGuard.Service)
+              if (Option.isSome(guardOpt)) {
+                yield* guardOpt.value.enforceForTool(ctx.sessionID, key, args as Record<string, unknown>)
+              }
               yield* plugin.trigger(
                 "tool.execute.before",
                 { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -578,6 +587,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         description: task.description,
         subagent_type: task.agent,
         command: task.command,
+      }
+      const guardOpt = yield* Effect.serviceOption(PermissionGuard.Service)
+      if (Option.isSome(guardOpt)) {
+        yield* guardOpt.value.enforceForTool(sessionID, TaskTool.id, taskArgs as Record<string, unknown>)
       }
       yield* plugin.trigger(
         "tool.execute.before",
@@ -1694,10 +1707,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (Option.isSome(mailboxOpt)) {
                 const mailboxSvc = mailboxOpt.value
 
-                // Event-driven: subscribe to LeadMessageReceived events
-                const eventStream = bus.subscribe(Mailbox.Event.LeadMessageReceived)
+                // Event-driven: subscribe to mailbox Received events addressed to us
+                const eventStream = bus.subscribe(Mailbox.Event.Received)
                   .pipe(
-                    Stream.filter((e) => e.properties.leadSessionID === sessionID),
+                    Stream.filter((e) => e.properties.recipientSessionID === sessionID),
                     Stream.take(1),
                   )
 
