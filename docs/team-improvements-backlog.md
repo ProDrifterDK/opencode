@@ -129,10 +129,10 @@ Severity legend: **⛔ blocker** | **🔴 high** | **🟡 medium** | **🟢 low*
 
 | ID | Sev | Issue | Files | Fix sketch |
 |----|---|---|---|---|
-| O1 | 🟡 | No multi-provider failover. When a team's circuit breaker trips on the primary provider, engineers stall instead of failing over. | `src/tool/team.ts` (`TeamSpawnTool`), `src/team/daemon.ts` (`createEngineerLoopEffect`), `src/team/rate-limiter.ts` | Add `fallbackAgent` param to `team_spawn`; on `CircuitBreakerOpenError`, switch the engineer's session to the fallback agent's provider. |
-| O2 | 🟡 | Team events not exposed through the plugin system. External plugins can't observe team lifecycle. | `src/team/events.ts`, `src/plugin/index.ts` | Add `plugin.trigger("team.engineer.spawned", …)` etc. Mirror the `tool.execute.before` integration model already used by PermissionGuard. |
-| O3 | 🟢 | Team transcripts not shareable as a single artifact. Engineer sessions are linked to Lead via `parentID` but no surface to share the whole subtree. | `src/share/*`, `src/team/session-coordinator.ts` | Expose "share whole subtree" command; team-aware share URL. |
-| O4 | 🟢 | No `/team-resume` slash command. Teams in `terminated` (not `dissolved`) state could be re-attached. | `src/command/template/`, `.opencode/command/`, `src/team/session-coordinator.ts` (state="terminated" recovery) | Add `/team-resume <teamID>` that re-attaches engineers to a previously-terminated team. |
+| O1 | ✅ | **DONE 2026-04-25**. New `fallbackAgent?: string` param on `team_spawn`. Persisted via new `fallback_agent_name` column on `engineer_slot` (migration `20260425180000_fallback_agent_column`). Tool validates both primary + fallback against E4 cache. Engineer-loop catches `CircuitBreakerOpenError` and re-runs `attemptTask` with the fallback model on the SAME session via `promptService.prompt({sessionID, model: fallbackModel})` — no respawn needed. Resets per-team breaker between attempts. CLI subprocess receives both models via `--fallback-provider-id`/`--fallback-model-id` flags. EngineerSpawned event extended with fallback fields. Commit `1ae7a09f8`. |
+| O2 | ✅ | **DONE 2026-04-25**. Module-level hook notifier `notifyPluginEvent({type, properties})` added to `src/plugin/index.ts` — uses live hook-getter registration so the call works from sync code. `publishTeamEvent` calls it on the lead path only (subprocess branch short-circuits). Plugin failures are caught and logged, never blocking Bus + GlobalBus emissions. Plugins subscribe via `event` hook (same path as `bus.subscribeAll`). 4 boundary tests. Commit `bb12deb8c`. **Deviation**: spec suggested `Plugin.trigger(eventName, payload)` but that API requires Effect context + `TriggerName` registration — used `Hooks["event"]` path instead, functionally equivalent. |
+| O3 | ✅ | **DONE 2026-04-25**. New `team_share(teamID)` Lead-only tool. Calls `SessionShare.Service.share(sessionID)` once for the Lead and once per engineer (per-session API — N+1 calls). Returns structured text output: `Lead: <url>` + `Engineers (N): <name> (<task>): <url>`. `requireLead` guard. 4 tests covering 0-engineer, 2-engineer, non-lead rejection, team-not-found. Tool count 18→19. Commit `cc915da9e`. |
+| O4 | ✅ | **DONE 2026-04-25**. New `/team-resume <teamID>` slash command + `team_resume(teamID)` LLM tool. `SessionCoordinator.resumeTeam` flips state `terminated → active`. `TeamDaemon.resumeTeamMonitoring` re-attaches heartbeat (idempotent), resets `in-progress` tasks to `pending` (subprocess died mid-task), re-spawns engineers in `working`/`blocked` state via `engineerProcessManager.spawn`. Reuses worktrees via existing idempotent `createEngineerWorktree`. **No `isLead` guard** — by design: a fresh session resuming a terminated team would otherwise be locked out. State-machine check (`terminated` only) is the real authorization. 6 tests. Tool count 19→20. Commit `17c1dbc49`. |
 
 ---
 
@@ -320,6 +320,45 @@ Final: **304 pass / 0 fail** in `src/team/ src/tool/`.
 - S2's hardening is unused today. Either reintroduce a consumer (e.g., a Lead-side "checkpoint" that bundles current-tree changes) or remove `commitOnCurrentBranch` entirely in a future cleanup. Keeping it for now since the cost is small and the abstraction may have value if a non-merge commit path returns.
 - S1's rate limiter is per-process. If the daemon restarts, the window resets. Acceptable for transient flooding protection; not a hardening against persistent abuse (which would need DB-backed counters).
 - S3 reuses E4's cache, so an agent added mid-session is invisible to validation for up to 30s. Same caveat as E4 — acceptable.
+
+---
+
+## What was completed in the 2026-04-25 OpenCode-native sweep (O1-O4)
+
+Sequential dispatch — all 4 items touch `src/tool/team.ts`. Order: O1 → O2 → O4 → O3 (severity-driven; 🟡 first).
+
+### Commits
+
+- **O1 — Multi-provider failover** (`1ae7a09f8`): New `fallbackAgent?: string` param on `team_spawn`. Persisted via `engineer_slot.fallback_agent_name` column (migration `20260425180000_fallback_agent_column`, single non-destructive ALTER). Tool validates both primary + fallback agents via E4 `_agentsCache`. Engineer-loop catches `CircuitBreakerOpenError` from `RateLimiter.acquire`, calls `rateLimiter.resetCircuitBreaker(teamID)` (assumption: fallback uses different provider), and re-runs `attemptTask` with the fallback model on the SAME session via `promptService.prompt({sessionID, model: fallbackModel})` — no respawn. CLI subprocess receives both models via `--fallback-provider-id`/`--fallback-model-id` flags. `EngineerSpawned` event extended with `fallbackAgent`/`fallbackProviderID`/`fallbackModelID` fields. 9 new tests including failover decision logic with real `RateLimiter.layer`.
+- **O2 — Plugin trigger system for team events** (`bb12deb8c`): Module-level hook notifier `notifyPluginEvent({type, properties})` added to `src/plugin/index.ts`. Uses `_registerHooksGetter(() => hooks)` registered at layer init so the live hook list is accessible from sync code. `publishTeamEvent` calls `notifyPluginEvent` on the lead path AFTER `Bus.publish` + `GlobalBus.emit` (subprocess branch short-circuits before this). Plugin failures caught + logged, never propagating to Bus/GlobalBus. Plugins subscribe via the `event` hook — same path as `bus.subscribeAll`. **Deviation**: spec suggested typed `Plugin.trigger(eventName, payload)` API, but that requires Effect context + `TriggerName` registration in `Hooks` interface. Used `Hooks["event"]` path instead — functionally equivalent. 4 new tests.
+- **O4 — `/team-resume` slash command + `team_resume` tool** (`17c1dbc49`): `SessionCoordinator.resumeTeam(teamID)` flips state `terminated → active`. `TeamDaemon.resumeTeamMonitoring(teamID)` re-attaches heartbeat (idempotent via `isMonitoring` check), resets `in-progress` tasks to `pending` (the subprocess that owned them is gone), and re-spawns engineers in `working`/`blocked` state via `engineerProcessManager.spawn`. Reuses worktrees via existing idempotent `createEngineerWorktree`. **No `isLead` guard** — intentional: a fresh session resuming a terminated team would otherwise be locked out. State-machine check (`terminated` only) is the real authorization boundary. New slash command at `src/command/template/team-resume.txt` + `.opencode/command/team-resume.md`. 6 new tests. Tool count 18→19.
+- **O3 — `team_share` tool** (`cc915da9e`): New Lead-only tool. Calls `SessionShare.Service.share(sessionID)` once for the Lead session and once per engineer session (per-session API — N+1 calls). Returns structured text output:
+  ```
+  Team <id> shared:
+    Lead: <url>
+    Engineers (N):
+      engineer-X (Foo Task): <url>
+      engineer-Y (Bar Task): <url>
+  ```
+  `requireLead` guard. 4 tests. Tool count 19→20.
+
+### Test count progression (O-sweep)
+
+| Item | Before | After | Delta |
+|---|---|---|---|
+| O1 | 304 | 313 | +9 |
+| O2 | 313 | 317 | +4 |
+| O4 | 317 | 324 | +7 |
+| O3 | 324 | 328 | +4 |
+
+Final: **328 pass / 0 fail** in `src/team/ src/tool/`.
+
+### Open follow-ups / observations
+
+- O1: failover swap assumes fallback uses a *different* provider so the per-team breaker reset is safe. If both primary and fallback share a provider, the breaker reset could prematurely re-charge a still-rate-limited provider. Document expected setup: pin agents to distinct providers for failover to make sense.
+- O2: plugins receive ALL bus events via the `event` hook, including team events. There is no per-event-type subscription filter — plugins must filter by `type` themselves. Acceptable but a future enhancement could provide typed subscriptions.
+- O3: per-session sharing means N+1 share API calls. If/when `SessionShare` exposes a batch API, refactor `team_share` to use it.
+- O4: no automatic resume on daemon restart. User must explicitly call `/team-resume`. Future could add `OPENCODE_AUTO_RESUME_TEAMS=1` env flag for ops-friendly behavior.
 
 ### Open follow-ups (not blockers)
 
