@@ -3,6 +3,7 @@ import { BusEvent } from "@/bus/bus-event"
 import * as Bus from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import { Log } from "@/util"
+import { notifyPluginEvent } from "@/plugin"
 
 const log = Log.create({ service: "team.events" })
 
@@ -151,6 +152,11 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
       properties,
     },
   })
+
+  // Third publish path: plugin event hooks (best-effort, errors are caught + logged).
+  // Only fires from the lead / standalone process — engineer subprocesses do not
+  // have the plugin manager loaded (see isEngineerSubprocess guard above).
+  notifyPluginEvent({ type: def.type, properties })
 }
 
 export function subscribeTeamEvent<D extends BusEvent.Definition>(

@@ -252,6 +252,7 @@ export const layer = Layer.effect(
           Effect.forkScoped,
         )
 
+        _registerHooksGetter(() => hooks)
         return { hooks }
       }),
     )
@@ -285,5 +286,53 @@ export const layer = Layer.effect(
 )
 
 export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Config.defaultLayer))
+
+// ---------------------------------------------------------------------------
+// Module-level plugin event notifier
+// ---------------------------------------------------------------------------
+// Populated by the Plugin layer when it initialises its hook list.
+// publishTeamEvent (and other non-Effect callers) use this to fire the
+// `event` hook on every loaded plugin without needing an Effect context.
+// Each entry is a getter so that callers always read the live hook list.
+// ---------------------------------------------------------------------------
+
+const _hooksGetters: Array<() => Hooks[]> = []
+
+/** @internal Called once per instance by the Plugin layer during init. */
+export function _registerHooksGetter(get: () => Hooks[]): void {
+  _hooksGetters.push(get)
+}
+
+/** @internal For tests only — clears all registered hook getters. */
+export function _clearHooksGetters(): void {
+  _hooksGetters.length = 0
+}
+
+/**
+ * Fire `hook.event` on every loaded plugin for the given event.
+ * Best-effort: promise rejections are caught and logged, never propagated.
+ * Safe to call from synchronous (non-Effect) code.
+ */
+export function notifyPluginEvent(event: { type: string; properties: unknown }): void {
+  for (const getter of _hooksGetters) {
+    let hooks: Hooks[]
+    try {
+      hooks = getter()
+    } catch {
+      continue
+    }
+    for (const hook of hooks) {
+      const fn = hook["event"]
+      if (!fn) continue
+      try {
+        void Promise.resolve(fn({ event: event as any })).catch((err) => {
+          log.error("plugin event hook failed", { type: event.type, error: String(err) })
+        })
+      } catch (err) {
+        log.error("plugin event hook threw synchronously", { type: event.type, error: String(err) })
+      }
+    }
+  }
+}
 
 export * as Plugin from "."

@@ -144,3 +144,36 @@ subtasks: [
 1. `team_inbox` returns: `engineer-backend is blocked: needs DB schema for users table`
 2. You have the schema — send it: `team_message({ to: "<engineerID>", message: "Schema: ..." })`
 3. Engineer resumes automatically; no further action needed unless it blocks again.
+
+---
+
+## Plugin events
+
+Team lifecycle events are forwarded to loaded plugins via the `event` hook
+(`Hooks["event"]` in `@opencode-ai/plugin`). Plugins receive them alongside
+all other OpenCode bus events — no special registration is needed.
+
+### Event names and payload shapes
+
+All payloads are defined in `src/team/events.ts` as Zod schemas. The
+canonical source of truth is the `Event` constant in that file.
+
+| Event name            | Key payload fields                                                      |
+|-----------------------|-------------------------------------------------------------------------|
+| `team.created`        | `teamID`, `leadSessionID`, `goal`                                       |
+| `team.dissolved`      | `teamID`, `reason`                                                      |
+| `engineer.spawned`    | `teamID`, `engineerID`, `sessionID`, `name`, `state`, `taskID`, `taskTitle`, `taskDescription` |
+| `engineer.completed`  | `teamID`, `engineerID`, `taskId`                                        |
+| `engineer.failed`     | `teamID`, `engineerID`, `taskId`, `error`                               |
+| `engineer.progress`   | `teamID`, `engineerID`, `progressText`, `timestamp`                     |
+| `task.assigned`       | `teamID`, `taskId`, `engineerID`                                        |
+| `task.updated`        | `teamID`, `taskId`, `status`, `oldStatus`                               |
+| `task.completed`      | `teamID`, `taskId`, `engineerID`                                        |
+
+### Delivery guarantees
+
+- Events are fired from the **lead / standalone process only**. Engineer
+  subprocesses (`OPENCODE_TEAM_ENGINEER=1`) do NOT emit plugin events — they
+  forward raw JSON-lines to the lead, which then re-publishes them.
+- Plugin hook failures are caught and logged; they never block event delivery
+  to Bus or GlobalBus subscribers.
