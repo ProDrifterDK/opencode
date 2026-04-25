@@ -112,10 +112,10 @@ Severity legend: **⛔ blocker** | **🔴 high** | **🟡 medium** | **🟢 low*
 
 | ID | Sev | Issue | Files | Fix sketch |
 |----|---|---|---|---|
-| E1 | 🟡 | Token estimate hardcoded `8000` per engineer in `ENGINEER_TOKEN_ESTIMATE`. Reality varies 10×, drifting the per-team budget. | `src/team/daemon.ts` (`ENGINEER_TOKEN_ESTIMATE`), `src/session/llm.ts` (response usage) | Track actual token usage from `LLM.Service` responses; pass to `rateLimiter.release(teamID, engID, actualTokens)`. |
-| E2 | 🟢 | When a Lead picks an agent without a pinned model, the engineer inherits the Lead's model — including for trivial subtasks. *Note: routing is provider-agnostic via OpenCode agents; this is a prompt-side nudge, not a tier system.* | `src/command/template/team-start.txt` (Step 2: Decompose), `docs/team-tools-implementation.md` | Prompt nudge: annotate `complexity` per subtask in `team_decompose`; if user has agents pinned to faster providers, prefer them for low-complexity tasks. Documentation example for "good agent setup for teams." |
-| E3 | 🟢 | Bus dual-publish in `publishTeamEvent` — both local Bus and GlobalBus. Likely one is unused. | `src/team/events.ts` (`publishTeamEvent`) | Investigate which is consumed by the TUI; remove the other. |
-| E4 | 🟢 | No caching on `team_agents` — re-queries provider list every call. | `src/tool/team.ts` (`TeamAgentsTool`) | Memoize with a short TTL (~30s). |
+| E1 | ✅ | **DONE 2026-04-25**. New `RateLimiter.reconcile(teamID, engID, estimated, actual)` adjusts `tokensUsedThisMinute` by `actual - estimated` (clamped ≥0). Engineer-loop extracts tokens from `step-finish` parts of returned message and reconciles best-effort. Estimate stays as upfront budget gate. Limitation: only final assistant message captured (multi-turn partial). Commit `a228e22ce`. |
+| E2 | ✅ | **DONE 2026-04-25**. Optional `complexity?: "low"\|"medium"\|"high"` added to `SubtaskSpec` + `team_decompose` Zod schema. Pure pass-through hint — no DB migration. Tool description nudges Lead. Reference doc shows JSON example pinning faster agents to low-complexity tasks. Commit `02377749d`. |
+| E3 | ✅ | **DONE 2026-04-25** (no path dropped). Investigation found dual-publish is intentional and non-redundant: `Bus.publish` reaches daemon (heartbeat setup on EngineerSpawned), `GlobalBus.emit({directory:"global"})` reaches TUI sync (which filters on `directory === "global"` so `Bus.publish`'s instance-scoped GlobalBus emission is silently dropped). Comment expanded to document routing rationale. Commit `84912ff6d`. |
+| E4 | ✅ | **DONE 2026-04-25**. Module-level cache `_agentsCache: { value, expiresAt }` in `src/tool/team.ts`. `TeamAgentsTool.execute` checks cache before calling `agentService.list()`. New constant `TEAM_AGENTS_CACHE_TTL_MS = 30_000`. 6 boundary tests. Commit `111bde140`. |
 
 ### Security / Robustness
 
@@ -262,6 +262,36 @@ Final: **269 pass / 0 fail** in `src/team/ src/tool/`.
 - U2: TUI test coverage. The TUI sidebar navigation is exercised manually only — no automated TUI test infra.
 - U4: monitor's `formatStatus` text format unstable as feature evolves; consider structured-only output for LLM consumption.
 - U6: `team_retask` does not surface task changes to engineers if a task is reassigned mid-flight (locked to `pending`/`blocked` only — by design, but document edge cases).
+
+---
+
+## What was completed in the 2026-04-25 Efficiency sweep (E1-E4)
+
+Run via parallel-then-sequential dispatch — E1 + E3 fired in parallel, E4 + E2 sequential.
+
+### Commits
+
+- **E3 — Bus dual-publish documented** (`84912ff6d`): Investigation confirmed both bus paths in `publishTeamEvent` serve distinct subscribers. `Bus.publish` reaches daemon for `EngineerSpawned` heartbeat setup. `GlobalBus.emit({directory:"global"})` reaches TUI via SDK SSE stream — TUI filters `directory === "global"`, so `Bus.publish`'s instance-scoped GlobalBus emission is dropped. Dual-publish kept; rationale documented in `events.ts:122-141`.
+- **E1 — Real token usage reconciliation** (`a228e22ce`): New `RateLimiter.reconcile(teamID, engID, estimatedTokens, actualTokens)` adjusts `tokensUsedThisMinute` by `actual - estimated` (clamped ≥0). Engineer-loop extracts tokens from `step-finish` parts of `promptService.loop` returned message and reconciles best-effort (`Effect.ignore` on failure). Estimate stays as upfront budget gate. Limitation: only the final assistant message is captured — multi-turn token totals are partial. Documented in `extractTokensFromMessage` JSDoc.
+- **E4 — `team_agents` cache** (`111bde140`): Module-level `_agentsCache: { value, expiresAt }` in `src/tool/team.ts`. `TeamAgentsTool.execute` returns cached value within TTL, queries `agentService.list()` on miss. New constant `TEAM_AGENTS_CACHE_TTL_MS = 30_000`. 6 boundary tests in `team-agents-cache.test.ts` (TTL constant value, first-call queries, hit-within-TTL, re-query after expiry, exact boundary, instance isolation).
+- **E2 — `complexity` field on SubtaskSpec** (`02377749d`): Optional `complexity?: "low"|"medium"|"high"` added to `SubtaskSpec` interface and `team_decompose` Zod schema. Pure pass-through hint — NO DB migration. Tool description nudges: `"Annotate complexity per subtask (low/medium/high) to help match to faster agents in heterogeneous teams."` Reference doc shows JSON example pinning faster agents to low-complexity tasks. Debug log line on annotated tasks.
+
+### Test count progression (E-sweep)
+
+| Item | Before | After | Delta |
+|---|---|---|---|
+| E3 | 269 | 269 | +0 (docs only) |
+| E1 | 269 | 278 | +9 |
+| E4 | 278 | 284 | +6 |
+| E2 | 284 | 286 | +2 |
+
+Final: **286 pass / 0 fail** in `src/team/ src/tool/`.
+
+### Open follow-ups
+
+- E1: token capture is partial for multi-turn sessions. Future fix would call into a sessions service to aggregate `step-finish` parts across all assistant messages, not just the final one.
+- E2: `complexity` is pass-through only. No automated routing yet. Future O-sweep item could read `complexity` and choose agents at `team_assign` time.
+- E4: cache has no manual invalidation. If a user adds a provider mid-session, the new agent doesn't appear until 30s. Acceptable for now.
 
 ### Open follow-ups (not blockers)
 
