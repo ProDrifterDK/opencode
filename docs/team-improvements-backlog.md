@@ -121,9 +121,9 @@ Severity legend: **⛔ blocker** | **🔴 high** | **🟡 medium** | **🟢 low*
 
 | ID | Sev | Issue | Files | Fix sketch |
 |----|---|---|---|---|
-| S1 | 🟡 | `team_message` flooding from a rogue engineer. No rate limit on inter-team messages — engineer could spam Lead's inbox. | `src/tool/team.ts` (`TeamMessageTool`), `src/team/mailbox.ts` | Cap at e.g. 10 messages/min per engineer; reject with a clear error past threshold. |
-| S2 | 🟡 | `commitOnCurrentBranch` commits **all** working-tree changes — including unrelated user-staged work. | `src/team/git-manager.ts` (`commitOnCurrentBranch`) | Either scope to expected files (read from active engineers' fileScopes via SessionCoordinator), or refuse if `git status` shows files outside any active engineer's scope. |
-| S3 | 🟢 | No eager validation that requested `agentName` exists at `team_spawn` time. Falls through to `session.create` failure. | `src/tool/team.ts` (`TeamSpawnTool`) | Call `agents.get(agentName)` early; return a clear "Agent not found" error with available list. |
+| S1 | ✅ | **DONE 2026-04-25**. Per-sender sliding-window rate limiter (10 msgs/60s) in new `message-rate-limiter.ts`. `TeamMessageTool` checks before `mailbox.send`; rejects 11th in window with `Rate limit exceeded` + retry-after seconds. 5 boundary tests. Commit `d24df0f96`. |
+| S2 | ✅ | **DONE 2026-04-25 (defense-in-depth)**. Original premise (`team_commit` sweeps unrelated WIP via `git add --all`) was made **stale by A1**: post-worktree, `team_commit` uses `gitManager.mergeBranch` (squash merge), not `commitOnCurrentBranch`. The latter is now dead code. Hardening still applied: `commitOnCurrentBranch(input: { message, fileScopes? })` — non-empty union → `git add -- <pathspec>`, empty → `--all` fallback. Future-proofs the method if a consumer is reintroduced. Plus 14 unrelated stub fixes unblocked type-safe paths in tests. Commit `f64293ff1`. |
+| S3 | ✅ | **DONE 2026-04-25**. `TeamSpawnTool.execute` validates `agentName` against `_agentsCache` (E4) at tool boundary before any state mutation. Error format: `Agent '<name>' not found. Available: <comma-separated list>` (filters hidden/native agents). 9 boundary tests including case-insensitive match and cache hit/miss. Commit `99ecbc331`. |
 
 ### OpenCode-native opportunities
 
@@ -292,6 +292,34 @@ Final: **286 pass / 0 fail** in `src/team/ src/tool/`.
 - E1: token capture is partial for multi-turn sessions. Future fix would call into a sessions service to aggregate `step-finish` parts across all assistant messages, not just the final one.
 - E2: `complexity` is pass-through only. No automated routing yet. Future O-sweep item could read `complexity` and choose agents at `team_assign` time.
 - E4: cache has no manual invalidation. If a user adds a provider mid-session, the new agent doesn't appear until 30s. Acceptable for now.
+
+---
+
+## What was completed in the 2026-04-25 Security/Robustness sweep (S1-S3)
+
+Sequential dispatch — all 3 items touched `tool/team.ts`. Order: S3 → S1 → S2.
+
+### Commits
+
+- **S3 — Eager `agentName` validation in `team_spawn`** (`99ecbc331`): `TeamSpawnTool.execute` now calls into the E4 `_agentsCache` at the tool boundary before any state mutation. If lookup fails, returns `Agent '<name>' not found. Available: <list>` (filters hidden/native agents). 9 boundary tests covering valid name, case-insensitive match, unknown name with full error message, empty string, no-visible-agents edge case, cache hit, cache miss.
+- **S1 — `team_message` per-sender rate limit** (`d24df0f96`): New `src/team/message-rate-limiter.ts` with module-level `Map<senderID, number[]>` sliding-window limiter. `checkAndRecordMessage(senderID)` prunes timestamps older than `MESSAGE_RATE_WINDOW_MS = 60_000` and rejects if remaining count ≥ `MESSAGE_RATE_LIMIT_PER_MIN = 10`. `TeamMessageTool` gates before `mailbox.send`; rejection returns `Rate limit exceeded: 10 messages/min per sender. Retry in ~Ns.`. 5 tests including allow-10, reject-11th, window-reset, per-sender isolation, exact-boundary pruning.
+- **S2 — `commitOnCurrentBranch` pathspec scope** (`f64293ff1`): Hardening applied as defense-in-depth. **Important context**: post-A1 (worktree-per-engineer), `team_commit` uses `gitManager.mergeBranch` (squash merge), NOT `commitOnCurrentBranch`. The latter is now dead code with no live caller. Original S2 premise (sweep unrelated WIP via `git add --all`) is stale. Hardening still applied: signature changed to `(input: { message, fileScopes? })`. Non-empty union → `git add -- <pathspec>`, empty → `--all` fallback. Future-proofs the method. Bonus: 14 unrelated stub fixes (`makeGitManagerStub`/`makeTaskBoardStub` were missing methods added by A1/B4) unblocked type-safe paths in `team-commit-tool.test.ts`.
+
+### Test count progression (S-sweep)
+
+| Item | Before | After | Delta |
+|---|---|---|---|
+| S3 | 286 | 295 | +9 |
+| S1 | 295 | 300 | +5 |
+| S2 | 300 | 304 | +4 (+ 14 unrelated stub-fix tests unblocked) |
+
+Final: **304 pass / 0 fail** in `src/team/ src/tool/`.
+
+### Open follow-ups / observations
+
+- S2's hardening is unused today. Either reintroduce a consumer (e.g., a Lead-side "checkpoint" that bundles current-tree changes) or remove `commitOnCurrentBranch` entirely in a future cleanup. Keeping it for now since the cost is small and the abstraction may have value if a non-merge commit path returns.
+- S1's rate limiter is per-process. If the daemon restarts, the window resets. Acceptable for transient flooding protection; not a hardening against persistent abuse (which would need DB-backed counters).
+- S3 reuses E4's cache, so an agent added mid-session is invisible to validation for up to 30s. Same caveat as E4 — acceptable.
 
 ### Open follow-ups (not blockers)
 
