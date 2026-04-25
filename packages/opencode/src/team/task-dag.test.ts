@@ -11,6 +11,7 @@ import { describe, test, expect, beforeEach } from "bun:test"
 import { Effect, Layer } from "effect"
 import { Service as LeadCoordinatorService, CyclicDependenciesError } from "./lead-coordinator"
 import { Service as TaskBoardRepoService } from "./task-board"
+import { Service as RateLimiterService } from "./rate-limiter"
 import { LeadCoordinatorError } from "./lead-coordinator"
 import type {
   Task,
@@ -134,10 +135,21 @@ import { layer as leadLayer } from "./lead-coordinator"
 
 let memBoard: ReturnType<typeof makeMemoryTaskBoard>
 
+const makeNullRateLimiter = () =>
+  RateLimiterService.of({
+    acquire: () => Effect.void,
+    release: () => Effect.void,
+    report429: () => Effect.void,
+    resetCircuitBreaker: () => Effect.void,
+    getStats: () => null,
+    forgetTeam: () => {},
+  })
+
 const makeLayers = () => {
   memBoard = makeMemoryTaskBoard()
   const repoLayer = Layer.succeed(TaskBoardRepoService, memBoard)
-  return leadLayer.pipe(Layer.provide(repoLayer))
+  const rlLayer = Layer.succeed(RateLimiterService, makeNullRateLimiter())
+  return leadLayer.pipe(Layer.provide(repoLayer), Layer.provide(rlLayer))
 }
 
 const runWith = <A>(effect: Effect.Effect<A, any, LeadCoordinatorService>) => {

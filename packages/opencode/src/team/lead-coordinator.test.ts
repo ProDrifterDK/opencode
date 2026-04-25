@@ -2,6 +2,8 @@ import { describe, test, expect, beforeEach } from "bun:test"
 import { Effect, Layer } from "effect"
 import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as TaskBoardRepoService } from "./task-board"
+import { Service as RateLimiterService } from "./rate-limiter"
+import type { RateLimiterStats } from "./rate-limiter"
 import type { Task, TaskBoardID, CreateTaskInput, UpdateTaskInput, TaskBoardFilter, TeamID, EngineerID } from "./task-board.sql"
 import type { EngineerStateRecord } from "./types"
 
@@ -101,9 +103,29 @@ const makeEngineer = (suffix: string, state: EngineerStateRecord["state"] = "idl
 const memBoard = makeMemoryTaskBoard()
 const testTaskBoardLayer = Layer.succeed(TaskBoardRepoService, memBoard)
 
+const makeMemoryRateLimiter = (statsOverride?: RateLimiterStats | null) => {
+  const statsMap = new Map<string, RateLimiterStats>()
+  if (statsOverride !== undefined) {
+    // Will be returned for any teamID if set
+    statsMap.set("__default__", statsOverride as RateLimiterStats)
+  }
+  return RateLimiterService.of({
+    acquire: () => Effect.void,
+    release: () => Effect.void,
+    report429: () => Effect.void,
+    resetCircuitBreaker: () => Effect.void,
+    getStats: (teamID: string) => statsMap.get(teamID) ?? statsMap.get("__default__") ?? null,
+    forgetTeam: () => {},
+  })
+}
+
+const testRateLimiterLayer = Layer.succeed(RateLimiterService, makeMemoryRateLimiter())
+
 import { layer as leadLayer } from "./lead-coordinator"
 
-const resolvedLead = leadLayer.pipe(Layer.provide(testTaskBoardLayer))
+const resolvedLead = leadLayer.pipe(
+  Layer.provide(Layer.merge(testTaskBoardLayer, testRateLimiterLayer)),
+)
 
 const runWith = <A>(
   effect: Effect.Effect<A, any, LeadCoordinatorService>,
@@ -552,5 +574,130 @@ describe("LeadCoordinator", () => {
     expect(status).toContain("1/4 completed")
     expect(status).toContain("eng_a [working] — Auth model")
     expect(status).toContain("eng_b [idle]")
+  })
+
+  test("monitor returns report with rateLimits populated when RateLimiter has state", async () => {
+    const mockStats: RateLimiterStats = {
+      activeCalls: 2,
+      queuedCalls: 1,
+      tokensUsedThisMinute: 12000,
+      tokensBudgetPerMinute: 100000,
+      circuitBreakerOpen: false,
+      consecutive429s: 0,
+    }
+
+    const rateLimiterWithStats = makeMemoryRateLimiter(mockStats)
+    const layerWithStats = leadLayer.pipe(
+      Layer.provide(
+        Layer.merge(testTaskBoardLayer, Layer.succeed(RateLimiterService, rateLimiterWithStats)),
+      ),
+    )
+
+    const report = await Effect.provide(
+      Effect.gen(function* () {
+        const svc = yield* LeadCoordinatorService
+        return yield* svc.monitor(TEAM_ID)
+      }),
+      layerWithStats,
+    ).pipe(Effect.runPromise)
+
+    expect(report.rateLimits).toBeDefined()
+    expect(report.rateLimits).not.toBeNull()
+    expect(report.rateLimits!.tokensUsedThisMinute).toBe(12000)
+    expect(report.rateLimits!.tokensBudgetPerMinute).toBe(100000)
+    expect(report.rateLimits!.activeCalls).toBe(2)
+    expect(report.rateLimits!.queuedCalls).toBe(1)
+    expect(report.rateLimits!.circuitBreakerOpen).toBe(false)
+  })
+
+  test("monitor returns rateLimits null when RateLimiter has no state for team", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const report = await runWith(service.monitor("team_no_rl_state" as TeamID))
+    expect(report.rateLimits).toBeNull()
+  })
+
+  test("formatStatus renders rate-limit summary when rateLimits present", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const report = {
+      totalTasks: 2,
+      pending: 0,
+      inProgress: 1,
+      completed: 1,
+      failed: 0,
+      blocked: 0,
+      engineers: [],
+      blockers: [],
+      rateLimits: {
+        activeCalls: 3,
+        queuedCalls: 2,
+        tokensUsedThisMinute: 12000,
+        tokensBudgetPerMinute: 100000,
+        circuitBreakerOpen: false,
+        consecutive429s: 0,
+      } satisfies RateLimiterStats,
+    }
+
+    const status = service.formatStatus(report)
+    expect(status).toContain("Rate limits:")
+    expect(status).toContain("12000/100000")
+    expect(status).toContain("12%")
+    expect(status).toContain("active 3")
+    expect(status).toContain("queued 2")
+    expect(status).toContain("CB: closed")
+  })
+
+  test("formatStatus renders circuit breaker open with 429 count", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const report = {
+      totalTasks: 1,
+      pending: 0,
+      inProgress: 0,
+      completed: 1,
+      failed: 0,
+      blocked: 0,
+      engineers: [],
+      blockers: [],
+      rateLimits: {
+        activeCalls: 0,
+        queuedCalls: 5,
+        tokensUsedThisMinute: 0,
+        tokensBudgetPerMinute: 100000,
+        circuitBreakerOpen: true,
+        consecutive429s: 3,
+      } satisfies RateLimiterStats,
+    }
+
+    const status = service.formatStatus(report)
+    expect(status).toContain("CB: open")
+    expect(status).toContain("3 429s")
+  })
+
+  test("formatStatus omits rate-limit line when rateLimits is null/undefined", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const report = {
+      totalTasks: 1,
+      pending: 1,
+      inProgress: 0,
+      completed: 0,
+      failed: 0,
+      blocked: 0,
+      engineers: [],
+      blockers: [],
+    }
+
+    const status = service.formatStatus(report)
+    expect(status).not.toContain("Rate limits:")
   })
 })

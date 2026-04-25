@@ -201,6 +201,7 @@ export const TeamMonitorTool = Tool.define(
               failed: report.failed,
               blocked: report.blocked,
               unreadMessages: messages.length,
+              rateLimits: report.rateLimits ?? null,
             },
           }
         }).pipe(toolErrorBoundary),

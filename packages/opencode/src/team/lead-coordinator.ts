@@ -4,6 +4,8 @@ import { TaskBoardRepo, TaskBoardRepoError } from "./task-board"
 import { type EngineerID, type EngineerStateRecord } from "./types"
 import { MAX_TEAM_SIZE, TASK_BOARD_MAX_TASKS } from "./constants"
 import { Event, publishTeamEvent } from "./events"
+import { RateLimiter } from "./rate-limiter"
+import type { RateLimiterStats } from "./rate-limiter"
 import type {
   Task,
   TaskBoardID,
@@ -64,6 +66,7 @@ export interface ProgressReport {
   blocked: number
   engineers: EngineerSummary[]
   blockers: Task[]
+  rateLimits?: RateLimiterStats | null
 }
 
 const encodeFiles = (files: string[]): string => JSON.stringify(files)
@@ -103,10 +106,11 @@ export class Service extends Context.Service<Service, Interface>()(
   "@opencode/LeadCoordinator",
 ) {}
 
-export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.effect(
+export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimiter.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const taskBoard = yield* TaskBoardRepo.Service
+    const rateLimiter = yield* RateLimiter.Service
 
     const decompose = Effect.fn("LeadCoordinator.decompose")(
       function* (input: DecomposeInput) {
@@ -382,11 +386,14 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
           (t) => t.status === "blocked" && t.blocked_by && !completedIds.has(t.blocked_by),
         )
 
+        const rateLimits = rateLimiter.getStats(teamId)
+
         return {
           totalTasks: tasks.length,
           ...counts,
           engineers: [...engineerMap.values()],
           blockers,
+          rateLimits,
         }
       },
     )
@@ -460,6 +467,16 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
         for (const b of report.blockers) {
           lines.push(`    ${b.title} (blocked by ${b.blocked_by as string})`)
         }
+      }
+      if (report.rateLimits != null) {
+        const rl = report.rateLimits
+        const tokenPct = rl.tokensBudgetPerMinute > 0
+          ? Math.round((rl.tokensUsedThisMinute / rl.tokensBudgetPerMinute) * 100)
+          : 0
+        const cbState = rl.circuitBreakerOpen ? "open" : "closed"
+        lines.push(
+          `  Rate limits: tokens ${rl.tokensUsedThisMinute}/${rl.tokensBudgetPerMinute} (${tokenPct}%), active ${rl.activeCalls}, queued ${rl.queuedCalls}, CB: ${cbState}${rl.consecutive429s > 0 ? ` (${rl.consecutive429s} 429s)` : ""}`,
+        )
       }
       return lines.join("\n")
     }

@@ -106,7 +106,10 @@ export const AppLayer = Layer.mergeAll(
   SessionShare.defaultLayer,
   TaskBoardRepo.layer,
   Mailbox.defaultLayer,
-  LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer)),
+  LeadCoordinator.layer.pipe(
+    Layer.provide(TaskBoardRepo.layer),
+    Layer.provide(RateLimiter.layer),
+  ),
   SessionCoordinator.defaultLayer,
   GitManager.layer,
   RateLimiter.layer,
@@ -119,7 +122,12 @@ export const AppLayer = Layer.mergeAll(
   // Scope lifetime, which is future work. See src/team/heartbeat.ts.
   HeartbeatMonitor.layer.pipe(
     Layer.provide(SessionCoordinator.defaultLayer),
-    Layer.provide(LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer))),
+    Layer.provide(
+      LeadCoordinator.layer.pipe(
+        Layer.provide(TaskBoardRepo.layer),
+        Layer.provide(RateLimiter.layer),
+      ),
+    ),
     Layer.provide(Mailbox.defaultLayer),
   ),
   TeamDaemon.layer.pipe(
