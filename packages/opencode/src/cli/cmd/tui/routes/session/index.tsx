@@ -619,6 +619,7 @@ export function Session() {
     {
       title: conceal() ? "Disable code concealment" : "Enable code concealment",
       value: "session.toggle.conceal",
+      search: "toggle code concealment",
       keybind: "messages_toggle_conceal",
       category: "Session",
       onSelect: (dialog) => {
