@@ -227,6 +227,19 @@ const memMailbox = MailboxService.of({
       }
     }),
 
+  purgeOlderThan: (maxAgeMs) =>
+    Effect.sync(() => {
+      const cutoff = Date.now() - maxAgeMs
+      let purged = 0
+      for (const [id, row] of mailboxStore) {
+        if (row.created_at < cutoff) {
+          mailboxStore.delete(id)
+          purged++
+        }
+      }
+      return purged
+    }),
+
   hasUnread: (input) =>
     Effect.sync(() =>
       [...mailboxStore.values()].some(
@@ -990,5 +1003,101 @@ describe("Team Lifecycle Integration", () => {
 
     await Effect.runPromise(memCoordinator.dissolveTeam({ teamID: TEAM_ID }))
     expect(teams.has(TEAM_ID)).toBe(false)
+  })
+
+  // ── B5: Mailbox TTL + GC + purge wiring regression ─────────────────
+  describe("Mailbox GC", () => {
+    test("purgeOlderThan removes messages older than threshold", async () => {
+      const recipient = "sess_gc_recipient" as SessionID
+      const sender = "sess_gc_sender" as SessionID
+
+      // Inject a message, then backdate it
+      const oldMsg = await Effect.runPromise(
+        memMailbox.send({
+          recipientSessionID: recipient,
+          senderSessionID: sender,
+          priority: "inbox",
+          type: "info",
+          content: "old message",
+        }),
+      )
+      // Backdate to 25h ago by mutating the in-memory row directly
+      const stored = mailboxStore.get(oldMsg.id)!
+      mailboxStore.set(oldMsg.id, { ...stored, created_at: Date.now() - 25 * 60 * 60 * 1000 })
+
+      // Add a fresh message that should survive
+      await Effect.runPromise(
+        memMailbox.send({
+          recipientSessionID: recipient,
+          senderSessionID: sender,
+          priority: "inbox",
+          type: "info",
+          content: "fresh message",
+        }),
+      )
+
+      const purged = await Effect.runPromise(memMailbox.purgeOlderThan(86_400_000))
+      expect(purged).toBe(1)
+
+      const remaining = await Effect.runPromise(memMailbox.peek(recipient))
+      expect(remaining.length).toBe(1)
+      expect(remaining[0].content).toBe("fresh message")
+    })
+
+    test("killEngineer purges that engineer's mailbox", async () => {
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 1 }))
+      const eng = await Effect.runPromise(
+        memCoordinator.spawnEngineer({ teamID: TEAM_ID, leadSessionID: LEAD_SESSION, name: "engineer-kill" }),
+      )
+
+      await Effect.runPromise(
+        memMailbox.send({
+          recipientSessionID: eng.sessionID,
+          senderSessionID: LEAD_SESSION,
+          priority: "inbox",
+          type: "task-assignment",
+          content: "test",
+        }),
+      )
+
+      const before = await Effect.runPromise(memMailbox.peek(eng.sessionID))
+      expect(before.length).toBe(1)
+
+      await Effect.runPromise(memCoordinator.killEngineer({ teamID: TEAM_ID, engineerID: eng.engineerID }))
+
+      const remaining = await Effect.runPromise(memMailbox.peek(eng.sessionID))
+      expect(remaining.length).toBe(0)
+    })
+
+    test("dissolveTeam purges all engineers' mailboxes", async () => {
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 0 }))
+      const e1 = await Effect.runPromise(
+        memCoordinator.spawnEngineer({ teamID: TEAM_ID, leadSessionID: LEAD_SESSION, name: "engineer-d1" }),
+      )
+      const e2 = await Effect.runPromise(
+        memCoordinator.spawnEngineer({ teamID: TEAM_ID, leadSessionID: LEAD_SESSION, name: "engineer-d2" }),
+      )
+
+      for (const sid of [e1.sessionID, e2.sessionID]) {
+        await Effect.runPromise(
+          memMailbox.send({
+            recipientSessionID: sid,
+            senderSessionID: LEAD_SESSION,
+            priority: "inbox",
+            type: "task-assignment",
+            content: "work",
+          }),
+        )
+      }
+
+      expect(mailboxStore.size).toBe(2)
+
+      await Effect.runPromise(memCoordinator.dissolveTeam({ teamID: TEAM_ID }))
+
+      const r1 = await Effect.runPromise(memMailbox.peek(e1.sessionID))
+      const r2 = await Effect.runPromise(memMailbox.peek(e2.sessionID))
+      expect(r1.length).toBe(0)
+      expect(r2.length).toBe(0)
+    })
   })
 })

@@ -20,6 +20,7 @@ import {
   HEARTBEAT_CHECK_INTERVAL,
   HEARTBEAT_TIMEOUT,
   ENGINEER_KILL_TIMEOUT_MS,
+  MAILBOX_MAX_AGE_MS,
 } from "./constants"
 import { RateLimiter } from "./rate-limiter"
 import { Service as HeartbeatMonitorService, layer as heartbeatLayer } from "./heartbeat"
@@ -457,6 +458,25 @@ export const layer = Layer.effect(
       }))
     }
 
+    // Age-based mailbox GC. Messages older than MAILBOX_MAX_AGE_MS are
+    // orphans (sender/recipient session likely already gone) — drop them
+    // so the mailbox table doesn't grow unbounded. Driven by the same
+    // setInterval as `checkForStaleEngineers`.
+    const purgeStaleMailboxMessages = () => {
+      AppRuntime.runFork(
+        mailbox.purgeOlderThan(MAILBOX_MAX_AGE_MS).pipe(
+          Effect.tap((count) =>
+            count > 0
+              ? Effect.sync(() => log.info("mailbox GC purged old messages", { count }))
+              : Effect.void,
+          ),
+          Effect.catchCause((cause) =>
+            Effect.sync(() => log.error("mailbox GC failed", { cause })),
+          ),
+        ),
+      )
+    }
+
     const handleLeadMessageReceived = (event: {
       type: string
       properties: {
@@ -774,7 +794,10 @@ export const layer = Layer.effect(
       unsubscribers.push(unsubPartUpdated)
 
       heartbeatUpdateInterval = setInterval(updateRunningHeartbeats, HEARTBEAT_UPDATE_INTERVAL)
-      heartbeatCheckInterval = setInterval(checkForStaleEngineers, HEARTBEAT_CHECK_INTERVAL)
+      heartbeatCheckInterval = setInterval(() => {
+        checkForStaleEngineers()
+        purgeStaleMailboxMessages()
+      }, HEARTBEAT_CHECK_INTERVAL)
 
       if (!sigintHandlerRegistered) {
         sigintHandlerRegistered = true

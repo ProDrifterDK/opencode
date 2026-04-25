@@ -8,6 +8,9 @@ export const ENGINEER_MAX_RUNTIME = 2 * 60 * 60 * 1000
 
 export const MAILBOX_QUEUE_DEPTH = 50
 
+/** Mailbox messages older than this are GC'd by the daemon sweep. Orphan-cleanup TTL, not unread management. */
+export const MAILBOX_MAX_AGE_MS = 86_400_000 // 24h
+
 export const LEAD_CONTEXT_BUDGET = 0.6
 
 export const TASK_BOARD_MAX_TASKS = 100

@@ -1,4 +1,4 @@
-import { eq, and, asc, isNull, sql } from "drizzle-orm"
+import { eq, and, asc, isNull, lt, sql } from "drizzle-orm"
 import z from "zod"
 import { Effect, Layer, Context } from "effect"
 import { Schema } from "effect"
@@ -48,6 +48,7 @@ export interface Interface {
   readonly peek: (recipientSessionID: SessionID) => Effect.Effect<MailboxRow[], DbError>
   readonly markRead: (input: { messageID: MailboxID; recipientSessionID: SessionID }) => Effect.Effect<void, DbError>
   readonly purge: (recipientSessionID: SessionID) => Effect.Effect<void, DbError>
+  readonly purgeOlderThan: (maxAgeMs: number) => Effect.Effect<number, DbError>
   readonly hasUnread: (input: {
     recipientSessionID: SessionID
     priority?: MailboxPriority
@@ -245,7 +246,18 @@ export const layer = Layer.effect(
       })
     })
 
-    return Service.of({ send, receive, receiveByPriority, peek, markRead, purge, hasUnread })
+    const purgeOlderThan = Effect.fn("Mailbox.purgeOlderThan")(function* (maxAgeMs: number) {
+      const cutoff = Date.now() - maxAgeMs
+      return yield* dbTx((db) => {
+        const result = db
+          .delete(MailboxTable)
+          .where(lt(MailboxTable.created_at, cutoff))
+          .run() as { changes?: number } | undefined
+        return result?.changes ?? 0
+      })
+    })
+
+    return Service.of({ send, receive, receiveByPriority, peek, markRead, purge, purgeOlderThan, hasUnread })
   }),
 )
 
