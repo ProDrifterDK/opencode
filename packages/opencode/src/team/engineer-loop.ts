@@ -13,9 +13,9 @@
  *     rate-limit slot, send the engineer prompt, run the prompt loop,
  *     publish team events, and release the slot on exit.
  *
- * Phase 2 will pipe `publishTeamEvent` calls out via stdout JSON so the
- * lead can mirror them onto its own bus. Phase 1 keeps events local to
- * the engineer's own process.
+ * Phase 2 wired `publishTeamEvent` to write JSON-line events to stdout
+ * via `events.ts`; the lead reads them via `engineer-event-reader.ts`
+ * and mirrors them onto its own bus.
  */
 import { Effect } from "effect"
 import { Log } from "@/util"

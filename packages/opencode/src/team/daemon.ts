@@ -179,6 +179,10 @@ const startEngineerInBackground = (
     modelID?: string
     teammates?: Array<{ name: string; engineerID: string; task?: string }>
   },
+  // Injection seam: the caller (inside `layer`) passes the locally-defined
+  // `attachExitHandler` closure so that `startEngineerInBackground` can
+  // remain a module-level function while still capturing `coordinator`
+  // from the layer scope. Tests may inject a stub here.
   attachExitHandler: (params: {
     teamID: TeamID
     engineerID: EngineerID

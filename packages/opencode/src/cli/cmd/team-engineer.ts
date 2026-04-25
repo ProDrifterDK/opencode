@@ -124,9 +124,9 @@ export const TeamEngineerRunCommand = cmd({
             taskDescription,
             providerID,
             modelID,
-            // Phase 1 keeps engineer events local; the lead's daemon
-            // can't see them yet, so a static teammates list isn't
-            // worth fetching here. Phase 2 will revisit.
+            // Engineer runs without peer awareness; `teammates: []` is a
+            // known gap (backlog: A3-followup teammate hydration). The
+            // value is used to address mailbox messages between engineers.
             teammates: [],
           }),
         )
