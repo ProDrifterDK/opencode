@@ -73,11 +73,54 @@ export const Event = {
   })),
 } as const
 
+/**
+ * True when the current process is an engineer subprocess spawned by
+ * the lead via EngineerProcessManager. Set in the spawn `env`
+ * (OPENCODE_TEAM_ENGINEER=1). When true, publishTeamEvent forwards
+ * events to stdout as JSON-lines instead of emitting on GlobalBus —
+ * GlobalBus is process-local and the lead can't see it from a
+ * different process anyway. The lead-side reader
+ * (engineer-event-reader.ts) decodes those lines and republishes them
+ * onto the lead's Bus + GlobalBus.
+ */
+const isEngineerSubprocess = (): boolean => process.env.OPENCODE_TEAM_ENGINEER === "1"
+
+/**
+ * Encode an event as a JSON-line and write it to stdout. Defensive:
+ * if stdout.write throws (broken pipe, etc.) we catch + log + drop the
+ * event. The engineer must NOT crash because the lead disconnected.
+ */
+function writeEngineerEventToStdout(type: string, properties: unknown): void {
+  let line: string
+  try {
+    line = JSON.stringify({ type, properties })
+  } catch (err) {
+    log.error("failed to serialize engineer event", { type, error: String(err) })
+    return
+  }
+  try {
+    process.stdout.write(line + "\n")
+  } catch (err) {
+    log.error("failed to write engineer event to stdout", { type, error: String(err) })
+  }
+}
+
 export function publishTeamEvent<D extends BusEvent.Definition>(
   def: D,
   properties: z.output<D["properties"]>,
 ): void {
-  // Publish to Effect Bus (for backend subscribers like daemon).
+  if (isEngineerSubprocess()) {
+    // engineer subprocess publishes only via stdout — local Bus is the lead's path.
+    // Bus.publish is intentionally skipped here: there are no in-process subscribers
+    // to team events on the engineer side, and GlobalBus is process-local so it
+    // would never reach the lead. The lead-side reader (engineer-event-reader.ts)
+    // decodes these JSON-lines and republishes them on the lead's Bus + GlobalBus.
+    writeEngineerEventToStdout(def.type, properties)
+    return
+  }
+
+  // Lead / standalone process: publish to Effect Bus (for backend subscribers like
+  // daemon) and emit to GlobalBus so the TUI receives the event.
   // Silently ignore "No context found" errors — they occur when publishTeamEvent
   // is called outside an active instance (e.g. tests, gracefulShutdown). In those
   // cases the GlobalBus emission below is sufficient.
@@ -88,8 +131,6 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
     }
   })
 
-  // Also emit to GlobalBus so TUI receives the event
-  // Use "global" directory so it's processed regardless of workspace
   GlobalBus.emit("event", {
     directory: "global",
     payload: {

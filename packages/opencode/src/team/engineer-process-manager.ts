@@ -9,16 +9,21 @@
  * The default layer uses `Bun.spawn`. Tests can substitute a layer that
  * returns a fake handle so they don't actually fork bun processes.
  *
- * Notes for Phase 2 / Phase 3:
- *   - stdio is piped but unread today; Phase 2 owns the stdout reader
- *     for forwarding engineer events back to the lead's bus.
+ * Notes for Phase 3:
+ *   - Phase 2 (this commit) wires the stdout event reader (forwards
+ *     publishTeamEvent calls from the engineer back to the lead's Bus
+ *     + GlobalBus) and the stderr drain (keeps the OS pipe buffer from
+ *     filling and blocking the child).
  *   - No `.exited` handler is attached; Phase 3 will wire crash
- *     detection and clean up stale slots in `RunningEngineer`.
+ *     detection and clean up stale slots in `RunningEngineer`. The
+ *     readers in this file naturally end when their pipes close, so
+ *     Phase 3 only needs to detect process exit + call `removeRunning`.
  */
 import { Context, Effect, Layer, Schema } from "effect"
 import { Log } from "@/util"
 import { sanitizedProcessEnv } from "@/util/opencode-process"
 import type { EngineerID, TeamID } from "./types"
+import { readEngineerEvents, drainEngineerStderr } from "./engineer-event-reader"
 
 const log = Log.create({ service: "team.engineer-process-manager" })
 
@@ -139,11 +144,38 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
               OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS: "1",
               OPENCODE_TEAM_ID: teamID,
               OPENCODE_ENGINEER_ID: engineerID,
+              // Phase 2 of A3: tells `publishTeamEvent` (in events.ts)
+              // to write events as JSON-lines on stdout instead of
+              // emitting on GlobalBus, since GlobalBus is process-local
+              // and would never reach the lead. The reader below
+              // decodes those lines and republishes them on the lead's
+              // Bus + GlobalBus.
+              OPENCODE_TEAM_ENGINEER: "1",
             }),
           })
 
           if (typeof subprocess.pid !== "number") {
             throw new Error("Bun.spawn did not return a pid")
+          }
+
+          // Phase 2 of A3: attach the stdout event reader and stderr
+          // drain. Both run as detached promises that resolve when the
+          // child closes its respective pipe; we don't await them here
+          // (the engineer outlives this spawn call). Phase 3 will add
+          // the `.exited` watcher; the readers naturally end before
+          // that promise resolves.
+          //
+          // The pipes are typed as ReadableStream<Uint8Array> by Bun.
+          // If for some reason a runtime returns null (e.g. mocked
+          // subprocess in a test) we just skip drainage rather than
+          // throwing — keeping spawn itself defensive.
+          const stdout = subprocess.stdout as ReadableStream<Uint8Array> | null | undefined
+          const stderr = subprocess.stderr as ReadableStream<Uint8Array> | null | undefined
+          if (stdout && typeof stdout.getReader === "function") {
+            void readEngineerEvents(stdout)
+          }
+          if (stderr && typeof stderr.getReader === "function") {
+            void drainEngineerStderr(stderr)
           }
 
           log.info("engineer subprocess spawned", {
