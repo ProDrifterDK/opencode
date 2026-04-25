@@ -312,6 +312,82 @@ describe("RateLimiter", () => {
     expect(result.errorB).toBeInstanceOf(CircuitBreakerOpenError)
   })
 
+  // --- reconcile tests ---
+
+  test("reconcile: actual > estimate increases tokensUsedThisMinute", async () => {
+    const result = await runWith(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_A, ENG_A, "engineer", 8000)
+      // Loop finishes with 12000 actual tokens
+      yield* service.reconcile(TEAM_A, ENG_A, 8000, 12000)
+      return service.getStats(TEAM_A)
+    }))
+
+    expect(result?.tokensUsedThisMinute).toBe(12000)
+  })
+
+  test("reconcile: actual < estimate decreases tokensUsedThisMinute", async () => {
+    const result = await runWith(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_A, ENG_A, "engineer", 8000)
+      // Loop finishes using only 5000 tokens
+      yield* service.reconcile(TEAM_A, ENG_A, 8000, 5000)
+      return service.getStats(TEAM_A)
+    }))
+
+    expect(result?.tokensUsedThisMinute).toBe(5000)
+  })
+
+  test("reconcile: actual === estimate leaves tokensUsedThisMinute unchanged", async () => {
+    const result = await runWith(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_A, ENG_A, "engineer", 8000)
+      yield* service.reconcile(TEAM_A, ENG_A, 8000, 8000)
+      return service.getStats(TEAM_A)
+    }))
+
+    expect(result?.tokensUsedThisMinute).toBe(8000)
+  })
+
+  test("reconcile: clamps tokensUsedThisMinute to 0 if delta would go negative", async () => {
+    const result = await runWith(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_A, ENG_A, "engineer", 8000)
+      // Actual is 0 (e.g., loop was interrupted immediately)
+      yield* service.reconcile(TEAM_A, ENG_A, 8000, 0)
+      return service.getStats(TEAM_A)
+    }))
+
+    expect(result?.tokensUsedThisMinute).toBe(0)
+  })
+
+  test("reconcile: no-op when team state does not exist", async () => {
+    // Should not throw — team may have been dissolved before reconcile ran
+    await expect(
+      runWith(Effect.gen(function* () {
+        const service = yield* RateLimiterService
+        yield* service.reconcile("team_never_created" as TeamID, ENG_A, 8000, 12000)
+      })),
+    ).resolves.toBeUndefined()
+  })
+
+  test("reconcile: multiple engineers — only target team's budget is adjusted", async () => {
+    const result = await runWith(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_A, ENG_A, "engineer", 8000)
+      yield* service.acquire(TEAM_B, ENG_B, "engineer", 8000)
+      // Reconcile only TEAM_A
+      yield* service.reconcile(TEAM_A, ENG_A, 8000, 3000)
+      return {
+        tokensA: service.getStats(TEAM_A)?.tokensUsedThisMinute,
+        tokensB: service.getStats(TEAM_B)?.tokensUsedThisMinute,
+      }
+    }))
+
+    expect(result.tokensA).toBe(3000)
+    expect(result.tokensB).toBe(8000)
+  })
+
   // --- isolation tests ---
 
   test("two teams have independent token budgets", async () => {

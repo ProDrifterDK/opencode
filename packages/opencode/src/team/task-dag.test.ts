@@ -139,6 +139,7 @@ const makeNullRateLimiter = () =>
   RateLimiterService.of({
     acquire: () => Effect.void,
     release: () => Effect.void,
+    reconcile: () => Effect.void,
     report429: () => Effect.void,
     resetCircuitBreaker: () => Effect.void,
     getStats: () => null,

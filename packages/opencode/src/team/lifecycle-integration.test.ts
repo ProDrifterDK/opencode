@@ -708,6 +708,39 @@ describe("Team Lifecycle Integration", () => {
     expect(engineers.has(ENG_B)).toBe(true)
   })
 
+  // 7b. Rate limiter reconcile: token budget adjusted after engineer loop completes
+  test("rate limiter reconcile: actual > estimate bumps tokensUsedThisMinute", async () => {
+    const result = await runRateLimiter(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_ID, ENG_A, "engineer", 8000)
+      yield* service.reconcile(TEAM_ID, ENG_A, 8000, 14000)
+      return service.getStats(TEAM_ID)
+    }))
+
+    expect(result?.tokensUsedThisMinute).toBe(14000)
+  })
+
+  test("rate limiter reconcile: actual < estimate reduces tokensUsedThisMinute", async () => {
+    const result = await runRateLimiter(Effect.gen(function* () {
+      const service = yield* RateLimiterService
+      yield* service.acquire(TEAM_ID, ENG_A, "engineer", 8000)
+      yield* service.reconcile(TEAM_ID, ENG_A, 8000, 2000)
+      return service.getStats(TEAM_ID)
+    }))
+
+    expect(result?.tokensUsedThisMinute).toBe(2000)
+  })
+
+  test("rate limiter reconcile: no-op when team dissolved before reconcile", async () => {
+    await expect(
+      runRateLimiter(Effect.gen(function* () {
+        const service = yield* RateLimiterService
+        // Never acquired — simulate dissolved team scenario
+        yield* service.reconcile(TEAM_ID, ENG_A, 8000, 12000)
+      })),
+    ).resolves.toBeUndefined()
+  })
+
   // 8. Rate limit queue — 6th request queued
   test("rate limit queue: 6th request queued when max concurrent = 4 and 2 in queue", async () => {
     const result = await runRateLimiterScoped(Effect.gen(function* () {

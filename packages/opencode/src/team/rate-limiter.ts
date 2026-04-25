@@ -55,6 +55,25 @@ export interface Interface {
     estimatedTokens: number,
   ) => Effect.Effect<void, RateLimitExhaustedError | CircuitBreakerOpenError>
   readonly release: (teamID: TeamID, engineerID: EngineerID, tokensUsed: number) => Effect.Effect<void>
+  /**
+   * Reconcile the token budget after an engineer's loop completes. The
+   * acquire step reserved `estimatedTokens` upfront; once the actual usage
+   * is known, call this to apply the delta so the minute-window counter
+   * reflects reality instead of the estimate.
+   *
+   * Semantics:
+   *   - delta = actualTokens - estimatedTokens
+   *   - tokensUsedThisMinute += delta  (clamped to ≥0)
+   *
+   * Best-effort: if the team state no longer exists (e.g. team dissolved
+   * before reconcile ran) the call is a silent no-op.
+   */
+  readonly reconcile: (
+    teamID: TeamID,
+    engineerID: EngineerID,
+    estimatedTokens: number,
+    actualTokens: number,
+  ) => Effect.Effect<void>
   readonly report429: (teamID: TeamID, engineerID: EngineerID) => Effect.Effect<void>
   // resetCircuitBreaker is per-team: clears the breaker only for the given team.
   readonly resetCircuitBreaker: (teamID: TeamID) => Effect.Effect<void>
@@ -200,6 +219,16 @@ export const layer = Layer.effect(
       },
     )
 
+    const reconcile = Effect.fn("RateLimiter.reconcile")(
+      function* (teamID: TeamID, _engineerID: EngineerID, estimatedTokens: number, actualTokens: number) {
+        const s = teamStates.get(teamID)
+        if (!s) return // team already dissolved — silent no-op
+        resetMinuteWindow(s)
+        const delta = actualTokens - estimatedTokens
+        s.tokensUsedThisMinute = Math.max(0, s.tokensUsedThisMinute + delta)
+      },
+    )
+
     const report429 = Effect.fn("RateLimiter.report429")(
       function* (teamID: TeamID, engineerID: EngineerID) {
         const s = getOrCreateTeamState(teamID)
@@ -249,6 +278,7 @@ export const layer = Layer.effect(
     return Service.of({
       acquire,
       release,
+      reconcile,
       report429,
       resetCircuitBreaker,
       getStats,

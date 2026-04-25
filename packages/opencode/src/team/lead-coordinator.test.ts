@@ -112,6 +112,7 @@ const makeMemoryRateLimiter = (statsOverride?: RateLimiterStats | null) => {
   return RateLimiterService.of({
     acquire: () => Effect.void,
     release: () => Effect.void,
+    reconcile: () => Effect.void,
     report429: () => Effect.void,
     resetCircuitBreaker: () => Effect.void,
     getStats: (teamID: string) => statsMap.get(teamID) ?? statsMap.get("__default__") ?? null,

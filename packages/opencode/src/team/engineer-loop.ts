@@ -21,6 +21,7 @@ import { Effect } from "effect"
 import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
+import { MessageV2 } from "@/session/message-v2"
 import { Event, publishTeamEvent } from "./events"
 import { RateLimiter } from "./rate-limiter"
 import type { EngineerID, TeamID } from "./types"
@@ -31,9 +32,28 @@ const log = Log.create({ service: "team.engineer-loop" })
 // Rough token estimate per engineer lifetime. Used only as a budget hint
 // for the rate limiter's per-minute token window — the exact number matters
 // less than the fact that we reserve *some* budget so N engineers can't
-// spawn unlimited LLM traffic. If we ever get real token accounting back
-// from the LLM service, pass it to release() instead.
+// spawn unlimited LLM traffic. After the loop completes, the actual usage
+// from the final LLM response is reconciled via rateLimiter.reconcile().
 export const ENGINEER_TOKEN_ESTIMATE = 8000
+
+/**
+ * Sum input + output tokens across all `step-finish` parts in a message.
+ * Returns 0 when no step-finish parts are present (caller treats as no-op).
+ *
+ * Note: this captures only the tokens from the *final* assistant message
+ * returned by promptService.loop. For multi-turn engineer sessions the
+ * count is a partial view — it still beats the hard-coded estimate for the
+ * common single-turn case and is better than nothing for multi-turn.
+ */
+export const extractTokensFromMessage = (msg: MessageV2.WithParts): number => {
+  let total = 0
+  for (const part of msg.parts) {
+    if (part.type === "step-finish") {
+      total += (part.tokens?.input ?? 0) + (part.tokens?.output ?? 0)
+    }
+  }
+  return total
+}
 
 export interface EngineerLoopInput {
   teamID: string
@@ -146,8 +166,29 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
         timestamp: Date.now(),
       })
 
-      yield* promptService.loop({ sessionID: input.sessionID })
+      const loopResult = yield* promptService.loop({ sessionID: input.sessionID })
       log.info("engineer loop completed", { engineerID: input.engineerID })
+
+      // Reconcile the rate-limiter token budget: replace the upfront estimate
+      // with the actual tokens consumed by this engineer's session.
+      // Best-effort — if token extraction or reconcile fails, engineer
+      // completion still succeeds.
+      yield* Effect.gen(function* () {
+        const actualTokens = extractTokensFromMessage(loopResult)
+        if (actualTokens > 0) {
+          yield* rateLimiter.reconcile(
+            input.teamID as TeamID,
+            input.engineerID as EngineerID,
+            ENGINEER_TOKEN_ESTIMATE,
+            actualTokens,
+          )
+          log.info("token reconciliation applied", {
+            engineerID: input.engineerID,
+            estimated: ENGINEER_TOKEN_ESTIMATE,
+            actual: actualTokens,
+          })
+        }
+      }).pipe(Effect.ignore)
 
       // The lead's running map is in a different process now (Phase 1).
       // deleteRunning here is a no-op when the loop runs in a subprocess
