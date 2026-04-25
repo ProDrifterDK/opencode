@@ -9,6 +9,7 @@ import { TeamID, EngineerID, type EngineerState } from "./types"
 import { MAX_TEAM_SIZE } from "./constants"
 import { Event, publishTeamEvent } from "./events"
 import type { SessionID } from "../session/schema"
+import { deriveEngineerName } from "./engineer-naming"
 
 export class CoordinatorError extends Schema.TaggedErrorClass<CoordinatorError>()("CoordinatorError", {
   message: Schema.String,
@@ -46,6 +47,7 @@ export interface Interface {
     teamID: TeamID
     leadSessionID: SessionID
     name?: string
+    taskTitle?: string
     agentName?: string
     agentColor?: string
   }) => Effect.Effect<EngineerSlot, CoordinatorError>
@@ -188,6 +190,7 @@ export const layer = Layer.effect(
       teamID: TeamID
       leadSessionID: SessionID
       name?: string
+      taskTitle?: string
       agentName?: string
       agentColor?: string
     }) {
@@ -208,7 +211,7 @@ export const layer = Layer.effect(
 
       const engineerID = EngineerID.ascending() as EngineerID
       const now = Date.now()
-      const engName = input.name ?? `engineer-${currentCount + 1}`
+      const engName = input.name ?? deriveEngineerName(input.taskTitle, currentCount + 1)
 
       const slot: EngineerSlot = {
         engineerID,
