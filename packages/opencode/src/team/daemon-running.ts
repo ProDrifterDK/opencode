@@ -3,7 +3,6 @@
  * Kept separate so unit tests can import without pulling in
  * the full daemon (which triggers Effect app-runtime init).
  */
-import { Fiber } from "effect"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "@/session/schema"
 
@@ -11,10 +10,23 @@ export type RunningEngineer = {
   engineerID: string
   sessionID: SessionID
   teamID: string
-  fiber: Fiber.RuntimeFiber<any, any>
   startedAt: number
   worktreePath: string
   branch: string
+  /**
+   * OS process ID of the engineer subprocess. Phase 1 of A3 replaces the
+   * in-process Effect fiber with a `Bun.spawn`ed child — the lead now sees
+   * each engineer as a real OS process, so a crashing/OOM engineer cannot
+   * take down the lead.
+   */
+  pid: number
+  /**
+   * Handle to the spawned child process. Optional for tests that inject a
+   * fake spawner — production always sets this. Phase 2 will read stdio
+   * from this handle to forward engineer events back to the lead's bus,
+   * Phase 3 will wire `.exited` into crash detection.
+   */
+  subprocess?: import("bun").Subprocess
 }
 
 export const running = new Map<TeamID, Map<EngineerID, RunningEngineer>>()

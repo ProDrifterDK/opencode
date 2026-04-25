@@ -1,4 +1,4 @@
-import { Effect, Layer, Context, Fiber } from "effect"
+import { Effect, Layer, Context } from "effect"
 import { Bus } from "@/bus"
 import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
@@ -18,9 +18,10 @@ import { RateLimiter } from "./rate-limiter"
 import { Service as HeartbeatMonitorService, layer as heartbeatLayer } from "./heartbeat"
 import { LeadCoordinator } from "./lead-coordinator"
 import { GitManager } from "./git-manager"
-import { InstanceRef } from "@/effect/instance-ref"
-import { Instance, type InstanceContext } from "@/project/instance"
-import { LocalContext } from "@/util"
+import {
+  Service as EngineerProcessManager,
+  layer as engineerProcessManagerLayer,
+} from "./engineer-process-manager"
 import type { EngineerID, TeamID } from "./types"
 import type { TaskBoardID } from "./task-board.sql"
 import {
@@ -34,6 +35,19 @@ import {
 } from "./daemon-running"
 
 const log = Log.create({ service: "team.daemon" })
+
+// Best-effort SIGTERM on an engineer subprocess. Errors are logged but
+// never thrown — losing visibility into a kill failure is acceptable
+// (Phase 3 will add `.exited` confirmation). Lives outside Effect.gen
+// so callers don't need try/catch inside generators.
+const killEngineerSubprocess = (engineerID: string, pid: number, sub: import("bun").Subprocess | undefined): void => {
+  if (!sub) return
+  try {
+    sub.kill()
+  } catch (err) {
+    log.warn("subprocess.kill() failed", { engineerID, pid, error: String(err) })
+  }
+}
 
 // Heartbeat constants are defined in ./constants and imported above.
 // The daemon's setInterval sweep acts as a backstop for teams that
@@ -130,150 +144,12 @@ export function gracefulShutdown(): void {
   running.clear()
 }
 
-// Rough token estimate per engineer lifetime. Used only as a budget hint
-// for the rate limiter's per-minute token window — the exact number matters
-// less than the fact that we reserve *some* budget so N engineers can't
-// spawn unlimited LLM traffic. If we ever get real token accounting back
-// from the LLM service, pass it to release() instead.
-const ENGINEER_TOKEN_ESTIMATE = 8000
-
-const createEngineerLoopEffect = (input: {
-  teamID: string
-  engineerID: string
-  sessionID: SessionID
-  name: string
-  taskId: string
-  taskTitle: string
-  taskDescription: string
-  providerID?: string
-  modelID?: string
-  teammates?: Array<{ name: string; engineerID: string; task?: string }>
-}) =>
-  Effect.gen(function* () {
-    const rateLimiter = yield* RateLimiter.Service
-    const promptService = yield* SessionPrompt.Service
-
-    log.info("starting engineer loop", {
-      engineerID: input.engineerID,
-      sessionID: input.sessionID,
-      model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
-    })
-
-    // Acquire a rate-limit slot. Blocks while the queue is full; fails
-    // fast with CircuitBreakerOpenError if too many consecutive 429s have
-    // been reported. `release` only runs if acquire succeeds (via the
-    // `ensuring` on the body below — if acquire throws, control exits
-    // this gen before reaching the ensuring guard).
-    yield* rateLimiter.acquire(
-      input.teamID as TeamID,
-      input.engineerID as EngineerID,
-      "engineer",
-      ENGINEER_TOKEN_ESTIMATE,
-    )
-
-    yield* Effect.gen(function* () {
-    // Emit initial progress
-    publishTeamEvent(Event.EngineerProgress, {
-      teamID: input.teamID,
-      engineerID: input.engineerID,
-      progressText: `Starting: ${input.taskTitle.slice(0, 40)}${input.taskTitle.length > 40 ? "..." : ""}`,
-      timestamp: Date.now(),
-    })
-
-    // Build teammates section if we have teammates
-    const teammatesSection = input.teammates && input.teammates.length > 0
-      ? [
-          ``,
-          `Your teammates:`,
-          ...input.teammates.map((t) => `- ${t.name} (ID: ${t.engineerID})${t.task ? ` - working on: ${t.task}` : ""}`),
-          `Use team_message with recipientID to collaborate with them.`,
-        ]
-      : []
-
-    const engineerPrompt = [
-      `You are an engineer on team ${input.teamID}. Your name is ${input.name}.`,
-      ...teammatesSection,
-      ``,
-      `Your assigned task:`,
-      `Title: ${input.taskTitle}`,
-      `Description: ${input.taskDescription}`,
-      ``,
-      `Instructions:`,
-      `1. Analyze the task and plan your approach`,
-      `2. Execute the work using available tools (Read, Write, Edit, Bash, etc.)`,
-      `3. Test your changes`,
-      `4. Write your findings/report to a file: .tmp/report-${input.name}.md`,
-      `5. IMPORTANT: When finished, call team_report with:`,
-      `   - status: "completed" (or "blocked"/"failed" if issues)`,
-      `   - summary: ONE sentence + path to report file (e.g., "Completed review. Report: .tmp/report-${input.name}.md")`,
-      `   - DO NOT send full report content via team_report — keep summary under 200 chars`,
-      `6. After reporting, you may check team_tasks for NEW unassigned work.`,
-      `   - team_tasks only shows pending, unassigned tasks (NOT your completed task)`,
-      `   - If NEW tasks are available, use team_claim to claim one and work on it.`,
-      `   - If NO NEW tasks are available, STOP. Do not reclaim your completed task.`,
-      ``,
-      `Collaboration tools:`,
-      `- team_message: Send message to a teammate or lead`,
-      `- team_roster: See all teammates and their IDs`,
-      `- team_tasks: List available tasks (only shows pending, unassigned tasks)`,
-      `- team_claim: Claim an unassigned task`,
-      ``,
-      `Start working on your assigned task now. Remember to call team_report when done.`,
-    ].join("\n")
-
-    // Build model parameter if specified
-    const modelParam = input.providerID && input.modelID
-      ? { providerID: input.providerID, modelID: input.modelID }
-      : undefined
-
-    yield* promptService.prompt({
-      sessionID: input.sessionID,
-      parts: [{ type: "text", text: engineerPrompt }],
-      model: modelParam,
-    })
-    log.info("engineer completed initial prompt", { engineerID: input.engineerID })
-
-    // Emit working progress
-    publishTeamEvent(Event.EngineerProgress, {
-      teamID: input.teamID,
-      engineerID: input.engineerID,
-      progressText: `Working on: ${input.taskTitle.slice(0, 35)}${input.taskTitle.length > 35 ? "..." : ""}`,
-      timestamp: Date.now(),
-    })
-
-    yield* promptService.loop({ sessionID: input.sessionID })
-    log.info("engineer loop completed", { engineerID: input.engineerID })
-
-    deleteRunning(input.teamID as TeamID, input.engineerID as EngineerID)
-    publishTeamEvent(Event.EngineerCompleted, {
-      teamID: input.teamID,
-      engineerID: input.engineerID,
-      taskId: input.taskId,
-    })
-    }).pipe(
-      // Release the rate-limit slot on ANY exit of the body (success,
-      // failure, or interruption from checkForStaleEngineers). Errors from
-      // release itself are swallowed — losing a slot is better than
-      // compounding a failure. The outer acquire lives above this ensuring,
-      // so if acquire itself fails, release never runs (correct).
-      Effect.ensuring(
-        rateLimiter
-          .release(input.teamID as TeamID, input.engineerID as EngineerID, ENGINEER_TOKEN_ESTIMATE)
-          .pipe(Effect.ignore),
-      ),
-    )
-  })
-
-// Capture the current Instance context at call time (synchronous, outside Effect.gen)
-// so the engineer fiber can be forked with its worktree directory overriding ctx.directory.
-function resolveEngineerCtx(worktreePath: string): InstanceContext | undefined {
-  try {
-    return { ...Instance.current, directory: worktreePath }
-  } catch (err) {
-    if (err instanceof LocalContext.NotFound) return undefined
-    throw err
-  }
-}
+// Engineer loop body lives in `./engineer-loop.ts`. It is no longer
+// invoked in-process here; instead, the lead spawns a subprocess via
+// `EngineerProcessManager.spawn` (Phase 1 of A3) and the new
+// `team-engineer-run` CLI subcommand calls `runEngineerLoop` inside
+// the child. Process isolation means a crashing engineer can't take
+// the lead with it.
 
 const startEngineerInBackground = (input: {
   teamID: string
@@ -289,6 +165,7 @@ const startEngineerInBackground = (input: {
 }) =>
   Effect.gen(function* () {
     const gitManager = yield* GitManager.Service
+    const processManager = yield* EngineerProcessManager
 
     log.info("creating worktree for engineer", {
       engineerID: input.engineerID,
@@ -300,33 +177,42 @@ const startEngineerInBackground = (input: {
       engineerID: input.engineerID as EngineerID,
     })
 
-    log.info("forking engineer loop in background", {
+    log.info("spawning engineer subprocess", {
       engineerID: input.engineerID,
       worktreePath,
       branch,
       model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
     })
 
-    // Override InstanceRef so tools in this engineer's fiber use the worktree directory.
-    // resolveEngineerCtx is called synchronously here (outside try/catch inside gen).
-    const engineerCtx = resolveEngineerCtx(worktreePath)
-    const loopEffect = engineerCtx
-      ? createEngineerLoopEffect(input).pipe(Effect.provideService(InstanceRef, engineerCtx))
-      : createEngineerLoopEffect(input)
-
-    const fiber = AppRuntime.runFork(loopEffect)
+    const spawned = yield* processManager.spawn({
+      teamID: input.teamID as TeamID,
+      engineerID: input.engineerID as EngineerID,
+      sessionID: input.sessionID,
+      worktreePath,
+      taskID: input.taskId,
+      taskTitle: input.taskTitle,
+      taskDescription: input.taskDescription,
+      name: input.name,
+      providerID: input.providerID,
+      modelID: input.modelID,
+    })
 
     setRunning(input.teamID as TeamID, input.engineerID as EngineerID, {
       engineerID: input.engineerID,
       sessionID: input.sessionID,
       teamID: input.teamID,
-      fiber,
       startedAt: Date.now(),
       worktreePath,
       branch,
+      pid: spawned.pid,
+      subprocess: spawned.subprocess,
     })
 
-    log.info("engineer loop forked", { engineerID: input.engineerID, running: countAllRunning() })
+    log.info("engineer subprocess registered", {
+      engineerID: input.engineerID,
+      pid: spawned.pid,
+      running: countAllRunning(),
+    })
   })
 
 export const layer = Layer.effect(
@@ -399,8 +285,14 @@ export const layer = Layer.effect(
 
         const runningEngineer = getRunningEngineer(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
         if (runningEngineer) {
-          log.info("interrupting engineer fiber", { engineerID: engineer.engineerID })
-          yield* Fiber.interrupt(runningEngineer.fiber)
+          log.info("killing engineer subprocess", {
+            engineerID: engineer.engineerID,
+            pid: runningEngineer.pid,
+          })
+          // Phase 1: best-effort SIGTERM. Phase 3 will add an
+          // `.exited` watcher so we can confirm the child actually
+          // died and clean up regardless.
+          killEngineerSubprocess(engineer.engineerID, runningEngineer.pid, runningEngineer.subprocess)
           deleteRunning(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
         }
       })
@@ -806,8 +698,11 @@ export const layer = Layer.effect(
       unsubscribers = []
 
       for (const [, engineerID, engineer] of iterAllRunning()) {
-        log.info("interrupting engineer", { engineerID })
-        yield* Fiber.interrupt(engineer.fiber)
+        log.info("killing engineer subprocess on daemon stop", {
+          engineerID,
+          pid: engineer.pid,
+        })
+        killEngineerSubprocess(engineerID as string, engineer.pid, engineer.subprocess)
       }
       running.clear()
 
@@ -845,6 +740,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Mailbox.defaultLayer),
   Layer.provide(TaskBoardRepo.layer),
   Layer.provide(RateLimiter.layer),
+  Layer.provide(engineerProcessManagerLayer),
 )
 
 export * as TeamDaemon from "./daemon"
