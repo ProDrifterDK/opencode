@@ -19,9 +19,10 @@
  * runs as a detached promise; it ends naturally when the underlying
  * stream closes.
  *
- * Phase 3 will add `.exited` plumbing for crash detection — this
- * module's reader naturally ends when stdout closes, so all Phase 3
- * needs is to call `removeRunning` after the exit promise resolves.
+ * Phase 3 added `.exited` plumbing for crash detection via
+ * `attachExitHandler` in daemon.ts — this module's reader naturally
+ * ends when stdout closes; the exit handler calls `deleteRunning` and
+ * reconciles DB state after the exit promise resolves.
  */
 import z from "zod"
 import { BusEvent } from "@/bus/bus-event"

@@ -4,6 +4,7 @@ import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Event, publishTeamEvent } from "./events"
+import { reconcileExitedEngineer } from "./engineer-lifecycle"
 import { SessionCoordinator, type EngineerSlot } from "./session-coordinator"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Mailbox, Event as MailboxEvent } from "./mailbox"
@@ -13,7 +14,13 @@ import { EngineerSlotTable, TeamStateTable } from "./session-coordinator.sql"
 import { TaskBoardTable } from "./task-board.sql"
 import { eq } from "drizzle-orm"
 import { Event as MessageEvent } from "@/session/message-v2"
-import { ENGINEER_MAX_RUNTIME, HEARTBEAT_UPDATE_INTERVAL, HEARTBEAT_CHECK_INTERVAL, HEARTBEAT_TIMEOUT } from "./constants"
+import {
+  ENGINEER_MAX_RUNTIME,
+  HEARTBEAT_UPDATE_INTERVAL,
+  HEARTBEAT_CHECK_INTERVAL,
+  HEARTBEAT_TIMEOUT,
+  ENGINEER_KILL_TIMEOUT_MS,
+} from "./constants"
 import { RateLimiter } from "./rate-limiter"
 import { Service as HeartbeatMonitorService, layer as heartbeatLayer } from "./heartbeat"
 import { LeadCoordinator } from "./lead-coordinator"
@@ -21,6 +28,8 @@ import { GitManager } from "./git-manager"
 import {
   Service as EngineerProcessManager,
   layer as engineerProcessManagerLayer,
+  terminateSubprocess,
+  type KillableSubprocess,
 } from "./engineer-process-manager"
 import type { EngineerID, TeamID } from "./types"
 import type { TaskBoardID } from "./task-board.sql"
@@ -36,17 +45,23 @@ import {
 
 const log = Log.create({ service: "team.daemon" })
 
-// Best-effort SIGTERM on an engineer subprocess. Errors are logged but
-// never thrown — losing visibility into a kill failure is acceptable
-// (Phase 3 will add `.exited` confirmation). Lives outside Effect.gen
-// so callers don't need try/catch inside generators.
-const killEngineerSubprocess = (engineerID: string, pid: number, sub: import("bun").Subprocess | undefined): void => {
+// Phase 3 of A3 — graceful kill with SIGTERM→SIGKILL escalation. Fire
+// and forget: callers don't await the exit (the centralized exit
+// handler does the cleanup). Errors are swallowed so a missing pipe
+// or already-dead child doesn't crash callers in a generator.
+const killEngineerSubprocess = (
+  engineerID: string,
+  pid: number,
+  sub: import("bun").Subprocess | undefined,
+): void => {
   if (!sub) return
-  try {
-    sub.kill()
-  } catch (err) {
-    log.warn("subprocess.kill() failed", { engineerID, pid, error: String(err) })
-  }
+  // Cast: the production handle is a Bun.Subprocess. The helper accepts
+  // a structural KillableSubprocess so tests can pass simpler fakes.
+  void terminateSubprocess(sub as unknown as KillableSubprocess, {
+    timeoutMs: ENGINEER_KILL_TIMEOUT_MS,
+  }).catch((err) => {
+    log.warn("terminateSubprocess threw", { engineerID, pid, error: String(err) })
+  })
 }
 
 // Heartbeat constants are defined in ./constants and imported above.
@@ -151,18 +166,25 @@ export function gracefulShutdown(): void {
 // the child. Process isolation means a crashing engineer can't take
 // the lead with it.
 
-const startEngineerInBackground = (input: {
-  teamID: string
-  engineerID: string
-  sessionID: SessionID
-  name: string
-  taskId: string
-  taskTitle: string
-  taskDescription: string
-  providerID?: string
-  modelID?: string
-  teammates?: Array<{ name: string; engineerID: string; task?: string }>
-}) =>
+const startEngineerInBackground = (
+  input: {
+    teamID: string
+    engineerID: string
+    sessionID: SessionID
+    name: string
+    taskId: string
+    taskTitle: string
+    taskDescription: string
+    providerID?: string
+    modelID?: string
+    teammates?: Array<{ name: string; engineerID: string; task?: string }>
+  },
+  attachExitHandler: (params: {
+    teamID: TeamID
+    engineerID: EngineerID
+    subprocess: import("bun").Subprocess
+  }) => void,
+) =>
   Effect.gen(function* () {
     const gitManager = yield* GitManager.Service
     const processManager = yield* EngineerProcessManager
@@ -208,6 +230,17 @@ const startEngineerInBackground = (input: {
       subprocess: spawned.subprocess,
     })
 
+    // Phase 3 of A3: wire the centralized exit handler. This is the
+    // single cleanup path for the lead's `running` map — whether the
+    // engineer exits cleanly, crashes, gets OOM-killed, or is killed
+    // by `terminateSubprocess`, the handler observes one resolution of
+    // `subprocess.exited` and runs `deleteRunning` exactly once.
+    attachExitHandler({
+      teamID: input.teamID as TeamID,
+      engineerID: input.engineerID as EngineerID,
+      subprocess: spawned.subprocess,
+    })
+
     log.info("engineer subprocess registered", {
       engineerID: input.engineerID,
       pid: spawned.pid,
@@ -243,6 +276,80 @@ export const layer = Layer.effect(
             .pipe(Effect.catchCause(() => Effect.void))
         }
       }))
+    }
+
+    /**
+     * Phase 3 of A3 — centralized engineer exit handler.
+     *
+     * Attached after every successful spawn. When the subprocess's
+     * `.exited` Promise resolves (for ANY reason: clean exit, crash,
+     * OOM, manual kill), this function:
+     *
+     *   1. Looks up the slot. If already cleaned up by an earlier
+     *      pass (e.g. a manual `terminateEngineer` already deleted
+     *      it), returns silently — race-safe.
+     *   2. Deletes the slot from the lead's `running` map. This is
+     *      the single source of truth for cleanup; `terminateEngineer`
+     *      no longer touches `deleteRunning` itself.
+     *   3. Re-reads the engineer's DB state. If it's still "working"
+     *      (the engineer crashed before the lead processed an
+     *      EngineerCompleted/EngineerFailed event for it), marks the
+     *      slot `failed` and emits `EngineerFailed` with the exit code
+     *      in the reason. The heartbeat sweep gates on
+     *      `state === "working"`, so once this fires the sweep no
+     *      longer competes.
+     */
+    const attachExitHandler = (params: {
+      teamID: TeamID
+      engineerID: EngineerID
+      subprocess: import("bun").Subprocess
+    }) => {
+      void params.subprocess.exited
+        .then((code) => {
+          const slot = getRunningEngineer(params.teamID, params.engineerID)
+
+          AppRuntime.runFork(
+            Effect.gen(function* () {
+              const engineerSlot = yield* coordinator.getEngineer(params.engineerID)
+              const action = reconcileExitedEngineer({
+                slot,
+                currentState: engineerSlot?.state,
+                code: code ?? null,
+              })
+
+              if (action.kind === "noop") {
+                log.debug("exit handler: slot already gone, skipping", {
+                  engineerID: params.engineerID,
+                  code,
+                })
+                return
+              }
+
+              deleteRunning(params.teamID, params.engineerID)
+
+              log.info("engineer subprocess exited", {
+                engineerID: params.engineerID,
+                pid: slot!.pid,
+                code,
+              })
+
+              if (action.kind === "delete") return
+
+              // action.kind === "delete-and-fail": engineer crashed while working
+              yield* coordinator
+                .updateEngineer(params.engineerID, { state: "failed" })
+                .pipe(Effect.ignore)
+
+              publishTeamEvent(Event.EngineerFailed, {
+                teamID: params.teamID,
+                engineerID: params.engineerID,
+                taskId: engineerSlot?.currentTask ?? "unknown",
+                error: action.reason,
+              })
+            }).pipe(Effect.catchCause(() => Effect.void)),
+          )
+        })
+        .catch((err) => log.error("exit handler failed", { err }))
     }
 
     const terminateEngineer = (
@@ -289,11 +396,12 @@ export const layer = Layer.effect(
             engineerID: engineer.engineerID,
             pid: runningEngineer.pid,
           })
-          // Phase 1: best-effort SIGTERM. Phase 3 will add an
-          // `.exited` watcher so we can confirm the child actually
-          // died and clean up regardless.
+          // Phase 3 of A3: graceful kill (SIGTERM, escalate to SIGKILL
+          // after ENGINEER_KILL_TIMEOUT_MS). The `.exited` handler
+          // attached at spawn time owns the `running` map cleanup, so
+          // we don't call deleteRunning here — that would create two
+          // racing cleanup paths. Fire and forget.
           killEngineerSubprocess(engineer.engineerID, runningEngineer.pid, runningEngineer.subprocess)
-          deleteRunning(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
         }
       })
 
@@ -536,18 +644,21 @@ export const layer = Layer.effect(
             task: e.currentTask ?? undefined,
           }))
 
-        yield* startEngineerInBackground({
-          teamID: event.properties.teamID,
-          engineerID: event.properties.engineerID,
-          sessionID: event.properties.sessionID as SessionID,
-          name: event.properties.name,
-          taskId: event.properties.taskID,
-          taskTitle: event.properties.taskTitle,
-          taskDescription: event.properties.taskDescription,
-          providerID: event.properties.providerID,
-          modelID: event.properties.modelID,
-          teammates: otherEngineers,
-        })
+        yield* startEngineerInBackground(
+          {
+            teamID: event.properties.teamID,
+            engineerID: event.properties.engineerID,
+            sessionID: event.properties.sessionID as SessionID,
+            name: event.properties.name,
+            taskId: event.properties.taskID,
+            taskTitle: event.properties.taskTitle,
+            taskDescription: event.properties.taskDescription,
+            providerID: event.properties.providerID,
+            modelID: event.properties.modelID,
+            teammates: otherEngineers,
+          },
+          attachExitHandler,
+        )
       })
 
       AppRuntime.runFork(startWithTeammates.pipe(

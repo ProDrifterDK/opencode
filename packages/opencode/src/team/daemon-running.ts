@@ -22,9 +22,9 @@ export type RunningEngineer = {
   pid: number
   /**
    * Handle to the spawned child process. Optional for tests that inject a
-   * fake spawner — production always sets this. Phase 2 will read stdio
-   * from this handle to forward engineer events back to the lead's bus,
-   * Phase 3 will wire `.exited` into crash detection.
+   * fake spawner — production always sets this. Phase 2 reads stdio from
+   * this handle to forward engineer events back to the lead's bus;
+   * Phase 3 wired `.exited` into crash detection via `attachExitHandler` in daemon.ts.
    */
   subprocess?: import("bun").Subprocess
 }

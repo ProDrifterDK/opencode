@@ -9,21 +9,22 @@
  * The default layer uses `Bun.spawn`. Tests can substitute a layer that
  * returns a fake handle so they don't actually fork bun processes.
  *
- * Notes for Phase 3:
- *   - Phase 2 (this commit) wires the stdout event reader (forwards
- *     publishTeamEvent calls from the engineer back to the lead's Bus
- *     + GlobalBus) and the stderr drain (keeps the OS pipe buffer from
- *     filling and blocking the child).
- *   - No `.exited` handler is attached; Phase 3 will wire crash
- *     detection and clean up stale slots in `RunningEngineer`. The
- *     readers in this file naturally end when their pipes close, so
- *     Phase 3 only needs to detect process exit + call `removeRunning`.
+ * Lifecycle:
+ *   - Phase 2 wires the stdout event reader (forwards publishTeamEvent
+ *     calls from the engineer back to the lead's Bus + GlobalBus) and
+ *     the stderr drain (keeps the OS pipe buffer from filling and
+ *     blocking the child).
+ *   - Phase 3 (this commit) exposes `terminateSubprocess` for graceful
+ *     kill with SIGTERM→SIGKILL escalation. The lead also attaches an
+ *     `.exited` handler after spawn returns to detect crashes / normal
+ *     exits and clean up the `running` map deterministically.
  */
 import { Context, Effect, Layer, Schema } from "effect"
 import { Log } from "@/util"
 import { sanitizedProcessEnv } from "@/util/opencode-process"
 import type { EngineerID, TeamID } from "./types"
 import { readEngineerEvents, drainEngineerStderr } from "./engineer-event-reader"
+import { ENGINEER_KILL_TIMEOUT_MS } from "./constants"
 
 const log = Log.create({ service: "team.engineer-process-manager" })
 
@@ -52,12 +53,79 @@ export interface SpawnInput {
   modelID?: string
 }
 
+/**
+ * Minimal subprocess shape required by `terminateSubprocess`. Tests pass
+ * fakes that satisfy this without standing up a real Bun.Subprocess.
+ */
+export interface KillableSubprocess {
+  readonly exited: Promise<number | null | undefined>
+  readonly exitCode?: number | null
+  readonly killed?: boolean
+  kill(signal?: number | NodeJS.Signals): unknown
+}
+
+export interface TerminateOptions {
+  /** Override the default escalation timeout. */
+  timeoutMs?: number
+}
+
+/**
+ * Phase 3 of A3 — graceful kill helper with SIGTERM→SIGKILL escalation.
+ *
+ * Sends SIGTERM, waits up to `timeoutMs` for `subprocess.exited` to
+ * resolve. If the child is still alive after that, sends SIGKILL and
+ * waits for the final exit. Returns the OS exit code (or null if the
+ * platform reports none). Idempotent: callers can invoke this in the
+ * terminate path AND have the centralized exit handler observe the same
+ * `.exited` promise without racing — exit cleanup keys off the
+ * single `subprocess.exited` resolution.
+ */
+export async function terminateSubprocess(
+  subprocess: KillableSubprocess,
+  opts: TerminateOptions = {},
+): Promise<number | null | undefined> {
+  const timeoutMs = opts.timeoutMs ?? ENGINEER_KILL_TIMEOUT_MS
+
+  // Already exited — nothing to do.
+  if (subprocess.exitCode !== undefined && subprocess.exitCode !== null) {
+    return subprocess.exitCode
+  }
+
+  try {
+    subprocess.kill("SIGTERM")
+  } catch (err) {
+    log.warn("SIGTERM failed", { error: String(err) })
+  }
+
+  // Sentinel symbol so we can distinguish timeout from a real exit code.
+  const TIMEOUT = Symbol("kill-timeout")
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<typeof TIMEOUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMEOUT), timeoutMs)
+  })
+
+  const result = await Promise.race([subprocess.exited, timeoutPromise])
+  if (timer !== undefined) clearTimeout(timer)
+
+  if (result !== TIMEOUT) {
+    return result as number | null | undefined
+  }
+
+  log.warn("engineer did not exit on SIGTERM, escalating to SIGKILL", { timeoutMs })
+  try {
+    subprocess.kill("SIGKILL")
+  } catch (err) {
+    log.warn("SIGKILL failed", { error: String(err) })
+  }
+  return subprocess.exited
+}
+
 export interface SpawnedEngineer {
   pid: number
   /**
-   * The Bun child process handle. Held but not consumed in Phase 1.
-   * Phase 2 will read stdout for event forwarding; Phase 3 will attach
-   * crash-detection on `.exited`.
+   * The Bun child process handle. Phase 2 reads stdout for event
+   * forwarding; Phase 3 wired `.exited` for crash detection — the lead
+   * attaches a handler via `attachExitHandler` in daemon.ts after spawn returns.
    */
   subprocess: import("bun").Subprocess
 }
@@ -161,9 +229,9 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
           // Phase 2 of A3: attach the stdout event reader and stderr
           // drain. Both run as detached promises that resolve when the
           // child closes its respective pipe; we don't await them here
-          // (the engineer outlives this spawn call). Phase 3 will add
-          // the `.exited` watcher; the readers naturally end before
-          // that promise resolves.
+          // (the engineer outlives this spawn call). Phase 3 attaches
+          // the `.exited` watcher in `daemon.ts` after spawn returns;
+          // the readers naturally end before that promise resolves.
           //
           // The pipes are typed as ReadableStream<Uint8Array> by Bun.
           // If for some reason a runtime returns null (e.g. mocked
