@@ -22,7 +22,6 @@ import { Service as TaskBoardRepoService } from "./task-board"
 import { Service as RateLimiterService, CircuitBreakerOpenError } from "./rate-limiter"
 import { Service as GitManagerService } from "./git-manager"
 import { Service as MessageSummarizerService, type SummaryResult, type MessageBatch } from "./message-summarizer"
-import { Service as PermissionGuardService, type FileScopeEntry } from "./permission-guard"
 import { DbError as MailboxDbError } from "./mailbox"
 import { EngineerStateRecord } from "./types"
 import {
@@ -564,22 +563,12 @@ const memSummarizer = MessageSummarizerService.of({
     }) as Effect.Effect<void, never, MailboxService>,
 })
 
-const memPermissionGuard = PermissionGuardService.of({
-  register: (_entry: FileScopeEntry) => Effect.void,
-  unregister: (_sessionID: SessionID) => Effect.void,
-  check: (_sessionID: SessionID, _filePath: string) => Effect.void,
-  isEngineer: (sessionID: SessionID): boolean =>
-    [...engineers.values()].some((e) => e.sessionID === sessionID),
-  enforceForTool: (_sessionID: SessionID, _toolID: string, _args: Record<string, unknown>) => Effect.void,
-})
-
 const baseLayer = Layer.succeed(SessionCoordinatorService, memCoordinator).pipe(
   Layer.merge(Layer.succeed(MailboxService, memMailbox)),
   Layer.merge(Layer.succeed(LeadCoordinatorService, memLead)),
   Layer.merge(Layer.succeed(TaskBoardRepoService, memTaskBoard)),
   Layer.merge(Layer.succeed(GitManagerService, memGit)),
   Layer.merge(Layer.succeed(MessageSummarizerService, memSummarizer)),
-  Layer.merge(Layer.succeed(PermissionGuardService, memPermissionGuard)),
 )
 
 import { layer as heartbeatLayer } from "./heartbeat"

@@ -28,9 +28,9 @@ Break the goal into independent subtasks. For each, specify:
 Prefer **disjoint** scopes. Each engineer runs in an isolated worktree
 at `<repoRoot>/.tmp/team/<teamID>/<engineerID>/` on branch
 `team/<teamID>/engineer-<engineerID>`. The lead's main tree is never
-switched. `fileScope` is still useful as documentation of intent and as
-input to PermissionGuard, but overlapping scopes no longer cause silent
-overwrites — conflicts surface at `team_commit` time and require manual
+switched. `fileScope` is still useful as documentation of intent and to
+detect overlap at planning time, but overlapping scopes no longer cause
+silent overwrites — conflicts surface at `team_commit` time and require manual
 resolution.
 
 Call `team_decompose({ teamID, subtasks: [...] })`.

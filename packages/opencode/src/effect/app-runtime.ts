@@ -54,7 +54,6 @@ import { TeamDaemon } from "@/team/daemon"
 import { GitManager } from "@/team/git-manager"
 import { RateLimiter } from "@/team/rate-limiter"
 import { HeartbeatMonitor } from "@/team/heartbeat"
-import { PermissionGuard } from "@/team/permission-guard"
 import { layer as engineerProcessManagerLayer } from "@/team/engineer-process-manager"
 import { Npm } from "@/npm"
 import { memoMap } from "./memo-map"
@@ -112,7 +111,6 @@ export const AppLayer = Layer.mergeAll(
   GitManager.layer,
   RateLimiter.layer,
   engineerProcessManagerLayer,
-  PermissionGuard.layer.pipe(Layer.provide(Mailbox.defaultLayer)),
   // HeartbeatMonitor exposes richer per-team monitoring (orphan
   // detection, per-engineer rate-limit backoff, diagnostic pings) that
   // the daemon's simpler setInterval sweep doesn't cover. It is wired
