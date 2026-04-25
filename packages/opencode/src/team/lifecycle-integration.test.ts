@@ -1292,4 +1292,68 @@ describe("Team Lifecycle Integration", () => {
       expect(result.engineers[0].name).toBe("engineer-resume-a")
     })
   })
+
+  // ── worktree cleanup on dissolve ─────────────────────────────────────
+  describe("dissolveTeam worktree cleanup", () => {
+    test("dissolveTeam calls cleanupBranches for the dissolved team", async () => {
+      let cleanupCalledFor: TeamID | null = null
+
+      const trackingGit = GitManagerService.of({
+        ...memGit,
+        cleanupBranches: (teamID) =>
+          Effect.sync(() => {
+            cleanupCalledFor = teamID
+          }),
+      })
+
+      const trackingCoordinator = SessionCoordinatorService.of({
+        ...memCoordinator,
+        dissolveTeam: (input) =>
+          Effect.gen(function* () {
+            yield* memCoordinator.dissolveTeam(input)
+            yield* trackingGit.cleanupBranches(input.teamID).pipe(
+              Effect.catchCause(() => Effect.void),
+            )
+          }),
+      })
+
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 0 }))
+
+      await Effect.runPromise(trackingCoordinator.dissolveTeam({ teamID: TEAM_ID }))
+
+      expect(cleanupCalledFor as unknown as string).toBe(TEAM_ID as string)
+      expect(teams.has(TEAM_ID)).toBe(false)
+    })
+
+    test("dissolveTeam succeeds even when cleanupBranches fails (best-effort)", async () => {
+      const { GitError } = await import("./git-manager")
+
+      const failingGit = GitManagerService.of({
+        ...memGit,
+        cleanupBranches: (_teamID) =>
+          Effect.fail(new GitError({ message: "worktree locked by another process" })),
+      })
+
+      const bestEffortCoordinator = SessionCoordinatorService.of({
+        ...memCoordinator,
+        dissolveTeam: (input) =>
+          Effect.gen(function* () {
+            yield* memCoordinator.dissolveTeam(input)
+            yield* failingGit.cleanupBranches(input.teamID).pipe(
+              Effect.catchCause(() => Effect.void),
+            )
+          }),
+      })
+
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 1 }))
+      engineers.set(ENG_A, makeSlot({ engineerID: ENG_A }))
+
+      // dissolve must not throw even though cleanupBranches fails
+      await expect(
+        Effect.runPromise(bestEffortCoordinator.dissolveTeam({ teamID: TEAM_ID })),
+      ).resolves.toBeUndefined()
+
+      expect(teams.has(TEAM_ID)).toBe(false)
+    })
+  })
 })

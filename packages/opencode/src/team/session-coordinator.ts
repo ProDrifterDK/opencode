@@ -4,6 +4,7 @@ import { Database } from "@/storage"
 import { Service as SessionService, defaultLayer as sessionDefaultLayer } from "@/session/session"
 import { Service as MailboxService, defaultLayer as mailboxDefaultLayer } from "./mailbox"
 import { Service as TaskBoardService, layer as taskBoardLayer } from "./task-board"
+import { Service as GitManagerService, layer as gitManagerLayer } from "./git-manager"
 import { TeamStateTable, EngineerSlotTable, type EngineerSlotRow, type TeamStateRow } from "./session-coordinator.sql"
 import { TeamID, EngineerID, type EngineerState } from "./types"
 import { MAX_TEAM_SIZE } from "./constants"
@@ -134,6 +135,7 @@ export const layer = Layer.effect(
     const session = yield* SessionService
     const mailbox = yield* MailboxService
     const taskBoard = yield* TaskBoardService
+    const gitManager = yield* GitManagerService
 
     const fetchTeam = (teamID: TeamID) =>
       dbQuery((db) =>
@@ -399,6 +401,12 @@ export const layer = Layer.effect(
         }),
       )
 
+      yield* gitManager.cleanupBranches(input.teamID).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to cleanup engineer worktrees on dissolve", { teamID: input.teamID, cause: Cause.pretty(cause) }),
+        ),
+      )
+
       yield* dbTx((db) => {
         db.delete(EngineerSlotTable)
           .where(eq(EngineerSlotTable.team_id, input.teamID))
@@ -592,6 +600,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(mailboxDefaultLayer),
   Layer.provide(taskBoardLayer),
   Layer.provide(sessionDefaultLayer),
+  Layer.provide(gitManagerLayer),
 )
 
 export * as SessionCoordinator from "./session-coordinator"
