@@ -41,6 +41,7 @@ import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { ShellToolID } from "@/tool/shell/id"
 import { Truncate } from "@/tool"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util"
@@ -773,7 +774,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         id: PartID.ascending(),
         messageID: msg.id,
         sessionID: input.sessionID,
-        tool: "bash",
+        tool: ShellToolID.id,
         callID: ulid(),
         state: {
           status: "running",
