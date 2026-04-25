@@ -14,6 +14,10 @@ import { HeartbeatMonitor } from "../team/heartbeat"
 import { GitManager } from "../team/git-manager"
 import { Agent } from "../agent/agent"
 import { Log } from "@/util"
+import { buildDissolveSummary } from "../team/dissolve-summary"
+import * as fs from "node:fs"
+import * as path from "node:path"
+import { execSync } from "node:child_process"
 
 const log = Log.create({ service: "tool.team" })
 // Priority translation: 4-tier (tool) -> 3-tier (mailbox).
@@ -764,6 +768,12 @@ export const TeamDissolveTool = Tool.define(
           const engineers = yield* coordinator.listTeamEngineers(teamID)
           const engineerCount = engineers.length
 
+          // Snapshot team metadata + tasks BEFORE archive so the summary
+          // sees real status (pending/completed/failed) instead of every
+          // row already flipped to "archived".
+          const teamRecord = yield* coordinator.getTeam(teamID)
+          const teamCreatedAt = teamRecord?.createdAt ?? Date.now()
+
           if (params.force) {
             const allTasks = yield* taskBoard.list({ team_id: teamID })
             const inProgressTasks = allTasks.filter((t) => t.status === "in-progress")
@@ -771,6 +781,10 @@ export const TeamDissolveTool = Tool.define(
               yield* taskBoard.update(task.id, { status: "failed" })
             }
           }
+
+          // Re-read tasks AFTER the force-fail rewrite so the summary
+          // reflects the final state the user actually sees.
+          const tasksSnapshot = yield* taskBoard.list({ team_id: teamID })
 
           yield* coordinator.dissolveTeam({ teamID })
 
@@ -792,13 +806,54 @@ const branchCleanup = yield* gitManager
               Effect.mapError(() => ({ cleaned: false, error: "cleanup failed" as string | null })),
             )
 
-          const output = [
-            `Team ${params.teamID} dissolved.`,
+          // Best-effort markdown summary write. Dissolve must succeed
+          // even if the file write fails (read-only fs, permission
+          // denied, etc.). We surface the path on success and the
+          // error message on failure.
+          const dissolvedAtMs = Date.now()
+          const summaryMarkdown = buildDissolveSummary({
+            teamID: params.teamID,
+            tasks: tasksSnapshot,
+            engineers,
+            durationMs: dissolvedAtMs - teamCreatedAt,
+            dissolvedAt: new Date(dissolvedAtMs).toISOString(),
+          })
+
+          const summaryRelPath = path.join(".tmp", `team-${params.teamID}-summary.md`)
+          const summaryWrite = yield* Effect.try({
+            try: () => {
+              // Resolve repo root via `git rev-parse --show-toplevel`,
+              // falling back to `process.cwd()` outside a repo.
+              let repoRoot: string
+              try {
+                repoRoot = execSync("git rev-parse --show-toplevel", {
+                  encoding: "utf8",
+                  stdio: ["ignore", "pipe", "ignore"],
+                }).trim()
+              } catch {
+                repoRoot = process.cwd()
+              }
+              const absPath = path.join(repoRoot, summaryRelPath)
+              fs.mkdirSync(path.dirname(absPath), { recursive: true })
+              fs.writeFileSync(absPath, summaryMarkdown, "utf8")
+              return absPath
+            },
+            catch: (cause) => new Error(String(cause)),
+          }).pipe(
+            Effect.map((absPath) => ({ ok: true as const, absPath, error: null as string | null })),
+            Effect.catch(() => Effect.succeed({ ok: false as const, absPath: null, error: "write failed" as string | null })),
+          )
+
+          const lines = [
+            summaryWrite.ok
+              ? `Team ${params.teamID} dissolved. Summary written to ${summaryRelPath}`
+              : `Team ${params.teamID} dissolved. (Summary write failed: ${summaryWrite.error})`,
             `Engineers terminated: ${engineerCount}`,
             branchCleanup.cleaned
               ? `Git branches cleaned.`
               : `Git branch cleanup skipped: ${branchCleanup.error}`,
-          ].join("\n")
+          ]
+          const output = lines.join("\n")
 
           return {
             title: `Dissolve team ${params.teamID}`,
@@ -807,6 +862,7 @@ const branchCleanup = yield* gitManager
               teamID: params.teamID,
               engineersTerminated: engineerCount,
               forced: params.force,
+              summaryPath: summaryWrite.ok ? summaryRelPath : null,
             },
           }
         }).pipe(toolErrorBoundary),

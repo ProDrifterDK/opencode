@@ -24,6 +24,7 @@ Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>
 
 ### team_dissolve
 `team_dissolve({ teamID, reason: "..." })` — gracefully shuts down the team.
+Writes a structured markdown summary of the team's run (tasks completed/failed/pending, per-engineer state and last report) to `.tmp/team-<teamID>-summary.md` at the repo root and surfaces the relative path in the tool output. The summary write is best-effort: if it fails, dissolve still succeeds and the failure reason is reported inline.
 
 ### team_inbox / team_message
 `team_inbox` — reads unread messages addressed to you.
