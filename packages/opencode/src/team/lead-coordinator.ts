@@ -1,4 +1,5 @@
 import { Effect, Layer, Context, Schema } from "effect"
+import { globOverlap } from "./git-manager"
 import { TaskBoardRepo, TaskBoardRepoError } from "./task-board"
 import { type EngineerID, type EngineerStateRecord } from "./types"
 import { MAX_TEAM_SIZE, TASK_BOARD_MAX_TASKS } from "./constants"
@@ -76,10 +77,6 @@ const decodeFiles = (raw: string | null): string[] => {
     return []
   }
 }
-
-const filesOverlap = (a: string[], b: string[]): string[] =>
-  a.filter((f) => b.includes(f))
-
 
 type Err = LeadCoordinatorError | FileScopeConflictError | CyclicDependenciesError | TaskBoardRepoError
 
@@ -181,17 +178,32 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
           })
         }
 
-        // ── File scope conflict check ──────────────────────────────────────
-        const allFiles: string[] = []
-        for (const spec of specs) {
-          const overlap = filesOverlap(spec.files, allFiles)
-          if (overlap.length > 0) {
-            yield* new FileScopeConflictError({
-              message: `Subtask "${spec.title}" has file conflicts`,
-              conflictingFiles: overlap,
-            })
+        // ── File scope overlap check (glob-aware, all-pairs) ──────────────
+        const overlaps: Array<{ a: string; b: string; aFiles: string[]; bFiles: string[] }> = []
+        for (let i = 0; i < specs.length; i++) {
+          for (let j = i + 1; j < specs.length; j++) {
+            const a = specs[i]
+            const b = specs[j]
+            if (a.files.length === 0 || b.files.length === 0) continue
+            const overlapping = a.files.some((af) => b.files.some((bf) => globOverlap(af, bf)))
+            if (overlapping) {
+              overlaps.push({
+                a: a.id ?? a.title,
+                b: b.id ?? b.title,
+                aFiles: a.files,
+                bFiles: b.files,
+              })
+            }
           }
-          allFiles.push(...spec.files)
+        }
+        if (overlaps.length > 0) {
+          const lines = overlaps.map(
+            (o) => `  - "${o.a}" vs "${o.b}": [${o.aFiles.join(", ")}] / [${o.bFiles.join(", ")}]`,
+          )
+          yield* new FileScopeConflictError({
+            message: `Overlapping fileScopes detected. Re-decompose with disjoint scopes:\n${lines.join("\n")}`,
+            conflictingFiles: overlaps.flatMap((o) => [...o.aFiles, ...o.bFiles]),
+          })
         }
 
         const existing = yield* taskBoard.list({ team_id: input.teamId })
@@ -400,11 +412,12 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service> = Layer.e
 
         for (const active of targetActive) {
           const activeFiles = decodeFiles(active.file_scope)
-          const conflict = filesOverlap(taskFiles, activeFiles)
-          if (conflict.length > 0) {
+          if (taskFiles.length === 0 || activeFiles.length === 0) continue
+          const conflicting = taskFiles.some((af) => activeFiles.some((bf) => globOverlap(af, bf)))
+          if (conflicting) {
             yield* new FileScopeConflictError({
               message: `Cannot reassign to engineer — file conflict with "${active.title}"`,
-              conflictingFiles: conflict,
+              conflictingFiles: [...taskFiles, ...activeFiles],
             })
           }
         }

@@ -103,7 +103,7 @@ const execGit = (args: string[], cwd?: string) =>
 
 const STRIP_GLOB = /(\/\*{1,2})+(\.\w+)?$|^\*+$/
 
-const globOverlap = (a: string, b: string): boolean => {
+export const globOverlap = (a: string, b: string): boolean => {
   if (a === b) return true
   const normA = a.replace(STRIP_GLOB, "").replace(/\/+$/, "")
   const normB = b.replace(STRIP_GLOB, "").replace(/\/+$/, "")

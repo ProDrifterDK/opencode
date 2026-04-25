@@ -169,7 +169,102 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    await expect(result).rejects.toThrow("file conflicts")
+    await expect(result).rejects.toThrow("Overlapping fileScopes detected")
+  })
+
+  test("rejects fileScopes overlapping via globs (e.g. src/** vs src/auth/**)", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const result = runWithCatch(
+      service.decompose({
+        teamId: "team_t1" as TeamID,
+        request: "test",
+        subtasks: [
+          { id: "a", title: "A", description: "", files: ["src/**"] },
+          { id: "b", title: "B", description: "", files: ["src/auth/**"] },
+        ],
+      }),
+    )
+
+    await expect(result).rejects.toThrow("Overlapping fileScopes detected")
+  })
+
+  test("collects all overlapping pairs when 3+ subtasks overlap", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const result = runWithCatch(
+      service.decompose({
+        teamId: "team_t2" as TeamID,
+        request: "test",
+        subtasks: [
+          { id: "a", title: "A", description: "", files: ["src/**"] },
+          { id: "b", title: "B", description: "", files: ["src/auth/**"] },
+          { id: "c", title: "C", description: "", files: ["src/billing/**"] },
+        ],
+      }),
+    )
+
+    await expect(result).rejects.toMatchObject({
+      _tag: "FileScopeConflictError",
+      message: expect.stringMatching(/"a" vs "b"[\s\S]+"a" vs "c"/),
+    })
+  })
+
+  test("accepts disjoint glob fileScopes", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const tasks = await runWith(
+      service.decompose({
+        teamId: "team_t3" as TeamID,
+        request: "test",
+        subtasks: [
+          { id: "a", title: "A", description: "", files: ["src/auth/**"] },
+          { id: "b", title: "B", description: "", files: ["src/billing/**"] },
+        ],
+      }),
+    )
+    expect(tasks.length).toBe(2)
+  })
+
+  test("accepts single-task decompose with no pairs to compare", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const tasks = await runWith(
+      service.decompose({
+        teamId: "team_t4" as TeamID,
+        request: "test",
+        subtasks: [
+          { id: "a", title: "Solo", description: "", files: ["src/**"] },
+        ],
+      }),
+    )
+    expect(tasks.length).toBe(1)
+  })
+
+  test("treats empty fileScope arrays as non-overlapping", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const tasks = await runWith(
+      service.decompose({
+        teamId: "team_t5" as TeamID,
+        request: "test",
+        subtasks: [
+          { id: "a", title: "A", description: "", files: [] },
+          { id: "b", title: "B", description: "", files: [] },
+        ],
+      }),
+    )
+    expect(tasks.length).toBe(2)
   })
 
   test("assign distributes tasks to idle engineers with exclusive scopes", async () => {
