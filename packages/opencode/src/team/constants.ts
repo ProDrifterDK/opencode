@@ -45,3 +45,6 @@ export const RATE_LIMIT_BASE_BACKOFF_MS = 30_000
 export const AUTO_TEAM_ENABLED = process.env.OPENCODE_AUTO_TEAM !== "false"
 export const AUTO_TEAM_THRESHOLD = 2
 export const AUTO_TEAM_MIN_FILES = 3
+
+/** TTL for the team_agents provider/agent list cache (module-level, per process). */
+export const TEAM_AGENTS_CACHE_TTL_MS = 30_000

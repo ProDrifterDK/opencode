@@ -13,6 +13,7 @@ import { TeamDaemon } from "../team/daemon"
 import { HeartbeatMonitor } from "../team/heartbeat"
 import { GitManager } from "../team/git-manager"
 import { Agent } from "../agent/agent"
+import { TEAM_AGENTS_CACHE_TTL_MS } from "../team/constants"
 import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
 import * as fs from "node:fs"
@@ -1483,6 +1484,9 @@ export const TeamClaimTool = Tool.define(
 
 // ─── Team Agents Tool ──────────────────────────────────────────────────────
 
+// Module-level cache for the agents list. Intentionally mutable; invalidated only by process restart.
+let _agentsCache: { value: Agent.Info[]; expiresAt: number } | null = null
+
 const teamAgentsParams = z.object({
   includeNative: z.boolean().optional().describe(
     "Include native/built-in agents (default: false, only show user-configured agents)"
@@ -1499,7 +1503,15 @@ export const TeamAgentsTool = Tool.define(
       parameters: teamAgentsParams,
       execute: (params: z.infer<typeof teamAgentsParams>, _ctx: Tool.Context) =>
         Effect.gen(function* () {
-          const allAgents = yield* agentService.list()
+          const now = Date.now()
+          const allAgents =
+            _agentsCache && _agentsCache.expiresAt > now
+              ? _agentsCache.value
+              : yield* Effect.gen(function* () {
+                  const fresh = yield* agentService.list()
+                  _agentsCache = { value: fresh, expiresAt: now + TEAM_AGENTS_CACHE_TTL_MS }
+                  return fresh
+                })
           const defaultAgent = yield* agentService.defaultAgent()
           const includeNative = params.includeNative ?? false
 
