@@ -119,11 +119,21 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
     return
   }
 
-  // Lead / standalone process: publish to Effect Bus (for backend subscribers like
-  // daemon) and emit to GlobalBus so the TUI receives the event.
-  // Silently ignore "No context found" errors — they occur when publishTeamEvent
-  // is called outside an active instance (e.g. tests, gracefulShutdown). In those
-  // cases the GlobalBus emission below is sufficient.
+  // Lead / standalone process: dual-publish is intentional — each path serves a
+  // distinct subscriber set and neither is redundant:
+  //
+  //   Bus.publish  →  Effect Bus PubSub  →  daemon.ts subscribeCallback(EngineerSpawned)
+  //                   (Bus.publish also emits to GlobalBus internally, but with
+  //                    directory=<instanceDir>, which the TUI filters OUT for team events)
+  //
+  //   GlobalBus.emit(directory:"global")  →  SDK SSE stream  →  TUI sync.tsx
+  //                   (event.ts:16 matches only directory==="global", so team events
+  //                    must be emitted here explicitly — Bus.publish's internal
+  //                    GlobalBus emit uses the instance directory, not "global")
+  //
+  // Silently ignore "No context found" errors from Bus.publish — they occur when
+  // publishTeamEvent is called outside an active instance (e.g. tests,
+  // gracefulShutdown). GlobalBus.emit below is always safe and covers the TUI path.
   Bus.publish(def, properties).catch((err) => {
     const msg = String(err)
     if (!msg.includes("No context found for instance")) {
