@@ -1,0 +1,125 @@
+# Team Lead Reference Appendix
+
+## Tools Reference
+
+**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_kill`, `team_dissolve`, `team_commit`
+**Engineer-only:** `team_status`, `team_report`, `team_claim`
+**Both:** `team_monitor`, `team_inbox`, `team_roster`, `team_tasks`, `team_message`
+
+### team_create
+`team_create({ goal: "..." })` — initializes a team; returns `teamID` required for all subsequent calls.
+
+### team_decompose
+`team_decompose({ teamID, subtasks: [{ title, description, fileScope }] })` — registers subtasks.
+
+### team_agents
+`team_agents({ teamID })` — lists configured agents with `{ name, description, ... }`.
+
+### team_spawn
+`team_spawn({ teamID, name: "engineer-<role>", task: { title, description, fileScope }, agent: "<agent-name>" })`
+Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>/<engineerID>/` on branch `team/<teamID>/engineer-<engineerID>`. The lead's main tree is never switched.
+
+### team_commit
+`team_commit({ teamID })` — squash-merges every `completed` engineer's branch into the lead's current branch using the engineer's task title as the commit message. Engineers still working, blocked, or failed are skipped. Stops immediately on merge conflict and reports conflicting files; re-run after manual resolution.
+
+### team_dissolve
+`team_dissolve({ teamID, reason: "..." })` — gracefully shuts down the team.
+
+### team_inbox / team_message
+`team_inbox` — reads unread messages addressed to you.
+`team_message({ teamID, to: "<engineerID>|lead", message: "..." })` — send a reply or unblock an engineer.
+
+### team_roster / team_tasks
+`team_roster` — returns engineer IDs and current state.
+`team_tasks` — lists pending/unassigned tasks.
+
+### team_reassign / team_kill / team_assign
+`team_reassign({ teamID, taskID, engineerID })` — moves a task from one engineer to another.
+`team_kill({ teamID, engineerID })` + fresh `team_spawn` — replaces a failed engineer.
+`team_assign({ teamID })` — auto-pairs any pending tasks with idle engineers.
+
+### team_monitor
+Expensive aggregate roll-up. Call only when:
+- An inbox message reports blocked/failed state
+- The user asks for a status report
+- You are about to `team_dissolve` and want a final summary
+
+Do **not** call `team_monitor` as a polling mechanism — use `team_inbox` for routine coordination.
+
+## fileScope Rules
+
+`fileScope` is a list of files or directories the subtask will touch. It serves two purposes:
+1. **Documentation of intent** — makes the plan readable at a glance.
+2. **Overlap detection at planning time** — lets you spot likely conflicts before spawning.
+
+Overlapping scopes no longer cause silent overwrites because each engineer works in an isolated worktree. Conflicts surface at `team_commit` time and require manual resolution.
+
+Prefer **disjoint** scopes. When overlap is unavoidable, note it in the subtask description so engineers coordinate via `team_message`.
+
+## Error Handling
+
+**Engineer blocked:** Engineer sends a message via `team_inbox`. Read it, then either:
+- Send clarification via `team_message`
+- `team_reassign` the task to another engineer
+- `team_kill` the engineer and `team_spawn` a replacement with a corrected task description
+
+**Engineer failed:** Same recovery path as blocked. Check `team_roster` for current state.
+
+**Merge conflict at team_commit:** The tool reports conflicting files and stops. Resolve conflicts manually in the lead's working tree, commit the resolution, then call `team_commit` again.
+
+**Spawn limit exceeded:** If 5 engineers are already running, wait for one to complete before spawning more. Use `team_assign` to pair pending tasks with engineers that become idle.
+
+**Token budget:** If the shared budget is being exhausted, consider dissolving and restarting with fewer concurrent engineers.
+
+## Agent Tier Guidance
+
+Match subtasks to agents by reading each agent's `description` field — not by name-matching.
+Agent names are user-configurable and carry no guaranteed meaning.
+
+Typical agent roles (by description pattern):
+- **Architecture / deep analysis** — complex design tasks, multi-file refactors
+- **Implementation** — feature coding, bug fixes, tests
+- **Review / QA** — code review, test coverage analysis
+- **Docs / research** — documentation writing, API research, planning
+
+If no agent's description fits a subtask, ask the user before picking a fallback. Do not guess.
+
+## Examples
+
+### Output Format After Startup
+
+```
+Team started: <teamID>
+Engineers spawned: <count>
+Tasks assigned: <count> / <total>
+
+Engineers:
+  <name> — <task title> [working] (agent: <agent-name>)
+  ...
+
+Pending tasks:
+  <task title> (unassigned)
+```
+
+### Typical Decomposition
+
+```
+subtasks: [
+  {
+    title: "Implement auth middleware",
+    description: "Add JWT validation to all /api routes. Return 401 on invalid token.",
+    fileScope: ["src/middleware/auth.ts", "src/routes/"]
+  },
+  {
+    title: "Write auth tests",
+    description: "Unit tests for the JWT middleware covering valid, expired, and malformed tokens.",
+    fileScope: ["src/middleware/auth.test.ts"]
+  }
+]
+```
+
+### Handling a Blocked Engineer
+
+1. `team_inbox` returns: `engineer-backend is blocked: needs DB schema for users table`
+2. You have the schema — send it: `team_message({ to: "<engineerID>", message: "Schema: ..." })`
+3. Engineer resumes automatically; no further action needed unless it blocks again.
