@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test"
 import { Effect, Layer, Scope, Fiber } from "effect"
 import { Service as HeartbeatService } from "./heartbeat"
-import { Service as SessionCoordinatorService, type EngineerSlot, type TeamRecord } from "./session-coordinator"
+import { Service as SessionCoordinatorService, CoordinatorError, type EngineerSlot, type TeamRecord } from "./session-coordinator"
 import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as MailboxService } from "./mailbox"
 import { Service as TaskBoardRepoService } from "./task-board"
@@ -75,6 +75,14 @@ const makeTeam = (overrides: Partial<TeamRecord> = {}): TeamRecord => ({
 // In-memory service mocks
 // ---------------------------------------------------------------------------
 
+// Forward-declared so memCoordinator (defined first) can delegate mailbox cleanup
+// to memMailbox.purge — this mirrors the real session-coordinator wiring contract
+// and ensures these mocks fail closed if production code stops calling purge.
+const purgeViaMailbox = (sessionID: SessionID) =>
+  Effect.suspend(() => memMailbox.purge(sessionID)).pipe(
+    Effect.mapError((cause) => new CoordinatorError({ message: String(cause) })),
+  )
+
 const memCoordinator = SessionCoordinatorService.of({
   createTeam: (input) =>
     Effect.sync(() => {
@@ -116,7 +124,7 @@ const memCoordinator = SessionCoordinatorService.of({
     }),
 
   killEngineer: (input) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       const slot = engineers.get(input.engineerID)
       engineers.delete(input.engineerID)
       const team = teams.get(input.teamID)
@@ -125,18 +133,17 @@ const memCoordinator = SessionCoordinatorService.of({
         team.engineerCount = remaining.length
         if (remaining.length === 0) team.state = "idle"
       }
-      for (const [id, row] of mailboxStore) {
-        if (row.recipient_session_id === slot?.sessionID) mailboxStore.delete(id)
-      }
+      // Mirror real wiring: session-coordinator delegates mailbox cleanup to Mailbox.purge.
+      // Calling memMailbox.purge here ensures the mock breaks if production code skips the call.
+      if (slot) yield* purgeViaMailbox(slot.sessionID)
     }),
 
   dissolveTeam: (input) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       const teamEngineers = [...engineers.values()].filter((e) => e.teamID === input.teamID)
       for (const eng of teamEngineers) {
-        for (const [id, row] of mailboxStore) {
-          if (row.recipient_session_id === eng.sessionID) mailboxStore.delete(id)
-        }
+        // Delegate per-engineer mailbox purge to Mailbox.purge to mirror real wiring.
+        yield* purgeViaMailbox(eng.sessionID)
         engineers.delete(eng.engineerID)
       }
       for (const [id, t] of tasks) {
