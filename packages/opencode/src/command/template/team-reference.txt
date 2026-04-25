@@ -83,6 +83,8 @@ Prefer **disjoint** scopes. When overlap is unavoidable, note it in the subtask 
 
 **Merge conflict at team_commit:** The tool reports conflicting files and stops. Resolve conflicts manually in the lead's working tree, commit the resolution, then call `team_commit` again.
 
+**Agent not found at team_spawn:** If the `agent` parameter does not match any configured agent, `team_spawn` returns an immediate error listing available agent names: `Agent '<name>' not found. Available: <comma-separated list>`. Call `team_agents` to see the full list with descriptions.
+
 **Spawn limit exceeded:** If 5 engineers are already running, wait for one to complete before spawning more. Use `team_assign` to pair pending tasks with engineers that become idle.
 
 **Token budget:** If the shared budget is being exhausted, consider dissolving and restarting with fewer concurrent engineers.

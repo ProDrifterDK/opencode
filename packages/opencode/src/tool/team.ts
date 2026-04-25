@@ -245,10 +245,24 @@ export const TeamSpawnTool = Tool.define(
           let agentName: string | undefined
           let agentColor: string | undefined
           if (params.agent) {
-            const agents = yield* agentService.list()
+            const now = Date.now()
+            const agents =
+              _agentsCache && _agentsCache.expiresAt > now
+                ? _agentsCache.value
+                : yield* Effect.gen(function* () {
+                    const fresh = yield* agentService.list()
+                    _agentsCache = { value: fresh, expiresAt: now + TEAM_AGENTS_CACHE_TTL_MS }
+                    return fresh
+                  })
             const agent = agents.find(a => a.name.toLowerCase() === params.agent!.toLowerCase())
             if (!agent) {
-              return yield* Effect.fail(new Error(`Agent "${params.agent}" not found. Use team_agents to list available agents.`))
+              const available = agents
+                .filter(a => !a.hidden && !a.native)
+                .map(a => a.name)
+              const availableList = available.length > 0 ? available.join(", ") : "(none configured)"
+              return yield* Effect.fail(
+                new Error(`Agent '${params.agent}' not found. Available: ${availableList}`)
+              )
             }
             agentName = agent.name
             agentColor = agent.color
