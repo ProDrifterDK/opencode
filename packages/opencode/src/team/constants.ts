@@ -48,3 +48,8 @@ export const AUTO_TEAM_MIN_FILES = 3
 
 /** TTL for the team_agents provider/agent list cache (module-level, per process). */
 export const TEAM_AGENTS_CACHE_TTL_MS = 30_000
+
+/** Per-sender rate limit for team_message: max messages in the rolling window. */
+export const MESSAGE_RATE_LIMIT_PER_MIN = 10
+/** Rolling window duration for team_message rate limiting (ms). */
+export const MESSAGE_RATE_WINDOW_MS = 60_000

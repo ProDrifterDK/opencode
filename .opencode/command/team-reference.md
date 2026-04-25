@@ -42,6 +42,7 @@ Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>
 ### team_inbox / team_message
 `team_inbox` — reads unread messages addressed to you.
 `team_message({ teamID, to: "<engineerID>|lead", message: "..." })` — send a reply or unblock an engineer.
+**Rate limit:** 10 messages/min per sender (engineer or lead). The 11th message in a 60s sliding window is rejected with a `retryAfterMs` hint.
 
 ### team_roster / team_tasks
 `team_roster` — returns engineer IDs and current state.

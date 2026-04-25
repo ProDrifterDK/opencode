@@ -14,6 +14,7 @@ import { HeartbeatMonitor } from "../team/heartbeat"
 import { GitManager } from "../team/git-manager"
 import { Agent } from "../agent/agent"
 import { TEAM_AGENTS_CACHE_TTL_MS } from "../team/constants"
+import { checkAndRecordMessage } from "../team/message-rate-limiter"
 import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
 import * as fs from "node:fs"
@@ -680,6 +681,15 @@ export const TeamMessageTool = Tool.define(
               )
             }
             recipientSessionID = recipient.sessionID
+          }
+
+          const rateCheck = checkAndRecordMessage(ctx.sessionID)
+          if (!rateCheck.allowed) {
+            return {
+              title: `Message to ${params.recipientID}`,
+              output: `Rate limit exceeded: 10 messages/min per sender. Retry in ~${Math.ceil(rateCheck.retryAfterMs! / 1000)}s.`,
+              metadata: { rateLimited: true },
+            }
           }
 
           const mailboxPriority = translatePriority(params.priority)
