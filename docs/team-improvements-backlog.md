@@ -101,12 +101,12 @@ Severity legend: **⛔ blocker** | **🔴 high** | **🟡 medium** | **🟢 low*
 
 | ID | Sev | Issue | Files | Fix sketch |
 |----|---|---|---|---|
-| U1 | 🔴 | No structured team summary at dissolve. After a 30-min run you get one line "Team dissolved." Engineers' reports + commits + task outcomes are lost to the user. | `src/tool/team.ts` (`TeamDissolveTool` ~line 711), `src/team/lead-coordinator.ts` (`monitor`), `src/team/task-board-service.ts` | Generate a markdown report from engineers + tasks + reports + commits; write to `.tmp/team-<teamID>-summary.md`; surface path in tool output. |
-| U2 | 🟡 | Lead can't jump into an engineer's session from the TUI. | `src/cli/cmd/tui/feature-plugins/sidebar/team.tsx`, `src/cli/cmd/tui/routes/session/sidebar.tsx` | Sidebar click → opens engineer session; CLI: a new `team_open <engineerID>` tool. |
-| U3 | 🟡 | Engineer naming is auto-generated (`engineer-1`, `engineer-2`). Hard to identify roles at a glance. | `src/team/session-coordinator.ts` (`spawnEngineer`), `src/tool/team.ts` (`team_spawn`) | Default name from a verb derived from task title (`engineer-refactor-auth`). |
-| U4 | 🟡 | `team_monitor` doesn't show rate-limit pressure — Lead doesn't know the team is being throttled until queue stalls. | `src/tool/team.ts` (`TeamMonitorTool` ~line 150), `src/team/lead-coordinator.ts` (`monitor`), `src/team/rate-limiter.ts` (`getStats`) | Include `RateLimiter.getStats(teamID)` in monitor's response. |
-| U5 | 🟢 | Prompt is large (~100 lines after my recent edits). Big context cost on every Lead invocation. | `src/command/template/team-start.txt`, `.opencode/command/team-start.md` | Split into short executive flow + reference appendix loaded on demand. |
-| U6 | 🟢 | No interactive replan — `team_reassign` moves a task but can't edit its description. | `src/tool/team.ts` (new `TeamRetaskTool`) | Add `team_retask({ taskId, title?, description?, fileScope? })` Lead-only. |
+| U1 | ✅ | **DONE 2026-04-25**. `TeamDissolveTool` writes structured markdown summary to `<repoRoot>/.tmp/team-<teamID>-summary.md`. New pure helper `dissolve-summary.ts` builds report from tasks + engineers + duration. Output line surfaces path. Best-effort write (dissolve never fails on summary error). Commit `9c8488fc7`. |
+| U2 | ✅ | **DONE 2026-04-25**. TUI engineer rows now navigate to engineer session via `onMouseDown` calling `props.api.route.navigate("session", {sessionID})`. `sessionID` plumbed through `engineer.spawned` event into sync state. Commit `e3ce6de0c`. |
+| U3 | ✅ | **DONE 2026-04-25**. `deriveEngineerName(taskTitle, fallbackIndex)` pure helper (new `engineer-naming.ts`) yields `engineer-<verb>-<noun>` from task title. 16 unit tests cover stopword stripping, fallback paths, truncation, unicode. Commit `8d320a779`. |
+| U4 | ✅ | **DONE 2026-04-25**. `LeadCoordinator.monitor` now calls `RateLimiter.getStats(teamId)` and attaches result to `ProgressReport.rateLimits`. `formatStatus` renders `Rate limits: tokens X/Y (Z%), active N, queued M, CB: <state>`. Required fixing `LeadCoordinator.layer` to also provide `RateLimiter.layer` in AppLayer. Commit `7282b5e1c`. |
+| U5 | ✅ | **DONE 2026-04-25**. Lead prompt split: `team-start.txt` trimmed from 139→37 lines (executive flow only). New `team-reference.txt` (125 lines) holds tools/fileScope/errors/examples. Lead reads reference on demand. Mirrored to `.opencode/command/team-{start,reference}.md`. Commit `bac98a05f`. |
+| U6 | ✅ | **DONE 2026-04-25**. New `team_retask({taskId, title?, description?, fileScope?})` Lead-only tool. Status guard rejects `in-progress`/`completed`/`failed`. Empty-update guard. fileScope changes trigger glob-overlap check vs other active tasks. Tool count 16→17. Commit `32337be2e`. |
 
 ### Efficiency
 
@@ -228,6 +228,40 @@ Wrong abstraction layer. `promptService.loop` is a multi-turn LLM conversation l
 | B2 | 252 | 230 | -22 (deleted permission-guard tests) |
 
 Final: **230 pass / 0 fail** in `src/team/ src/tool/ src/session/`.
+
+---
+
+## What was completed in the 2026-04-25 UX/UI sweep (U1-U6)
+
+Run via ultrawork — batch A (U2/U3/U5) parallel, batch B (U1/U4/U6) sequential to avoid `tool/team.ts` merge conflicts.
+
+### Commits
+
+- **U3 — Smarter engineer naming** (`8d320a779`): pure helper `deriveEngineerName(taskTitle, fallbackIndex)` in new `engineer-naming.ts` produces `engineer-<verb>-<noun>` from task title. 20-word stopword list (articles/prepositions only — verbs preserved). `session-coordinator.spawnEngineer` accepts `taskTitle?` and uses helper for default name. 16 unit tests.
+- **U5 — Lead prompt split** (`bac98a05f`): `team-start.txt` trimmed from 139→37 lines (executive flow only). New `team-reference.txt` (125 lines) holds tool API, fileScope rules, error handling, examples. Lead reads reference on demand. Mirrored to `.opencode/command/team-{start,reference}.md`.
+- **U2 — TUI engineer-row navigation** (`e3ce6de0c`): engineer rows in team sidebar now navigate to engineer session via `onMouseDown` → `api.route.navigate("session", {sessionID})`. `sessionID` plumbed through `engineer.spawned` event into sync state. Plugin TUI types updated to expose `sessionID`/`progressText`/`agentName`/`agentColor`.
+- **U1 — Structured dissolve summary** (`9c8488fc7`): new pure helper `dissolve-summary.ts` builds markdown report (tasks by status, engineers, duration). `TeamDissolveTool` snapshots state pre-archive, writes `<repoRoot>/.tmp/team-<teamID>-summary.md` post-archive. Best-effort write (dissolve never fails on summary error). 7 unit tests.
+- **U4 — Rate-limit pressure in monitor** (`7282b5e1c`): `ProgressReport` extended with `rateLimits?: RateLimiterStats | null`. `LeadCoordinator.monitor` calls `rateLimiter.getStats(teamId)`. `formatStatus` renders `Rate limits: tokens X/Y (Z%), active N, queued M, CB: <state>`. Required fixing `LeadCoordinator.layer` to provide `RateLimiter.layer` in AppLayer + `HeartbeatMonitor` inline layer. 9 new tests.
+- **U6 — `team_retask` tool** (`32337be2e`): new Lead-only tool `team_retask({taskId, title?, description?, fileScope?})`. Status guard rejects `in-progress`/`completed`/`failed`. Empty-update guard. fileScope changes trigger B1's glob-overlap check vs other active tasks. Tool count 16→17. 11 new tests.
+
+### Test count progression (U-sweep)
+
+| Item | Before | After | Delta |
+|---|---|---|---|
+| U3 | 230 | 246 | +16 |
+| U5 | 246 | 246 | +0 (prompt-only) |
+| U2 | 246 | 246 | +0 (TUI-only, no team-suite tests) |
+| U1 | 246 | 253 | +7 |
+| U4 | 253 | 258 | +5 (after factoring fix-up tests) |
+| U6 | 258 | 269 | +11 |
+
+Final: **269 pass / 0 fail** in `src/team/ src/tool/`.
+
+### Open follow-ups (non-blockers)
+
+- U2: TUI test coverage. The TUI sidebar navigation is exercised manually only — no automated TUI test infra.
+- U4: monitor's `formatStatus` text format unstable as feature evolves; consider structured-only output for LLM consumption.
+- U6: `team_retask` does not surface task changes to engineers if a task is reassigned mid-flight (locked to `pending`/`blocked` only — by design, but document edge cases).
 
 ### Open follow-ups (not blockers)
 
