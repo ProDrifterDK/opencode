@@ -89,7 +89,15 @@ function View(props: { api: TuiPluginApi }) {
         <Show when={open()}>
           <For each={team().engineers}>
             {(eng) => (
-              <box flexDirection="row" gap={1}>
+              <box
+                flexDirection="row"
+                gap={1}
+                onMouseDown={() => {
+                  if (eng.sessionID) {
+                    props.api.route.navigate("session", { sessionID: eng.sessionID })
+                  }
+                }}
+              >
                 <text
                   flexShrink={0}
                   style={{ fg: dot(eng.state) }}

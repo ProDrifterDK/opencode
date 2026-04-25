@@ -322,11 +322,15 @@ export type TuiSidebarTeamState = {
   } | null
   engineers: {
     engineerID: string
+    sessionID?: string
     name: string
     state: string
     currentTask?: string
+    progressText?: string
     startedAt?: number
     lastHeartbeat: number
+    agentName?: string
+    agentColor?: string
   }[]
 }
 
