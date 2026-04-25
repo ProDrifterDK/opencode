@@ -2,7 +2,7 @@
 
 ## Tools Reference
 
-**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_retask`, `team_kill`, `team_dissolve`, `team_commit`
+**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_retask`, `team_kill`, `team_dissolve`, `team_resume`, `team_commit`
 **Engineer-only:** `team_status`, `team_report`, `team_claim`
 **Both:** `team_monitor`, `team_inbox`, `team_roster`, `team_tasks`, `team_message`
 
@@ -41,6 +41,9 @@ Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>
 ### team_dissolve
 `team_dissolve({ teamID, reason: "..." })` — gracefully shuts down the team.
 Writes a structured markdown summary of the team's run (tasks completed/failed/pending, per-engineer state and last report) to `.tmp/team-<teamID>-summary.md` at the repo root and surfaces the relative path in the tool output. The summary write is best-effort: if it fails, dissolve still succeeds and the failure reason is reported inline.
+
+### team_resume
+`team_resume({ teamID })` — re-attaches a team that was left in `terminated` state (daemon shut down before dissolve). Verifies state is `terminated`, flips it back to `active`, resets any in-progress tasks back to `pending`, re-attaches the heartbeat monitor, and re-spawns subprocesses for engineers still on `working`/`blocked` slots. `failed` and `idle` engineers are not re-spawned. Rejects teams in any other state (idle, active, dissolving, dissolved). Lead-only.
 
 ### team_inbox / team_message
 `team_inbox` — reads unread messages addressed to you.

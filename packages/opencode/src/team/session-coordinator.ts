@@ -64,6 +64,7 @@ export interface Interface {
   readonly dissolveTeam: (input: {
     teamID: TeamID
   }) => Effect.Effect<void, CoordinatorError>
+  readonly resumeTeam: (teamID: TeamID) => Effect.Effect<{ team: TeamRecord; engineers: EngineerSlot[] }, CoordinatorError>
   readonly getTeam: (teamID: TeamID) => Effect.Effect<TeamRecord | null, CoordinatorError>
   readonly getEngineer: (engineerID: EngineerID) => Effect.Effect<EngineerSlot | null, CoordinatorError>
   readonly listTeamEngineers: (teamID: TeamID) => Effect.Effect<EngineerSlot[], CoordinatorError>
@@ -413,6 +414,44 @@ export const layer = Layer.effect(
       })
     })
 
+    const resumeTeam = Effect.fn("SessionCoordinator.resumeTeam")(function* (teamID: TeamID) {
+      const team = yield* fetchTeam(teamID)
+      if (!team) {
+        return yield* Effect.fail(new CoordinatorError({ message: `Team not found: ${teamID}` }))
+      }
+      if (team.state !== "terminated") {
+        return yield* Effect.fail(
+          new CoordinatorError({
+            message: `Cannot resume team in state ${team.state}. Only terminated teams can be resumed.`,
+          }),
+        )
+      }
+
+      const now = Date.now()
+
+      // Re-activate the team and load remaining engineer slots. Slots
+      // for crashed working engineers were marked `failed` by
+      // gracefulShutdown; we leave that semantic intact and let the
+      // caller decide whether to re-spawn them based on engineer state.
+      yield* dbTx((db) => {
+        db.update(TeamStateTable)
+          .set({ state: "active", time_updated: now })
+          .where(eq(TeamStateTable.team_id, teamID))
+          .run()
+      })
+
+      const engineerRows = yield* dbQuery((db) =>
+        db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.team_id, teamID)).all(),
+      )
+
+      const refreshed = yield* fetchTeam(teamID)
+      if (!refreshed) {
+        return yield* Effect.fail(new CoordinatorError({ message: `Team disappeared during resume: ${teamID}` }))
+      }
+
+      return { team: refreshed, engineers: engineerRows.map(rowToSlot) }
+    })
+
     const getTeam = Effect.fn("SessionCoordinator.getTeam")((teamID: TeamID) => fetchTeam(teamID))
 
     const getEngineer = Effect.fn("SessionCoordinator.getEngineer")((engineerID: EngineerID) =>
@@ -534,6 +573,7 @@ export const layer = Layer.effect(
       resumeEngineer,
       killEngineer,
       dissolveTeam,
+      resumeTeam,
       getTeam,
       getEngineer,
       listTeamEngineers,

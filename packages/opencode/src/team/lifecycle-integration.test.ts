@@ -151,6 +151,25 @@ const memCoordinator = SessionCoordinatorService.of({
       teams.delete(input.teamID)
     }),
 
+  resumeTeam: (teamID) =>
+    Effect.gen(function* () {
+      const team = teams.get(teamID)
+      if (!team) {
+        return yield* Effect.fail(new CoordinatorError({ message: `Team not found: ${teamID}` }))
+      }
+      if (team.state !== "terminated") {
+        return yield* Effect.fail(
+          new CoordinatorError({
+            message: `Cannot resume team in state ${team.state}. Only terminated teams can be resumed.`,
+          }),
+        )
+      }
+      const next: TeamRecord = { ...team, state: "active", updatedAt: Date.now() }
+      teams.set(teamID, next)
+      const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
+      return { team: next, engineers: slots }
+    }),
+
   getTeam: (teamID) => Effect.sync(() => teams.get(teamID) ?? null),
   getEngineer: (engineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
   listTeamEngineers: (teamID) =>
@@ -1165,6 +1184,112 @@ describe("Team Lifecycle Integration", () => {
       const r2 = await Effect.runPromise(memMailbox.peek(e2.sessionID))
       expect(r1.length).toBe(0)
       expect(r2.length).toBe(0)
+    })
+  })
+
+  // ── O4: team_resume ──────────────────────────────────────────────────
+  describe("team_resume", () => {
+    test("resume rejects teams in `active` state", async () => {
+      teams.set(TEAM_ID, makeTeam({ state: "active" }))
+
+      const result = await Effect.runPromise(
+        memCoordinator.resumeTeam(TEAM_ID).pipe(Effect.flip),
+      )
+
+      expect(result).toBeInstanceOf(CoordinatorError)
+      expect(result.message).toContain("Cannot resume team in state active")
+    })
+
+    test("resume rejects teams in `idle` state", async () => {
+      teams.set(TEAM_ID, makeTeam({ state: "idle" }))
+
+      const result = await Effect.runPromise(
+        memCoordinator.resumeTeam(TEAM_ID).pipe(Effect.flip),
+      )
+
+      expect(result).toBeInstanceOf(CoordinatorError)
+      expect(result.message).toContain("Only terminated teams can be resumed")
+    })
+
+    test("resume rejects teams in `dissolving` state", async () => {
+      teams.set(TEAM_ID, makeTeam({ state: "dissolving" as TeamRecord["state"] }))
+
+      const result = await Effect.runPromise(
+        memCoordinator.resumeTeam(TEAM_ID).pipe(Effect.flip),
+      )
+
+      expect(result).toBeInstanceOf(CoordinatorError)
+      expect(result.message).toContain("Cannot resume team in state dissolving")
+    })
+
+    test("resume rejects already-dissolved (missing) teams", async () => {
+      // Dissolved teams are deleted from the table; resumeTeam should
+      // surface a "not found" rather than silently succeeding.
+      const result = await Effect.runPromise(
+        memCoordinator.resumeTeam("team_missing" as TeamID).pipe(Effect.flip),
+      )
+
+      expect(result).toBeInstanceOf(CoordinatorError)
+      expect(result.message).toContain("Team not found")
+    })
+
+    test("resume terminated team flips state to active and returns engineer slots", async () => {
+      // Set up a terminated team with two engineer slots: one `failed`
+      // (subprocess died during the prior shutdown) and one `idle`.
+      teams.set(TEAM_ID, makeTeam({ state: "terminated" as TeamRecord["state"], engineerCount: 2 }))
+      engineers.set(ENG_A, makeSlot({ engineerID: ENG_A, state: "failed" }))
+      engineers.set(ENG_B, makeSlot({
+        engineerID: ENG_B,
+        sessionID: "sess_eng_b" as SessionID,
+        name: "engineer-b",
+        state: "idle",
+      }))
+
+      const result = await Effect.runPromise(memCoordinator.resumeTeam(TEAM_ID))
+
+      expect(result.team.state).toBe("active")
+      expect(result.engineers).toHaveLength(2)
+      expect(teams.get(TEAM_ID)!.state).toBe("active")
+
+      // Slots themselves are unchanged — resumeTeam reports the prior
+      // state. The daemon's resumeTeamMonitoring is responsible for
+      // re-spawning subprocesses and resetting tasks.
+      const slotStates = result.engineers.map((e) => e.state).sort()
+      expect(slotStates).toEqual(["failed", "idle"])
+    })
+
+    test("resume is idempotent at the state-machine level (second call after success rejects)", async () => {
+      teams.set(TEAM_ID, makeTeam({ state: "terminated" as TeamRecord["state"] }))
+
+      await Effect.runPromise(memCoordinator.resumeTeam(TEAM_ID))
+
+      // Now the team is active. A repeat call must be rejected — we
+      // never want a live team to be silently "re-resumed" because that
+      // would imply double-spawning subprocesses in the daemon.
+      const second = await Effect.runPromise(
+        memCoordinator.resumeTeam(TEAM_ID).pipe(Effect.flip),
+      )
+
+      expect(second).toBeInstanceOf(CoordinatorError)
+      expect(second.message).toContain("Cannot resume team in state active")
+    })
+
+    test("resume preserves engineer slot identity (no new sessions created)", async () => {
+      teams.set(TEAM_ID, makeTeam({ state: "terminated" as TeamRecord["state"] }))
+      engineers.set(ENG_A, makeSlot({
+        engineerID: ENG_A,
+        sessionID: "sess_resume_a" as SessionID,
+        name: "engineer-resume-a",
+        state: "failed",
+        currentTask: null,
+      }))
+
+      const result = await Effect.runPromise(memCoordinator.resumeTeam(TEAM_ID))
+
+      expect(result.engineers).toHaveLength(1)
+      expect(result.engineers[0].engineerID).toBe(ENG_A)
+      expect(result.engineers[0].sessionID).toBe("sess_resume_a")
+      expect(result.engineers[0].name).toBe("engineer-resume-a")
     })
   })
 })

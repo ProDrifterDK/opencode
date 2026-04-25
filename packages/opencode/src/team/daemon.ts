@@ -74,6 +74,7 @@ interface Interface {
   readonly start: () => Effect.Effect<void>
   readonly stop: () => Effect.Effect<void>
   readonly getRunning: () => Effect.Effect<RunningEngineer[]>
+  readonly resumeTeamMonitoring: (teamID: TeamID) => Effect.Effect<{ respawned: number; tasksReset: number }, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/TeamDaemon") {}
@@ -790,6 +791,133 @@ export const layer = Layer.effect(
       })
     }
 
+    /**
+     * O4 — Resume monitoring for a previously terminated team.
+     *
+     * Pre-conditions: caller (TeamResumeTool) has already flipped the
+     * team back to `active` via `coordinator.resumeTeam`. Here we wire
+     * the live runtime back up:
+     *
+     *   1. Re-attach the heartbeat monitor (idempotent — guarded by
+     *      `isMonitoring`).
+     *   2. Reset any tasks that the prior process left in `in-progress`
+     *      back to `pending` so they can be re-claimed. The original
+     *      subprocess died with the daemon; the slot was marked
+     *      `failed` by `gracefulShutdown`. We do not re-spawn failed
+     *      engineers — that's the lead's call (kill+spawn or rely on
+     *      the remaining idle engineers + team_assign).
+     *   3. Re-spawn engineers whose state is still `working` or
+     *      `blocked` (rare; only happens if shutdown didn't run). For
+     *      `idle` engineers we leave them alone — they'll pick up
+     *      pending work via team_assign / team_claim like normal.
+     */
+    // Resolve once at layer init so resumeTeamMonitoring (and any other
+    // Service method) doesn't leak `GitManager.Service | EngineerProcessManager`
+    // into the public Effect context. These layers are already provided
+    // by `defaultLayer` below, so the resolution is guaranteed at runtime.
+    const gitManagerSvc = yield* GitManager.Service
+    const processManagerSvc = yield* EngineerProcessManager
+
+    const resumeTeamMonitoring = Effect.fn("TeamDaemon.resumeTeamMonitoring")(function* (teamID: TeamID) {
+      log.info("resuming team monitoring", { teamID })
+
+      const team = yield* coordinator.getTeam(teamID).pipe(
+        Effect.mapError((err: unknown) => new Error(String(err))),
+      )
+      if (!team) {
+        return yield* Effect.fail(new Error(`Team not found: ${teamID}`))
+      }
+
+      // Re-attach heartbeat monitor (idempotent).
+      const alreadyMonitored = yield* heartbeatMonitor.isMonitoring(teamID)
+      if (!alreadyMonitored) {
+        yield* heartbeatMonitor
+          .startTeamMonitoring(teamID, team.leadSessionID)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() =>
+                log.warn("failed to start heartbeat monitoring on resume", {
+                  teamID,
+                  error: Cause.pretty(cause),
+                }),
+              ),
+            ),
+          )
+      }
+
+      // Reset any leftover in-progress tasks back to pending. The
+      // engineer subprocess that owned them is gone; releasing the
+      // task lets `team_assign` / `team_claim` re-pick it up.
+      const allTasks = yield* taskBoard.list({ team_id: teamID }).pipe(
+        Effect.mapError((err: unknown) => new Error(String(err))),
+      )
+      let tasksReset = 0
+      for (const task of allTasks) {
+        if (task.status === "in-progress") {
+          yield* taskBoard
+            .update(task.id, { status: "pending", assigned_engineer_id: null })
+            .pipe(Effect.mapError((err: unknown) => new Error(String(err))))
+          tasksReset++
+        }
+      }
+
+      // Re-spawn engineers that were still active when the daemon died.
+      // `gracefulShutdown` flips `working` slots to `failed`, so the
+      // common case here is that nothing needs re-spawning. We still
+      // handle `working` and `blocked` defensively in case the daemon
+      // crashed without the SIGINT/SIGTERM path.
+      const engineers = yield* coordinator.listTeamEngineers(teamID).pipe(
+        Effect.mapError((err: unknown) => new Error(String(err))),
+      )
+
+      let respawned = 0
+      for (const slot of engineers) {
+        if (slot.state !== "working" && slot.state !== "blocked") continue
+        const alreadyRunning = getRunningEngineer(teamID, slot.engineerID)
+        if (alreadyRunning) continue
+
+        const taskID = slot.currentTask
+        if (!taskID) continue
+        const task = allTasks.find((t) => t.id === taskID)
+        if (!task) continue
+
+        log.info("respawning engineer on resume", {
+          engineerID: slot.engineerID,
+          taskID,
+        })
+
+        yield* startEngineerInBackground(
+          {
+            teamID,
+            engineerID: slot.engineerID,
+            sessionID: slot.sessionID,
+            name: slot.name,
+            taskId: taskID,
+            taskTitle: task.title,
+            taskDescription: task.description ?? "",
+          },
+          attachExitHandler,
+        ).pipe(
+          // Provide the captured services so the public method signature
+          // doesn't require GitManager/EngineerProcessManager from callers.
+          Effect.provideService(GitManager.Service, gitManagerSvc),
+          Effect.provideService(EngineerProcessManager, processManagerSvc),
+          Effect.catchCause((cause) =>
+            Effect.sync(() =>
+              log.error("respawn failed on resume", {
+                engineerID: slot.engineerID,
+                error: Cause.pretty(cause),
+              }),
+            ),
+          ),
+        )
+        respawned++
+      }
+
+      log.info("team resumed", { teamID, respawned, tasksReset })
+      return { respawned, tasksReset }
+    })
+
     const start = Effect.fn("TeamDaemon.start")(function* () {
       log.info("starting team daemon")
 
@@ -870,7 +998,7 @@ export const layer = Layer.effect(
     // Clean up on shutdown (if start() was called)
     yield* Effect.addFinalizer(() => stop())
 
-    return Service.of({ start, stop, getRunning })
+    return Service.of({ start, stop, getRunning, resumeTeamMonitoring })
   }),
 )
 

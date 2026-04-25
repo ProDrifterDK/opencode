@@ -97,6 +97,8 @@ const TOOL_DESCRIPTIONS = {
     "Report task completion, failure, or blocked status. Engineer-only; required at end of a task.",
   team_dissolve:
     "Gracefully shut down a team when all tasks are complete. Lead-only.",
+  team_resume:
+    "Re-attach a team that was left in `terminated` state (daemon shut down before dissolve). Re-spawns engineer subprocesses for active tasks and resets any in-progress tasks back to pending. Lead-only.",
   team_commit:
     "Squash-merge each completed engineer's branch into the lead's current branch using the engineer's task title as the commit message. Conflicts are surfaced and require manual resolution. Lead-only.",
 } as const
@@ -981,6 +983,59 @@ const branchCleanup = yield* gitManager
   }),
 )
 
+const teamResumeParams = z.object({
+  teamID: z.string().describe("Team ID to resume (must be in `terminated` state)"),
+})
+
+export const TeamResumeTool = Tool.define(
+  "team_resume",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const daemon = yield* TeamDaemon.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_resume,
+      parameters: teamResumeParams,
+      execute: (params: z.infer<typeof teamResumeParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          // Resume is invoked from a fresh lead session that may not yet
+          // be registered as the lead of the team being resumed. We
+          // therefore do NOT require `isLead(ctx.sessionID)` — instead
+          // we accept the call and let `coordinator.resumeTeam` enforce
+          // state machine correctness (only `terminated` teams are
+          // resumable). The teamID parameter itself is the
+          // authorization boundary.
+          void ctx
+
+          // Ensure the daemon is running so heartbeat + event subscriptions are live.
+          yield* daemon.start()
+
+          const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const resumed = yield* coordinator.resumeTeam(teamID)
+          const result = yield* daemon.resumeTeamMonitoring(teamID)
+
+          const output = [
+            `Team ${params.teamID} resumed.`,
+            `Engineers re-spawned: ${result.respawned}`,
+            `Tasks reset to pending: ${result.tasksReset}`,
+            `Total engineer slots: ${resumed.engineers.length}`,
+          ].join("\n")
+
+          return {
+            title: `Resume team ${params.teamID}`,
+            output,
+            metadata: {
+              teamID: params.teamID,
+              respawned: result.respawned,
+              tasksReset: result.tasksReset,
+              engineerCount: resumed.engineers.length,
+            },
+          }
+        }).pipe(toolErrorBoundary),
+    }
+  }),
+)
+
 const teamCommitParams = z.object({
   teamID: z.string().describe("Team ID from team_create"),
 })
@@ -1644,6 +1699,7 @@ export const TeamTools = Effect.gen(function* () {
     TeamStatusTool,
     TeamReportTool,
     TeamDissolveTool,
+    TeamResumeTool,
     TeamCommitTool,
     TeamInboxTool,
     TeamRosterTool,

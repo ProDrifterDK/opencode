@@ -1,0 +1,7 @@
+Resume a team that's in `terminated` state. The team's task board, engineer history,
+and worktrees are preserved. Engineers are re-spawned as fresh subprocesses; any
+in-progress tasks are reset to pending so they can be re-claimed.
+
+Usage: /team-resume <teamID>
+
+This calls `team_resume(teamID)` internally.
