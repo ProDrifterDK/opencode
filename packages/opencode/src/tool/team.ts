@@ -74,7 +74,7 @@ const TOOL_DESCRIPTIONS = {
   team_spawn:
     "Create an engineer session with a task. REQUIRES an `agent` parameter from team_agents. Lead-only.",
   team_decompose:
-    "Break a team goal into subtasks with non-overlapping file scopes. Lead-only.",
+    "Break a team goal into subtasks with non-overlapping file scopes. Annotate `complexity` per subtask (low/medium/high) to help match to faster agents in heterogeneous teams. Lead-only.",
   team_assign:
     "Auto-assign pending tasks to idle engineers using file-scope matching. Lead-only.",
   team_reassign: "Move a task from one engineer to another. Lead-only.",
@@ -408,6 +408,10 @@ const teamDecomposeParams = z.object({
           .array(z.string())
           .optional()
           .describe("IDs of subtasks (from `id` field) that must complete before this one can start"),
+        complexity: z
+          .enum(["low", "medium", "high"])
+          .optional()
+          .describe("Hint for agent routing: low = fast/cheap agent, high = deep/powerful agent"),
       }),
     )
     .describe("Subtasks to create (pre-parsed by LLM). Use `id` + `dependencies` to declare execution order."),
@@ -438,6 +442,7 @@ export const TeamDecomposeTool = Tool.define(
               description: s.description,
               files: s.files,
               dependencies: s.dependencies,
+              complexity: s.complexity,
             })),
             request: `Decomposed into ${params.subtasks.length} subtasks`,
           })

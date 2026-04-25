@@ -963,4 +963,45 @@ describe("LeadCoordinator", () => {
 
     expect(updated.file_scope).toBe(JSON.stringify(["src/b.ts", "src/c.ts"]))
   })
+
+  test("decompose accepts complexity field and returns correct task count", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const tasks = await runWith(
+      service.decompose({
+        teamId: "team_complexity_1" as TeamID,
+        request: "test complexity",
+        subtasks: [
+          { title: "Update README", description: "Simple doc update", files: ["README.md"], complexity: "low" },
+          { title: "Refactor auth flow", description: "Complex refactor", files: ["src/auth/flow.ts"], complexity: "high" },
+        ],
+      }),
+    )
+
+    expect(tasks).toHaveLength(2)
+    expect(tasks[0].title).toBe("Update README")
+    expect(tasks[1].title).toBe("Refactor auth flow")
+    expect(tasks.every((t) => t.status === "pending")).toBe(true)
+  })
+
+  test("decompose without complexity field does not error (undefined defaults)", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const tasks = await runWith(
+      service.decompose({
+        teamId: "team_complexity_2" as TeamID,
+        request: "test no complexity",
+        subtasks: [
+          { title: "No complexity task", description: "No annotation", files: ["src/index.ts"] },
+        ],
+      }),
+    )
+
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0].title).toBe("No complexity task")
+  })
 })

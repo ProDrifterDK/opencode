@@ -10,7 +10,21 @@
 `team_create({ goal: "..." })` — initializes a team; returns `teamID` required for all subsequent calls.
 
 ### team_decompose
-`team_decompose({ teamID, subtasks: [{ title, description, fileScope }] })` — registers subtasks.
+`team_decompose({ teamID, subtasks: [{ title, description, fileScope, complexity? }] })` — registers subtasks. Annotate `complexity` per subtask (low/medium/high) to help match to faster agents in heterogeneous teams.
+
+#### Complexity field
+Each subtask accepts an optional `complexity` field (`"low" | "medium" | "high"`). This is a routing hint — it is not persisted or enforced automatically today, but it nudges the Lead to assign appropriately:
+
+**Routing hints:** If your team has agents pinned to different tiers (e.g. an `engineer-fast` agent on Haiku and `engineer-deep` on Opus), pass low-complexity tasks to faster agents via `team_spawn({ agentName: "engineer-fast", ... })` and high-complexity tasks to deeper agents.
+
+```json
+{
+  "subtasks": [
+    { "title": "Update README", "files": ["README.md"], "complexity": "low" },
+    { "title": "Refactor auth flow", "files": ["src/auth/**"], "complexity": "high" }
+  ]
+}
+```
 
 ### team_agents
 `team_agents({ teamID })` — lists configured agents with `{ name, description, ... }`.

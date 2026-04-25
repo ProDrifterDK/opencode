@@ -1,4 +1,5 @@
 import { Effect, Layer, Context, Schema } from "effect"
+import { Log } from "@/util"
 import { globOverlap } from "./git-manager"
 import { TaskBoardRepo, TaskBoardRepoError } from "./task-board"
 import { type EngineerID, type EngineerStateRecord } from "./types"
@@ -11,6 +12,8 @@ import type {
   TaskBoardID,
   TeamID,
 } from "./task-board.sql"
+
+const log = Log.create({ service: "team.lead-coordinator" })
 
 export class LeadCoordinatorError extends Schema.TaggedErrorClass<LeadCoordinatorError>()(
   "LeadCoordinatorError",
@@ -33,6 +36,7 @@ export interface SubtaskSpec {
   description: string
   files: string[]
   dependencies?: string[]
+  complexity?: "low" | "medium" | "high"
 }
 
 export interface DecomposeInput {
@@ -242,6 +246,11 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
             status: "pending",
             dependencies: [],
           })
+          if (spec.complexity !== undefined) {
+            yield* Effect.sync(() =>
+              log.info(`Lead annotated task "${spec.title}" as complexity=${spec.complexity}`),
+            )
+          }
           const clientId = spec.id ?? spec.title
           clientIdToTaskId.set(clientId, task.id)
           created.push(task)
