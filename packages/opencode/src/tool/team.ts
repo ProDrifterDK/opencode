@@ -77,6 +77,8 @@ const TOOL_DESCRIPTIONS = {
   team_assign:
     "Auto-assign pending tasks to idle engineers using file-scope matching. Lead-only.",
   team_reassign: "Move a task from one engineer to another. Lead-only.",
+  team_retask:
+    "Edit a pending or blocked task's title, description, or fileScope. At least one field must be provided. Rejects in-progress, completed, and failed tasks. Checks glob overlap against other active tasks when fileScope changes. Lead-only.",
   team_kill:
     "Terminate a single engineer session and release its task to pending. Lead-only.",
   team_monitor:
@@ -502,6 +504,54 @@ export const TeamReassignTool = Tool.define(
               taskID: task.id,
               title: task.title,
               toEngineerID: params.toEngineerID,
+            },
+          }
+        }).pipe(toolErrorBoundary),
+    }
+  }),
+)
+
+const teamRetaskParams = z.object({
+  taskID: z.string().describe("Task ID to update"),
+  title: z.string().optional().describe("New title for the task"),
+  description: z.string().optional().describe("New description for the task"),
+  fileScope: z.array(z.string()).optional().describe("Replacement file scope for the task"),
+})
+
+export const TeamRetaskTool = Tool.define(
+  "team_retask",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const lead = yield* LeadCoordinator.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_retask,
+      parameters: teamRetaskParams,
+      execute: (params: z.infer<typeof teamRetaskParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* requireLead(ctx, coordinator, "retask a task")
+
+          const task = yield* lead.retask({
+            taskId: params.taskID as import("../team/task-board.sql").TaskBoardID,
+            title: params.title,
+            description: params.description,
+            fileScope: params.fileScope,
+          })
+
+          const output = [
+            `Task updated successfully.`,
+            `Task ID: ${task.id}`,
+            `Title: ${task.title}`,
+            `Status: ${task.status}`,
+          ].join("\n")
+
+          return {
+            title: `Retask ${params.taskID}`,
+            output,
+            metadata: {
+              taskID: task.id,
+              title: task.title,
+              status: task.status,
             },
           }
         }).pipe(toolErrorBoundary),
@@ -1516,6 +1566,7 @@ export const TeamTools = Effect.gen(function* () {
     TeamDecomposeTool,
     TeamAssignTool,
     TeamReassignTool,
+    TeamRetaskTool,
     TeamKillTool,
     TeamMonitorTool,
     TeamMessageTool,

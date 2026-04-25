@@ -51,6 +51,13 @@ export interface ReassignInput {
   toEngineer: EngineerID
 }
 
+export interface RetaskInput {
+  taskId: TaskBoardID
+  title?: string
+  description?: string
+  fileScope?: string[]
+}
+
 export interface EngineerSummary {
   id: EngineerID
   state: EngineerStateRecord["state"]
@@ -95,6 +102,9 @@ export interface Interface {
   ) => Effect.Effect<ProgressReport, Err>
   readonly reassign: (
     input: ReassignInput,
+  ) => Effect.Effect<Task, Err>
+  readonly retask: (
+    input: RetaskInput,
   ) => Effect.Effect<Task, Err>
   readonly validateFileScopes: (
     tasks: Array<{ id: string; files: string[] }>,
@@ -436,6 +446,65 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
       },
     )
 
+    const retask = Effect.fn("LeadCoordinator.retask")(
+      function* (input: RetaskInput) {
+        const task = yield* taskBoard.get(input.taskId)
+        if (!task) {
+          return yield* new LeadCoordinatorError({
+            message: `Task not found: ${input.taskId as string}`,
+          })
+        }
+
+        if (
+          task.status === "in-progress" ||
+          task.status === "completed" ||
+          task.status === "failed"
+        ) {
+          return yield* new LeadCoordinatorError({
+            message: `Cannot retask a ${task.status} task`,
+          })
+        }
+
+        if (
+          input.title === undefined &&
+          input.description === undefined &&
+          input.fileScope === undefined
+        ) {
+          return yield* new LeadCoordinatorError({
+            message: "retask requires at least one of title/description/fileScope",
+          })
+        }
+
+        if (input.fileScope !== undefined) {
+          const allTasks = yield* taskBoard.list({ team_id: task.team_id })
+          const otherActive = allTasks.filter(
+            (t) =>
+              t.id !== task.id &&
+              (t.status === "pending" || t.status === "in-progress" || t.status === "blocked"),
+          )
+          const newFiles = input.fileScope
+          for (const active of otherActive) {
+            const activeFiles = decodeFiles(active.file_scope)
+            if (newFiles.length === 0 || activeFiles.length === 0) continue
+            const conflicting = newFiles.some((af) => activeFiles.some((bf) => globOverlap(af, bf)))
+            if (conflicting) {
+              return yield* new FileScopeConflictError({
+                message: `Cannot retask — file scope overlaps with "${active.title}"`,
+                conflictingFiles: [...newFiles, ...activeFiles],
+              })
+            }
+          }
+        }
+
+        const updateInput: import("./task-board.sql").UpdateTaskInput = {}
+        if (input.title !== undefined) updateInput.title = input.title
+        if (input.description !== undefined) updateInput.description = input.description
+        if (input.fileScope !== undefined) updateInput.file_scope = encodeFiles(input.fileScope)
+
+        return yield* taskBoard.update(task.id, updateInput)
+      },
+    )
+
     const validateFileScopes = (
       tasks: Array<{ id: string; files: string[] }>,
     ): Effect.Effect<boolean, never> =>
@@ -486,6 +555,7 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
       assign,
       monitor,
       reassign,
+      retask,
       validateFileScopes,
       formatStatus,
     })

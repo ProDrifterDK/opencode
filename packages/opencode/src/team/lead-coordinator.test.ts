@@ -700,4 +700,266 @@ describe("LeadCoordinator", () => {
     const status = service.formatStatus(report)
     expect(status).not.toContain("Rate limits:")
   })
+
+  // ─── retask tests ────────────────────────────────────────────────────────────
+
+  test("retask updates title only", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Original title",
+          description: "desc",
+          file_scope: '["src/a.ts"]',
+          status: "pending",
+        })
+      }),
+    )
+
+    const updated = await runWith(
+      service.retask({ taskId: task.id, title: "New title" }),
+    )
+
+    expect(updated.title).toBe("New title")
+    expect(updated.description).toBe("desc")
+  })
+
+  test("retask updates description only", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "My task",
+          description: "old desc",
+          file_scope: '["src/a.ts"]',
+          status: "pending",
+        })
+      }),
+    )
+
+    const updated = await runWith(
+      service.retask({ taskId: task.id, description: "new desc" }),
+    )
+
+    expect(updated.description).toBe("new desc")
+    expect(updated.title).toBe("My task")
+  })
+
+  test("retask updates fileScope only", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "My task",
+          description: "desc",
+          file_scope: '["src/a.ts"]',
+          status: "pending",
+        })
+      }),
+    )
+
+    const updated = await runWith(
+      service.retask({ taskId: task.id, fileScope: ["src/b.ts"] }),
+    )
+
+    expect(updated.file_scope).toBe(JSON.stringify(["src/b.ts"]))
+  })
+
+  test("retask updates all three fields at once", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Old",
+          description: "old desc",
+          file_scope: '["src/a.ts"]',
+          status: "blocked",
+        })
+      }),
+    )
+
+    const updated = await runWith(
+      service.retask({ taskId: task.id, title: "New", description: "new desc", fileScope: ["src/c.ts"] }),
+    )
+
+    expect(updated.title).toBe("New")
+    expect(updated.description).toBe("new desc")
+    expect(updated.file_scope).toBe(JSON.stringify(["src/c.ts"]))
+  })
+
+  test("retask rejects when no fields provided", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "My task",
+          description: "desc",
+          status: "pending",
+        })
+      }),
+    )
+
+    await expect(
+      runWithCatch(service.retask({ taskId: task.id })),
+    ).rejects.toMatchObject({ _tag: "LeadCoordinatorError" })
+  })
+
+  test("retask rejects task not found", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    await expect(
+      runWithCatch(service.retask({ taskId: "nonexistent" as TaskBoardID, title: "x" })),
+    ).rejects.toMatchObject({ _tag: "LeadCoordinatorError" })
+  })
+
+  test("retask rejects in-progress task", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Active",
+          description: "desc",
+          status: "in-progress",
+          assigned_engineer_id: "eng_a" as EngineerID,
+        })
+      }),
+    )
+
+    await expect(
+      runWithCatch(service.retask({ taskId: task.id, title: "New" })),
+    ).rejects.toMatchObject({ _tag: "LeadCoordinatorError" })
+  })
+
+  test("retask rejects completed task", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Done",
+          description: "desc",
+          status: "completed",
+        })
+      }),
+    )
+
+    await expect(
+      runWithCatch(service.retask({ taskId: task.id, title: "New" })),
+    ).rejects.toMatchObject({ _tag: "LeadCoordinatorError" })
+  })
+
+  test("retask rejects failed task", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Failed",
+          description: "desc",
+          status: "failed",
+        })
+      }),
+    )
+
+    await expect(
+      runWithCatch(service.retask({ taskId: task.id, title: "New" })),
+    ).rejects.toMatchObject({ _tag: "LeadCoordinatorError" })
+  })
+
+  test("retask rejects fileScope overlap with other active task", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const { taskToRetask } = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Other active",
+          description: "busy",
+          file_scope: '["src/auth.ts"]',
+          status: "in-progress",
+          assigned_engineer_id: "eng_a" as EngineerID,
+        })
+        const taskToRetask = yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Pending task",
+          description: "desc",
+          file_scope: '["src/other.ts"]',
+          status: "pending",
+        })
+        return { taskToRetask }
+      }),
+    )
+
+    await expect(
+      runWithCatch(service.retask({ taskId: taskToRetask.id, fileScope: ["src/auth.ts"] })),
+    ).rejects.toMatchObject({ _tag: "FileScopeConflictError" })
+  })
+
+  test("retask succeeds fileScope with no other active tasks", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const task = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Solo task",
+          description: "desc",
+          file_scope: '["src/a.ts"]',
+          status: "pending",
+        })
+      }),
+    )
+
+    const updated = await runWith(
+      service.retask({ taskId: task.id, fileScope: ["src/b.ts", "src/c.ts"] }),
+    )
+
+    expect(updated.file_scope).toBe(JSON.stringify(["src/b.ts", "src/c.ts"]))
+  })
 })

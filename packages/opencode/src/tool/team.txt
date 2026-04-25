@@ -20,7 +20,7 @@ Call it only on demand (blocked engineer, user-requested status, final
 pre-dissolve summary). Routine coordination happens through team_inbox and
 team_message.
 
-Available tools (16 total):
+Available tools (17 total):
 
 Lead-only:
 - team_create: Initialize a new team for a goal
@@ -29,6 +29,7 @@ Lead-only:
 - team_spawn: Create an engineer with an agent and task (REQUIRES agent param)
 - team_assign: Auto-assign pending tasks to idle engineers
 - team_reassign: Move a task from one engineer to another
+- team_retask: Edit a pending/blocked task's title, description, or fileScope
 - team_kill: Terminate a single engineer session
 - team_dissolve: Gracefully shut down a team
 - team_commit: Squash-merge each completed engineer's branch into the

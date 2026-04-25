@@ -2,7 +2,7 @@
 
 ## Tools Reference
 
-**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_kill`, `team_dissolve`, `team_commit`
+**Lead-only:** `team_create`, `team_agents`, `team_spawn`, `team_decompose`, `team_assign`, `team_reassign`, `team_retask`, `team_kill`, `team_dissolve`, `team_commit`
 **Engineer-only:** `team_status`, `team_report`, `team_claim`
 **Both:** `team_monitor`, `team_inbox`, `team_roster`, `team_tasks`, `team_message`
 
@@ -33,8 +33,9 @@ Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>
 `team_roster` — returns engineer IDs and current state.
 `team_tasks` — lists pending/unassigned tasks.
 
-### team_reassign / team_kill / team_assign
+### team_reassign / team_retask / team_kill / team_assign
 `team_reassign({ teamID, taskID, engineerID })` — moves a task from one engineer to another.
+`team_retask({ taskID, title?, description?, fileScope? })` — edits the title, description, and/or fileScope of a `pending` or `blocked` task. At least one field must be supplied. Rejects `in-progress`, `completed`, and `failed` tasks. Runs a glob-overlap check on `fileScope` changes against other active tasks.
 `team_kill({ teamID, engineerID })` + fresh `team_spawn` — replaces a failed engineer.
 `team_assign({ teamID })` — auto-pairs any pending tasks with idle engineers.
 
