@@ -28,6 +28,7 @@ const makeMemoryTaskBoard = () => {
           time_created: now,
           time_updated: now,
           completed_at: null,
+          archived_at: null,
         }
         tasks.set(id, task)
         return task
@@ -36,7 +37,7 @@ const makeMemoryTaskBoard = () => {
     update: (taskId: TaskBoardID, input: UpdateTaskInput) =>
       Effect.sync(() => {
         const existing = tasks.get(taskId)
-        if (!existing) throw new Error(`Task not found: ${taskId}`)
+        if (!existing || existing.archived_at !== null) throw new Error(`Task not found: ${taskId}`)
         const updated: Task = {
           ...existing,
           title: input.title ?? existing.title,
@@ -58,6 +59,7 @@ const makeMemoryTaskBoard = () => {
       Effect.sync(() =>
         [...tasks.values()].filter((t) => {
           if (t.team_id !== filter.team_id) return false
+          if (t.archived_at !== null) return false
           if (filter.status && t.status !== filter.status) return false
           if (filter.assigned_engineer_id && t.assigned_engineer_id !== filter.assigned_engineer_id) return false
           return true
@@ -65,14 +67,18 @@ const makeMemoryTaskBoard = () => {
       ),
 
     get: (taskId: TaskBoardID) =>
-      Effect.sync(() => tasks.get(taskId) ?? null),
+      Effect.sync(() => {
+        const t = tasks.get(taskId)
+        if (!t || t.archived_at !== null) return null
+        return t
+      }),
 
     delete: (taskId: TaskBoardID) =>
       Effect.sync(() => { tasks.delete(taskId) }),
 
     listReadyTasks: (teamId: TeamID) =>
       Effect.sync(() => {
-        const all = [...tasks.values()].filter((t) => t.team_id === teamId)
+        const all = [...tasks.values()].filter((t) => t.team_id === teamId && t.archived_at === null)
         const completedIds = new Set(all.filter((t) => t.status === "completed").map((t) => t.id))
         return all.filter(
           (t) =>
@@ -81,6 +87,21 @@ const makeMemoryTaskBoard = () => {
             t.dependencies.every((depId) => completedIds.has(depId)),
         )
       }),
+
+    archiveTeamBoard: (teamId: TeamID) =>
+      Effect.sync(() => {
+        const now = Date.now()
+        for (const [id, t] of tasks.entries()) {
+          if (t.team_id === teamId && t.archived_at === null) {
+            tasks.set(id, { ...t, archived_at: now })
+          }
+        }
+      }),
+
+    listArchived: (teamId: TeamID) =>
+      Effect.sync(() =>
+        [...tasks.values()].filter((t) => t.team_id === teamId && t.archived_at !== null),
+      ),
   })
 }
 
@@ -575,5 +596,73 @@ describe("TaskBoardService", () => {
     )
     expect(blocked).toHaveLength(1)
     expect(blocked[0].title).toBe("STUCK")
+  })
+
+  describe("archived_at filtering", () => {
+    test("get() returns null for archived tasks", async () => {
+      const got = await runWithBoth(
+        Effect.gen(function* () {
+          const repo = yield* TaskBoardRepoService
+          const t = yield* repo.create({
+            team_id: "team_arc1" as TeamID,
+            title: "X",
+            status: "pending",
+          })
+          yield* repo.archiveTeamBoard("team_arc1" as TeamID)
+          return yield* repo.get(t.id)
+        }),
+      )
+      expect(got).toBeNull()
+    })
+
+    test("list() excludes archived tasks", async () => {
+      const tasks = await runWithBoth(
+        Effect.gen(function* () {
+          const repo = yield* TaskBoardRepoService
+          yield* repo.create({ team_id: "team_arc2" as TeamID, title: "X", status: "pending" })
+          yield* repo.archiveTeamBoard("team_arc2" as TeamID)
+          return yield* repo.list({ team_id: "team_arc2" as TeamID })
+        }),
+      )
+      expect(tasks.length).toBe(0)
+    })
+
+    test("listReadyTasks() excludes archived tasks", async () => {
+      const tasks = await runWithBoth(
+        Effect.gen(function* () {
+          const repo = yield* TaskBoardRepoService
+          yield* repo.create({ team_id: "team_arc3" as TeamID, title: "X", status: "pending" })
+          yield* repo.archiveTeamBoard("team_arc3" as TeamID)
+          return yield* repo.listReadyTasks("team_arc3" as TeamID)
+        }),
+      )
+      expect(tasks.length).toBe(0)
+    })
+
+    test("update() refuses to mutate archived rows", async () => {
+      const result = runWithBoth(
+        Effect.gen(function* () {
+          const repo = yield* TaskBoardRepoService
+          const t = yield* repo.create({ team_id: "team_arc4" as TeamID, title: "X", status: "pending" })
+          yield* repo.archiveTeamBoard("team_arc4" as TeamID)
+          yield* repo.update(t.id, { title: "MUTATED" })
+        }),
+      )
+      await expect(result).rejects.toThrow("Task not found")
+    })
+
+    test("listArchived() returns archived rows for a team", async () => {
+      const { archived, createdId } = await runWithBoth(
+        Effect.gen(function* () {
+          const repo = yield* TaskBoardRepoService
+          const t = yield* repo.create({ team_id: "team_arc5" as TeamID, title: "X", status: "pending" })
+          yield* repo.archiveTeamBoard("team_arc5" as TeamID)
+          const archived = yield* repo.listArchived("team_arc5" as TeamID)
+          return { archived, createdId: t.id }
+        }),
+      )
+      expect(archived.length).toBe(1)
+      expect(archived[0].id).toBe(createdId)
+    })
   })
 })

@@ -1,4 +1,4 @@
-import { eq, and } from "drizzle-orm"
+import { eq, and, isNull, isNotNull } from "drizzle-orm"
 import { Effect, Layer, Schema, Context } from "effect"
 import { Database } from "@/storage"
 import {
@@ -58,6 +58,10 @@ export interface Interface {
   readonly delete: (taskId: TaskBoardID) => Effect.Effect<void, TaskBoardRepoError>
   /** Returns pending tasks whose every dependency is completed (or has no dependencies). */
   readonly listReadyTasks: (teamId: TeamID) => Effect.Effect<Task[], TaskBoardRepoError>
+  /** Soft-deletes all non-archived tasks for a team by setting archived_at. */
+  readonly archiveTeamBoard: (teamId: TeamID) => Effect.Effect<void, TaskBoardRepoError>
+  /** Returns archived tasks for a team. */
+  readonly listArchived: (teamId: TeamID) => Effect.Effect<Task[], TaskBoardRepoError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/TaskBoardRepo") {}
@@ -85,6 +89,7 @@ export const layer: Layer.Layer<Service> = Layer.effect(
             time_created: now,
             time_updated: now,
             completed_at: null,
+            archived_at: null,
           })
           .run()
         return {
@@ -101,13 +106,18 @@ export const layer: Layer.Layer<Service> = Layer.effect(
           time_created: now,
           time_updated: now,
           completed_at: null,
+          archived_at: null,
         } as Task
       })
     })
 
     const update = Effect.fn("TaskBoardRepo.update")((taskId: TaskBoardID, input: UpdateTaskInput) => {
       return tx((db) => {
-        const existing = db.select().from(TaskBoardTable).where(eq(TaskBoardTable.id, taskId)).get()
+        const existing = db
+          .select()
+          .from(TaskBoardTable)
+          .where(and(eq(TaskBoardTable.id, taskId), isNull(TaskBoardTable.archived_at)))
+          .get()
         if (!existing) throw new TaskBoardRepoError({ message: `Task not found: ${taskId}` })
 
         const newDeps = input.dependencies !== undefined
@@ -135,7 +145,10 @@ export const layer: Layer.Layer<Service> = Layer.effect(
 
     const list = Effect.fn("TaskBoardRepo.list")((filter: TaskBoardFilter) => {
       return query((db) => {
-        const conditions = [eq(TaskBoardTable.team_id, filter.team_id)]
+        const conditions = [
+          eq(TaskBoardTable.team_id, filter.team_id),
+          isNull(TaskBoardTable.archived_at),
+        ]
         if (filter.status) conditions.push(eq(TaskBoardTable.status, filter.status))
         if (filter.assigned_engineer_id)
           conditions.push(eq(TaskBoardTable.assigned_engineer_id, filter.assigned_engineer_id))
@@ -146,14 +159,23 @@ export const layer: Layer.Layer<Service> = Layer.effect(
 
     const get = Effect.fn("TaskBoardRepo.get")((taskId: TaskBoardID) => {
       return query((db) => {
-        const result = db.select().from(TaskBoardTable).where(eq(TaskBoardTable.id, taskId)).get()
+        const result = db
+          .select()
+          .from(TaskBoardTable)
+          .where(and(eq(TaskBoardTable.id, taskId), isNull(TaskBoardTable.archived_at)))
+          .get()
         return result ? rowToTask(result) : null
       })
     })
 
     const listReadyTasks = Effect.fn("TaskBoardRepo.listReadyTasks")((teamId: TeamID) => {
       return query((db) => {
-        const allTasks = db.select().from(TaskBoardTable).where(eq(TaskBoardTable.team_id, teamId)).all().map(rowToTask)
+        const allTasks = db
+          .select()
+          .from(TaskBoardTable)
+          .where(and(eq(TaskBoardTable.team_id, teamId), isNull(TaskBoardTable.archived_at)))
+          .all()
+          .map(rowToTask)
         const completedIds = new Set(allTasks.filter((t) => t.status === "completed").map((t) => t.id))
         return allTasks.filter(
           (t) =>
@@ -170,6 +192,27 @@ export const layer: Layer.Layer<Service> = Layer.effect(
       }).pipe(Effect.asVoid)
     })
 
+    const archiveTeamBoard = Effect.fn("TaskBoardRepo.archiveTeamBoard")((teamId: TeamID) => {
+      return tx((db) => {
+        const now = Date.now()
+        db.update(TaskBoardTable)
+          .set({ archived_at: now })
+          .where(and(eq(TaskBoardTable.team_id, teamId), isNull(TaskBoardTable.archived_at)))
+          .run()
+      }).pipe(Effect.asVoid)
+    })
+
+    const listArchived = Effect.fn("TaskBoardRepo.listArchived")((teamId: TeamID) => {
+      return query((db) =>
+        db
+          .select()
+          .from(TaskBoardTable)
+          .where(and(eq(TaskBoardTable.team_id, teamId), isNotNull(TaskBoardTable.archived_at)))
+          .all()
+          .map(rowToTask),
+      )
+    })
+
     return Service.of({
       create,
       update,
@@ -177,6 +220,8 @@ export const layer: Layer.Layer<Service> = Layer.effect(
       get,
       delete: remove,
       listReadyTasks,
+      archiveTeamBoard,
+      listArchived,
     })
   }),
 )

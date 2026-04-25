@@ -107,6 +107,9 @@ const makeMemoryTaskBoard = () => {
             t.dependencies.every((depId) => completedIds.has(depId)),
         )
       }),
+
+    archiveTeamBoard: (_teamId: TeamID) => Effect.void,
+    listArchived: (_teamId: TeamID) => Effect.succeed([]),
   })
 }
 

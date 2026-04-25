@@ -337,6 +337,9 @@ const memTaskBoard = TaskBoardRepoService.of({
           t.dependencies.every((depId) => completedIds.has(depId)),
       )
     }),
+
+  archiveTeamBoard: (_teamId: TeamID) => Effect.void,
+  listArchived: (_teamId: TeamID) => Effect.succeed([]),
 })
 
 // Build subtasks as proper SubtaskSpec for DecomposeInput

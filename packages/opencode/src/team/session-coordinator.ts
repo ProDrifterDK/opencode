@@ -5,7 +5,6 @@ import { Service as SessionService, defaultLayer as sessionDefaultLayer } from "
 import { Service as MailboxService, defaultLayer as mailboxDefaultLayer } from "./mailbox"
 import { Service as TaskBoardService, layer as taskBoardLayer } from "./task-board"
 import { TeamStateTable, EngineerSlotTable, type EngineerSlotRow, type TeamStateRow } from "./session-coordinator.sql"
-import type { TaskBoardID } from "./task-board.sql"
 import { TeamID, EngineerID, type EngineerState } from "./types"
 import { MAX_TEAM_SIZE } from "./constants"
 import { Event, publishTeamEvent } from "./events"
@@ -383,19 +382,11 @@ export const layer = Layer.effect(
         ]),
       )
 
-      const allTasks = yield* taskBoard.list({ team_id: input.teamID }).pipe(
+      yield* taskBoard.archiveTeamBoard(input.teamID).pipe(
         Effect.catchCause((cause) => {
-          console.error("[Coordinator] Failed to list tasks:", Cause.pretty(cause))
-          return Effect.succeed([] as { id: TaskBoardID }[])
+          console.error("[Coordinator] Failed to archive task board:", Cause.pretty(cause))
+          return Effect.void
         }),
-      )
-      yield* Effect.forEach(allTasks, (task) =>
-        taskBoard.delete(task.id).pipe(
-          Effect.catchCause((cause) => {
-            console.error("[Coordinator] Failed to delete task:", Cause.pretty(cause))
-            return Effect.void
-          }),
-        ),
       )
 
       yield* dbTx((db) => {

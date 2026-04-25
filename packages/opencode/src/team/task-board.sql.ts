@@ -27,6 +27,7 @@ export interface Task {
   time_created: number
   time_updated: number
   completed_at: number | null
+  archived_at: number | null
 }
 
 export interface CreateTaskInput {
@@ -82,6 +83,7 @@ export const TaskBoardTable = sqliteTable(
     dependencies: text().notNull().default("[]"),
     ...Timestamps,
     completed_at: integer(),
+    archived_at: integer(),
   },
   (table) => [
     index("task_board_team_id_idx").on(table.team_id),
