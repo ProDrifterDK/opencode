@@ -65,24 +65,34 @@ export interface EngineerLoopInput {
   taskDescription: string
   providerID?: string
   modelID?: string
+  /**
+   * Fallback model. When the primary provider trips the team's circuit
+   * breaker (3 consecutive 429s), the engineer-loop catches the
+   * `CircuitBreakerOpenError`, swaps to this model, and retries the
+   * task ONCE. If `fallbackProviderID/fallbackModelID` are absent or
+   * the retry also trips the breaker, the loop fails through.
+   */
+  fallbackProviderID?: string
+  fallbackModelID?: string
   teammates?: Array<{ name: string; engineerID: string; task?: string }>
 }
 
 /**
- * Run the engineer loop end-to-end. Identical to the legacy
- * `createEngineerLoopEffect` body — extracted so the new CLI subcommand
- * (which runs inside the engineer's own subprocess) can call it.
+ * One attempt at the engineer task with a specific model. Acquires a
+ * rate-limit slot, sends the engineer prompt, runs the prompt loop,
+ * reconciles tokens, publishes completion. Releases the slot on any
+ * exit. Throws `CircuitBreakerOpenError` if the team's breaker is
+ * tripped at acquire-time — the outer `runEngineerLoop` catches that to
+ * decide whether to swap to the fallback model.
  */
-export const runEngineerLoop = (input: EngineerLoopInput) =>
+const attemptTask = (
+  input: EngineerLoopInput,
+  modelParam: { providerID: string; modelID: string } | undefined,
+  attemptLabel: "primary" | "fallback",
+) =>
   Effect.gen(function* () {
     const rateLimiter = yield* RateLimiter.Service
     const promptService = yield* SessionPrompt.Service
-
-    log.info("starting engineer loop", {
-      engineerID: input.engineerID,
-      sessionID: input.sessionID,
-      model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
-    })
 
     // Acquire a rate-limit slot. Blocks while the queue is full; fails
     // fast with CircuitBreakerOpenError if too many consecutive 429s have
@@ -101,7 +111,10 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
       publishTeamEvent(Event.EngineerProgress, {
         teamID: input.teamID,
         engineerID: input.engineerID,
-        progressText: `Starting: ${input.taskTitle.slice(0, 40)}${input.taskTitle.length > 40 ? "..." : ""}`,
+        progressText:
+          attemptLabel === "fallback"
+            ? `Retrying (fallback): ${input.taskTitle.slice(0, 30)}${input.taskTitle.length > 30 ? "..." : ""}`
+            : `Starting: ${input.taskTitle.slice(0, 40)}${input.taskTitle.length > 40 ? "..." : ""}`,
         timestamp: Date.now(),
       })
 
@@ -115,10 +128,18 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
           ]
         : []
 
+      const retryNote = attemptLabel === "fallback"
+        ? [
+            `NOTE: Your previous attempt was interrupted because the primary provider hit a sustained 429 burst. You are now running on the fallback provider; pick up the task and complete it.`,
+            ``,
+          ]
+        : []
+
       const engineerPrompt = [
         `You are an engineer on team ${input.teamID}. Your name is ${input.name}.`,
         ...teammatesSection,
         ``,
+        ...retryNote,
         `Your assigned task:`,
         `Title: ${input.taskTitle}`,
         `Description: ${input.taskDescription}`,
@@ -146,17 +167,12 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
         `Start working on your assigned task now. Remember to call team_report when done.`,
       ].join("\n")
 
-      // Build model parameter if specified
-      const modelParam = input.providerID && input.modelID
-        ? { providerID: input.providerID, modelID: input.modelID }
-        : undefined
-
       yield* promptService.prompt({
         sessionID: input.sessionID,
         parts: [{ type: "text", text: engineerPrompt }],
         model: modelParam,
       })
-      log.info("engineer completed initial prompt", { engineerID: input.engineerID })
+      log.info("engineer completed initial prompt", { engineerID: input.engineerID, attempt: attemptLabel })
 
       // Emit working progress
       publishTeamEvent(Event.EngineerProgress, {
@@ -167,7 +183,7 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
       })
 
       const loopResult = yield* promptService.loop({ sessionID: input.sessionID })
-      log.info("engineer loop completed", { engineerID: input.engineerID })
+      log.info("engineer loop completed", { engineerID: input.engineerID, attempt: attemptLabel })
 
       // Reconcile the rate-limiter token budget: replace the upfront estimate
       // with the actual tokens consumed by this engineer's session.
@@ -210,6 +226,68 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
         rateLimiter
           .release(input.teamID as TeamID, input.engineerID as EngineerID, ENGINEER_TOKEN_ESTIMATE)
           .pipe(Effect.ignore),
+      ),
+    )
+  })
+
+/**
+ * Run the engineer loop end-to-end with optional one-shot failover.
+ *
+ * Try the primary model. If `acquire` throws `CircuitBreakerOpenError`
+ * AND a fallback model is configured, reset the team breaker (the
+ * working assumption is that the fallback uses a different provider, so
+ * the prior 429s don't apply), then retry ONCE with the fallback model.
+ * If the fallback also fails or no fallback is configured, the error
+ * propagates to the daemon's failure path.
+ */
+export const runEngineerLoop = (input: EngineerLoopInput) =>
+  Effect.gen(function* () {
+    log.info("starting engineer loop", {
+      engineerID: input.engineerID,
+      sessionID: input.sessionID,
+      model: input.providerID && input.modelID ? `${input.providerID}/${input.modelID}` : "(default)",
+      fallback:
+        input.fallbackProviderID && input.fallbackModelID
+          ? `${input.fallbackProviderID}/${input.fallbackModelID}`
+          : "(none)",
+    })
+
+    const primaryModel = input.providerID && input.modelID
+      ? { providerID: input.providerID, modelID: input.modelID }
+      : undefined
+    const fallbackModel = input.fallbackProviderID && input.fallbackModelID
+      ? { providerID: input.fallbackProviderID, modelID: input.fallbackModelID }
+      : undefined
+
+    return yield* attemptTask(input, primaryModel, "primary").pipe(
+      Effect.catchTag("CircuitBreakerOpenError", (cbErr) =>
+        Effect.gen(function* () {
+          if (!fallbackModel) {
+            log.info("no fallback configured — engineer fails through", {
+              engineerID: input.engineerID,
+            })
+            return yield* Effect.fail(cbErr)
+          }
+          log.info("circuit breaker open — swapping to fallback model", {
+            engineerID: input.engineerID,
+            fallback: `${fallbackModel.providerID}/${fallbackModel.modelID}`,
+          })
+          // Reset the team's breaker. Assumption: the fallback uses a
+          // different provider, so the breaker that was tripped by the
+          // primary provider's 429s should not block the fallback.
+          const rateLimiter = yield* RateLimiter.Service
+          yield* rateLimiter.resetCircuitBreaker(input.teamID as TeamID)
+          publishTeamEvent(Event.EngineerProgress, {
+            teamID: input.teamID,
+            engineerID: input.engineerID,
+            progressText: `🔁 Swapping to fallback after circuit breaker`,
+            timestamp: Date.now(),
+          })
+          // Retry once. Any error from the fallback attempt (CB open
+          // again, anything else) propagates so the daemon marks the
+          // engineer failed — we never loop fallbacks.
+          return yield* attemptTask(input, fallbackModel, "fallback")
+        }),
       ),
     )
   })

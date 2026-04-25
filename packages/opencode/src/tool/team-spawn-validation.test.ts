@@ -161,3 +161,66 @@ describe("team_spawn agent validation (S3)", () => {
     expect(callCount).toBe(2)
   })
 })
+
+// ─── Fallback agent validation (O1) ───────────────────────────────────────────
+//
+// `team_spawn` accepts an optional `fallbackAgent` parameter. The validation
+// uses the same cache + lookup as the primary `agent` param, but the error
+// label is "Fallback agent" instead of "Agent" so the LLM can disambiguate
+// which name is wrong when both are provided.
+
+describe("team_spawn fallback agent validation (O1)", () => {
+  const agents: AgentItem[] = [
+    { name: "engineer-fast", hidden: false, native: false },
+    { name: "engineer-deep", hidden: false, native: false },
+    { name: "native-internal", hidden: false, native: true },
+  ]
+
+  // Mirrors the lookupAgent helper in TeamSpawnTool that takes a label.
+  const lookupAgent = (
+    rawName: string,
+    label: "Agent" | "Fallback agent",
+    list: AgentItem[],
+  ): { ok: true; agent: AgentItem } | { ok: false; error: string } => {
+    const found = list.find(a => a.name.toLowerCase() === rawName.toLowerCase())
+    if (!found) {
+      const available = list
+        .filter(a => !a.hidden && !a.native)
+        .map(a => a.name)
+      const availableList = available.length > 0 ? available.join(", ") : "(none configured)"
+      return { ok: false, error: `${label} '${rawName}' not found. Available: ${availableList}` }
+    }
+    return { ok: true, agent: found }
+  }
+
+  test("valid fallback agent name resolves", () => {
+    const r = lookupAgent("engineer-deep", "Fallback agent", agents)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.agent.name).toBe("engineer-deep")
+  })
+
+  test("unknown fallback agent rejected with 'Fallback agent' label", () => {
+    const r = lookupAgent("typo-agent", "Fallback agent", agents)
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error).toBe(
+        "Fallback agent 'typo-agent' not found. Available: engineer-fast, engineer-deep",
+      )
+    }
+  })
+
+  test("primary 'Agent' label and fallback 'Fallback agent' label are distinct", () => {
+    const primary = lookupAgent("missing-1", "Agent", agents)
+    const fallback = lookupAgent("missing-2", "Fallback agent", agents)
+    expect(primary.ok).toBe(false)
+    expect(fallback.ok).toBe(false)
+    if (!primary.ok) expect(primary.error).toContain("Agent 'missing-1'")
+    if (!fallback.ok) expect(fallback.error).toContain("Fallback agent 'missing-2'")
+  })
+
+  test("case-insensitive match (parity with primary agent)", () => {
+    const r = lookupAgent("ENGINEER-FAST", "Fallback agent", agents)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.agent.name).toBe("engineer-fast")
+  })
+})

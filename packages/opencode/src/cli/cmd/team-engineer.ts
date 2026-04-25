@@ -79,6 +79,14 @@ export const TeamEngineerRunCommand = cmd({
         type: "string",
         describe: "LLM model id (optional, falls back to session default)",
       })
+      .option("fallback-provider-id", {
+        type: "string",
+        describe: "fallback LLM provider id (optional, used on CircuitBreakerOpenError)",
+      })
+      .option("fallback-model-id", {
+        type: "string",
+        describe: "fallback LLM model id (optional, used on CircuitBreakerOpenError)",
+      })
       .option("dangerously-skip-permissions", {
         type: "boolean",
         describe: "auto-approve permissions for tool calls (required for unattended engineers)",
@@ -95,6 +103,8 @@ export const TeamEngineerRunCommand = cmd({
     const taskDescription = String(args["task-description"])
     const providerID = args["provider-id"] ? String(args["provider-id"]) : undefined
     const modelID = args["model-id"] ? String(args["model-id"]) : undefined
+    const fallbackProviderID = args["fallback-provider-id"] ? String(args["fallback-provider-id"]) : undefined
+    const fallbackModelID = args["fallback-model-id"] ? String(args["fallback-model-id"]) : undefined
     const skipPerms = Boolean(args["dangerously-skip-permissions"])
 
     // Mirror env var so any downstream code that reads it (Phase 2/3)
@@ -124,6 +134,8 @@ export const TeamEngineerRunCommand = cmd({
             taskDescription,
             providerID,
             modelID,
+            fallbackProviderID,
+            fallbackModelID,
             // Engineer runs without peer awareness; `teammates: []` is a
             // known gap (backlog: A3-followup teammate hydration). The
             // value is used to address mailbox messages between engineers.

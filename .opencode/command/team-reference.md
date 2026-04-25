@@ -30,8 +30,10 @@ Each subtask accepts an optional `complexity` field (`"low" | "medium" | "high"`
 `team_agents({ teamID })` — lists configured agents with `{ name, description, ... }`.
 
 ### team_spawn
-`team_spawn({ teamID, name: "engineer-<role>", task: { title, description, fileScope }, agent: "<agent-name>" })`
+`team_spawn({ teamID, name: "engineer-<role>", task: { title, description, fileScope }, agent: "<agent-name>", fallbackAgent?: "<agent-name>" })`
 Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>/<engineerID>/` on branch `team/<teamID>/engineer-<engineerID>`. The lead's main tree is never switched.
+
+**Multi-provider failover (`fallbackAgent`):** Optional. When the team's circuit breaker opens because the primary provider returned 3 consecutive 429s, the engineer swaps to this agent and retries the task ONCE. Use a different provider for true cross-provider failover (e.g. `agent: "engineer-anthropic", fallbackAgent: "engineer-openai"`). If the fallback also trips the breaker, the engineer fails and the task is released. If `fallbackAgent` is omitted, the engineer fails on the first breaker-open without retry.
 
 ### team_commit
 `team_commit({ teamID })` — squash-merges every `completed` engineer's branch into the lead's current branch using the engineer's task title as the commit message. Engineers still working, blocked, or failed are skipped. Stops immediately on merge conflict and reports conflicting files; re-run after manual resolution.

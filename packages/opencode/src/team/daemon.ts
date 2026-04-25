@@ -178,6 +178,8 @@ const startEngineerInBackground = (
     taskDescription: string
     providerID?: string
     modelID?: string
+    fallbackProviderID?: string
+    fallbackModelID?: string
     teammates?: Array<{ name: string; engineerID: string; task?: string }>
   },
   // Injection seam: the caller (inside `layer`) passes the locally-defined
@@ -222,6 +224,8 @@ const startEngineerInBackground = (
       name: input.name,
       providerID: input.providerID,
       modelID: input.modelID,
+      fallbackProviderID: input.fallbackProviderID,
+      fallbackModelID: input.fallbackModelID,
     })
 
     setRunning(input.teamID as TeamID, input.engineerID as EngineerID, {
@@ -648,6 +652,9 @@ export const layer = Layer.effect(
         taskDescription: string
         providerID?: string
         modelID?: string
+        fallbackAgent?: string
+        fallbackProviderID?: string
+        fallbackModelID?: string
       }
     }) => {
       log.info("received engineer.spawned event", {
@@ -679,6 +686,8 @@ export const layer = Layer.effect(
             taskDescription: event.properties.taskDescription,
             providerID: event.properties.providerID,
             modelID: event.properties.modelID,
+            fallbackProviderID: event.properties.fallbackProviderID,
+            fallbackModelID: event.properties.fallbackModelID,
             teammates: otherEngineers,
           },
           attachExitHandler,

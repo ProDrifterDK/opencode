@@ -51,6 +51,13 @@ export interface SpawnInput {
   name: string
   providerID?: string
   modelID?: string
+  /**
+   * Optional fallback model. Forwarded to the engineer subprocess via
+   * `--fallback-provider-id` / `--fallback-model-id`. The engineer-loop
+   * uses these on a `CircuitBreakerOpenError` to retry the task once.
+   */
+  fallbackProviderID?: string
+  fallbackModelID?: string
 }
 
 /**
@@ -193,6 +200,8 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
           ]
           if (input.providerID) args.push("--provider-id", input.providerID)
           if (input.modelID) args.push("--model-id", input.modelID)
+          if (input.fallbackProviderID) args.push("--fallback-provider-id", input.fallbackProviderID)
+          if (input.fallbackModelID) args.push("--fallback-model-id", input.fallbackModelID)
 
           log.info("spawning engineer subprocess", {
             teamID,

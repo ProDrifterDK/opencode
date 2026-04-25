@@ -24,6 +24,7 @@ export interface EngineerSlot {
   currentTask: string | null
   agentName: string | null
   agentColor: string | null
+  fallbackAgent: string | null
   startedAt: number | null
   lastHeartbeat: number
 }
@@ -50,6 +51,7 @@ export interface Interface {
     taskTitle?: string
     agentName?: string
     agentColor?: string
+    fallbackAgent?: string
   }) => Effect.Effect<EngineerSlot, CoordinatorError>
   readonly resumeEngineer: (input: {
     engineerID: EngineerID
@@ -103,6 +105,7 @@ const rowToSlot = (row: EngineerSlotRow): EngineerSlot => ({
   currentTask: row.current_task,
   agentName: row.agent_name,
   agentColor: row.agent_color,
+  fallbackAgent: row.fallback_agent_name,
   startedAt: row.started_at,
   lastHeartbeat: row.last_heartbeat,
 })
@@ -193,6 +196,7 @@ export const layer = Layer.effect(
       taskTitle?: string
       agentName?: string
       agentColor?: string
+      fallbackAgent?: string
     }) {
       const team = yield* fetchTeam(input.teamID)
       if (!team) {
@@ -222,6 +226,7 @@ export const layer = Layer.effect(
         currentTask: null,
         agentName: input.agentName ?? null,
         agentColor: input.agentColor ?? null,
+        fallbackAgent: input.fallbackAgent ?? null,
         startedAt: now,
         lastHeartbeat: now,
       }
@@ -236,6 +241,7 @@ export const layer = Layer.effect(
           current_task: slot.currentTask,
           agent_name: slot.agentName,
           agent_color: slot.agentColor,
+          fallback_agent_name: slot.fallbackAgent,
           started_at: slot.startedAt,
           last_heartbeat: slot.lastHeartbeat,
           time_created: now,

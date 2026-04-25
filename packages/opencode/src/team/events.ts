@@ -31,6 +31,9 @@ export const Event = {
     modelID: z.string().optional(),
     agentName: z.string().optional(),
     agentColor: z.string().optional(),
+    fallbackAgent: z.string().optional(),
+    fallbackProviderID: z.string().optional(),
+    fallbackModelID: z.string().optional(),
   })),
 
   EngineerCompleted: BusEvent.define("engineer.completed", z.object({

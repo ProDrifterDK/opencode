@@ -68,6 +68,7 @@ const makeSlot = (overrides: Partial<EngineerSlot> = {}): EngineerSlot => ({
   currentTask: null,
   agentName: null,
   agentColor: null,
+  fallbackAgent: null,
   startedAt: Date.now(),
   lastHeartbeat: Date.now(),
   ...overrides,

@@ -36,6 +36,7 @@ const makeEngineer = (overrides: { engineerID: string; name: string } & Partial<
   currentTask: overrides.currentTask ?? null,
   agentName: overrides.agentName ?? "build-agent",
   agentColor: overrides.agentColor ?? "blue",
+  fallbackAgent: overrides.fallbackAgent ?? null,
   startedAt: overrides.startedAt ?? 1_700_000_000_000,
   lastHeartbeat: overrides.lastHeartbeat ?? 1_700_000_000_000,
 })

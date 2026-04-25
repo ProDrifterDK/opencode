@@ -222,6 +222,7 @@ const teamSpawnParams = z.object({
     fileScope: z.array(z.string()).optional().describe("Files this task may modify"),
   }),
   agent: z.string().optional().describe("Agent name to use for this engineer (use team_agents to list). If not specified, uses session's default model."),
+  fallbackAgent: z.string().optional().describe("Fallback agent name. If the primary agent's provider trips the team's circuit breaker (sustained 429s), the engineer swaps to this agent and retries the task ONCE. Use a different provider for true cross-provider failover."),
 })
 
 export const TeamSpawnTool = Tool.define(
@@ -241,11 +242,15 @@ export const TeamSpawnTool = Tool.define(
             return yield* Effect.fail(new Error("Only the lead can spawn engineers"))
           }
 
-          // Resolve agent to get model configuration and color
+          // Resolve agent (and optional fallback) to get model configuration and color.
+          // Both validations consume the E4 _agentsCache so we never double-list().
           let modelConfig: { providerID: string; modelID: string } | undefined
           let agentName: string | undefined
           let agentColor: string | undefined
-          if (params.agent) {
+          let fallbackAgentName: string | undefined
+          let fallbackModelConfig: { providerID: string; modelID: string } | undefined
+
+          if (params.agent || params.fallbackAgent) {
             const now = Date.now()
             const agents =
               _agentsCache && _agentsCache.expiresAt > now
@@ -255,22 +260,39 @@ export const TeamSpawnTool = Tool.define(
                     _agentsCache = { value: fresh, expiresAt: now + TEAM_AGENTS_CACHE_TTL_MS }
                     return fresh
                   })
-            const agent = agents.find(a => a.name.toLowerCase() === params.agent!.toLowerCase())
-            if (!agent) {
-              const available = agents
-                .filter(a => !a.hidden && !a.native)
-                .map(a => a.name)
-              const availableList = available.length > 0 ? available.join(", ") : "(none configured)"
-              return yield* Effect.fail(
-                new Error(`Agent '${params.agent}' not found. Available: ${availableList}`)
-              )
+            const lookupAgent = (rawName: string, label: "Agent" | "Fallback agent") => {
+              const found = agents.find(a => a.name.toLowerCase() === rawName.toLowerCase())
+              if (!found) {
+                const available = agents
+                  .filter(a => !a.hidden && !a.native)
+                  .map(a => a.name)
+                const availableList = available.length > 0 ? available.join(", ") : "(none configured)"
+                return { ok: false as const, error: `${label} '${rawName}' not found. Available: ${availableList}` }
+              }
+              return { ok: true as const, agent: found }
             }
-            agentName = agent.name
-            agentColor = agent.color
-            if (agent.model) {
-              modelConfig = {
-                providerID: agent.model.providerID,
-                modelID: agent.model.modelID,
+
+            if (params.agent) {
+              const r = lookupAgent(params.agent, "Agent")
+              if (!r.ok) return yield* Effect.fail(new Error(r.error))
+              agentName = r.agent.name
+              agentColor = r.agent.color
+              if (r.agent.model) {
+                modelConfig = {
+                  providerID: r.agent.model.providerID,
+                  modelID: r.agent.model.modelID,
+                }
+              }
+            }
+            if (params.fallbackAgent) {
+              const r = lookupAgent(params.fallbackAgent, "Fallback agent")
+              if (!r.ok) return yield* Effect.fail(new Error(r.error))
+              fallbackAgentName = r.agent.name
+              if (r.agent.model) {
+                fallbackModelConfig = {
+                  providerID: r.agent.model.providerID,
+                  modelID: r.agent.model.modelID,
+                }
               }
             }
           }
@@ -282,6 +304,7 @@ export const TeamSpawnTool = Tool.define(
             name: params.name,
             agentName,
             agentColor,
+            fallbackAgent: fallbackAgentName,
           })
 
           const fileScope = params.task.fileScope
@@ -316,11 +339,17 @@ export const TeamSpawnTool = Tool.define(
             modelID: modelConfig?.modelID,
             agentName,
             agentColor,
+            fallbackAgent: fallbackAgentName,
+            fallbackProviderID: fallbackModelConfig?.providerID,
+            fallbackModelID: fallbackModelConfig?.modelID,
           })
 
           const modelInfo = agentName
             ? `Agent: ${agentName}` + (modelConfig ? ` (${modelConfig.providerID}/${modelConfig.modelID})` : " (session default model)")
             : "Model: (session default)"
+          const fallbackInfo = fallbackAgentName
+            ? `Fallback: ${fallbackAgentName}` + (fallbackModelConfig ? ` (${fallbackModelConfig.providerID}/${fallbackModelConfig.modelID})` : " (session default model)")
+            : null
 
           const output = [
             `Engineer spawned successfully.`,
@@ -329,9 +358,10 @@ export const TeamSpawnTool = Tool.define(
             `Task ID: ${task.id}`,
             `Task: ${params.task.title}`,
             modelInfo,
+            fallbackInfo,
             ``,
             `Note: Do NOT poll team_monitor. Engineer will notify you when done.`,
-          ].join("\n")
+          ].filter(Boolean).join("\n")
 
           return {
             title: `Spawn engineer ${params.name}`,

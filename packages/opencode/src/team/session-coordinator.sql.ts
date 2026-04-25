@@ -18,6 +18,7 @@ export interface EngineerSlotRow {
   current_task: string | null
   agent_name: string | null
   agent_color: string | null
+  fallback_agent_name: string | null
   started_at: number | null
   last_heartbeat: number
   time_created: number
@@ -61,6 +62,7 @@ export const EngineerSlotTable = sqliteTable(
     current_task: text(),
     agent_name: text(),
     agent_color: text(),
+    fallback_agent_name: text(),
     started_at: integer(),
     last_heartbeat: integer().notNull(),
     ...Timestamps,
