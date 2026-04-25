@@ -430,6 +430,72 @@ describe("GitManager", () => {
     expect(engLog).toContain("engineer commit")
   })
 
+  // --- commitOnCurrentBranch ---
+
+  test("commitOnCurrentBranch with empty fileScopes falls back to git add --all", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    // Write an untracked file
+    Bun.spawnSync(["sh", "-c", "echo untracked > untracked.txt"], { cwd: testDir })
+
+    await runWith(service.commitOnCurrentBranch({ message: "fallback commit" }))
+
+    const log = git(["log", "--oneline", "-1"])
+    expect(log).toContain("fallback commit")
+
+    // Untracked file should have been staged and committed (git add --all)
+    const files = git(["ls-files"])
+    expect(files).toContain("untracked.txt")
+  })
+
+  test("commitOnCurrentBranch with fileScopes only stages matching paths", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    // Write two files — only one is in scope
+    Bun.spawnSync(["sh", "-c", "mkdir -p src && echo scoped > src/scoped.ts"], { cwd: testDir })
+    Bun.spawnSync(["sh", "-c", "echo outofscope > out-of-scope.txt"], { cwd: testDir })
+
+    await runWith(service.commitOnCurrentBranch({ message: "scoped commit", fileScopes: ["src/"] }))
+
+    const log = git(["log", "--oneline", "-1"])
+    expect(log).toContain("scoped commit")
+
+    // src/scoped.ts should be in the commit
+    const files = git(["ls-files"])
+    expect(files).toContain("src/scoped.ts")
+
+    // out-of-scope.txt should remain untracked (not staged by scoped git add)
+    const status = git(["status", "--porcelain"])
+    expect(status).toContain("out-of-scope.txt")
+  })
+
+  test("commitOnCurrentBranch deduplicates repeated fileScopes", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    Bun.spawnSync(["sh", "-c", "mkdir -p src && echo dedup > src/dedup.ts"], { cwd: testDir })
+
+    // Pass same scope twice — should not error
+    await expect(
+      runWith(service.commitOnCurrentBranch({
+        message: "dedup commit",
+        fileScopes: ["src/", "src/"],
+      })),
+    ).resolves.toBeUndefined()
+
+    const log = git(["log", "--oneline", "-1"])
+    expect(log).toContain("dedup commit")
+  })
+
+  test("commitOnCurrentBranch with --allow-empty commits even with no staged changes", async () => {
+    const service = await runWith(Effect.gen(function* () { return yield* Service }))
+
+    // No new files — allow-empty should still produce a commit
+    await runWith(service.commitOnCurrentBranch({ message: "empty commit", fileScopes: ["src/"] }))
+
+    const log = git(["log", "--oneline", "-1"])
+    expect(log).toContain("empty commit")
+  })
+
   // --- cleanupBranches with worktrees ---
 
   test("cleanupBranches removes worktrees and branches for team", async () => {

@@ -56,7 +56,7 @@ export interface Interface {
     teamID: TeamID
     engineerID: EngineerID
   }) => Effect.Effect<BranchStatus, GitError>
-  readonly commitOnCurrentBranch: (message: string) => Effect.Effect<void, GitError>
+  readonly commitOnCurrentBranch: (input: { message: string; fileScopes?: readonly string[] }) => Effect.Effect<void, GitError>
   // Phase 1: worktree primitives
   readonly createEngineerWorktree: (input: {
     teamID: TeamID
@@ -344,9 +344,17 @@ export const layer = Layer.effect(
       } satisfies BranchStatus
     })
 
-    const commitOnCurrentBranch = Effect.fn("GitManager.commitOnCurrentBranch")(function* (message: string) {
-      yield* execGit(["add", "--all"])
-      yield* execGit(["commit", "--allow-empty", "-m", message])
+    const commitOnCurrentBranch = Effect.fn("GitManager.commitOnCurrentBranch")(function* (input: { message: string; fileScopes?: readonly string[] }) {
+      const uniqueScopes = input.fileScopes ? [...new Set(input.fileScopes)] : []
+      if (uniqueScopes.length === 0) {
+        yield* Effect.logDebug("[GitManager.commitOnCurrentBranch] No active fileScopes — falling back to git add --all")
+        yield* execGit(["add", "--all"])
+      } else {
+        // Ignore errors from git add with pathspecs — a pathspec that matches no
+        // files is not an error when the commit itself is --allow-empty.
+        yield* execGit(["add", "--", ...uniqueScopes]).pipe(Effect.ignore)
+      }
+      yield* execGit(["commit", "--allow-empty", "-m", input.message])
     })
 
     return Service.of({

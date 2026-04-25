@@ -56,6 +56,9 @@ const makeTaskBoardStub = (tasks: TaskRow[]) =>
     list: () => Effect.succeed(tasks as any),
     get: (id) => Effect.succeed(tasks.find((t) => t.id === id) ?? null as any),
     delete: () => Effect.die("not implemented"),
+    listReadyTasks: () => Effect.succeed([] as any),
+    archiveTeamBoard: () => Effect.void,
+    listArchived: () => Effect.succeed([] as any),
   })
 
 type MergeCall = { teamID: TeamID; engineerID: EngineerID; message?: string }
@@ -70,6 +73,11 @@ const makeGitManagerStub = (
     mergeBranch: mergeFn,
     cleanupBranches: () => Effect.die("not implemented"),
     getBranchStatus: () => Effect.die("not implemented"),
+    commitOnCurrentBranch: () => Effect.void,
+    createEngineerWorktree: () => Effect.die("not implemented"),
+    removeEngineerWorktree: () => Effect.void,
+    commitInWorktree: () => Effect.void,
+    listEngineerWorktrees: () => Effect.succeed([] as const),
   })
 
 // ─── The execute logic under test (mirrors TeamCommitTool exactly) ──────────
