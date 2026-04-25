@@ -1,4 +1,4 @@
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Cause } from "effect"
 import { Bus } from "@/bus"
 import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
@@ -471,7 +471,7 @@ export const layer = Layer.effect(
               : Effect.void,
           ),
           Effect.catchCause((cause) =>
-            Effect.sync(() => log.error("mailbox GC failed", { cause })),
+            Effect.sync(() => log.error("mailbox GC failed", { cause: Cause.pretty(cause) })),
           ),
         ),
       )
@@ -794,6 +794,7 @@ export const layer = Layer.effect(
       unsubscribers.push(unsubPartUpdated)
 
       heartbeatUpdateInterval = setInterval(updateRunningHeartbeats, HEARTBEAT_UPDATE_INTERVAL)
+      // Both sweeps are runFork (fire-and-forget) — they race in the same tick. Independent (different keys) so race is harmless.
       heartbeatCheckInterval = setInterval(() => {
         checkForStaleEngineers()
         purgeStaleMailboxMessages()

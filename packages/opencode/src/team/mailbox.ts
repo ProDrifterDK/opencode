@@ -252,7 +252,7 @@ export const layer = Layer.effect(
         const result = db
           .delete(MailboxTable)
           .where(lt(MailboxTable.created_at, cutoff))
-          .run() as { changes?: number } | undefined
+          .run() as { changes: number }
         return result?.changes ?? 0
       })
     })

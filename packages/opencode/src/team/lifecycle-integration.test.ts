@@ -7,7 +7,7 @@ import { Service as MailboxService } from "./mailbox"
 import { Service as TaskBoardRepoService } from "./task-board"
 import { Service as RateLimiterService, CircuitBreakerOpenError } from "./rate-limiter"
 import { Service as GitManagerService } from "./git-manager"
-import { ENGINEER_MAX_IDLE, MAILBOX_QUEUE_DEPTH, MAX_TEAM_SIZE } from "./constants"
+import { ENGINEER_MAX_IDLE, MAILBOX_QUEUE_DEPTH, MAX_TEAM_SIZE, MAILBOX_MAX_AGE_MS } from "./constants"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
 import type { Task, TaskBoardID, CreateTaskInput, UpdateTaskInput, TaskBoardFilter } from "./task-board.sql"
@@ -75,12 +75,11 @@ const makeTeam = (overrides: Partial<TeamRecord> = {}): TeamRecord => ({
 // In-memory service mocks
 // ---------------------------------------------------------------------------
 
-// Forward-declared so memCoordinator (defined first) can delegate mailbox cleanup
-// to memMailbox.purge — this mirrors the real session-coordinator wiring contract
-// and ensures these mocks fail closed if production code stops calling purge.
+// memMailbox is forward-declared below; Effect.suspend defers the binding lookup
+// until call time so the const-binding resolves correctly.
 const purgeViaMailbox = (sessionID: SessionID) =>
   Effect.suspend(() => memMailbox.purge(sessionID)).pipe(
-    Effect.mapError((cause) => new CoordinatorError({ message: String(cause) })),
+    Effect.mapError((cause) => new CoordinatorError({ message: cause.message })),
   )
 
 const memCoordinator = SessionCoordinatorService.of({
@@ -1030,7 +1029,7 @@ describe("Team Lifecycle Integration", () => {
       )
       // Backdate to 25h ago by mutating the in-memory row directly
       const stored = mailboxStore.get(oldMsg.id)!
-      mailboxStore.set(oldMsg.id, { ...stored, created_at: Date.now() - 25 * 60 * 60 * 1000 })
+      mailboxStore.set(oldMsg.id, { ...stored, created_at: Date.now() - (MAILBOX_MAX_AGE_MS + 60_000) })
 
       // Add a fresh message that should survive
       await Effect.runPromise(
@@ -1043,12 +1042,37 @@ describe("Team Lifecycle Integration", () => {
         }),
       )
 
-      const purged = await Effect.runPromise(memMailbox.purgeOlderThan(86_400_000))
+      const purged = await Effect.runPromise(memMailbox.purgeOlderThan(MAILBOX_MAX_AGE_MS))
       expect(purged).toBe(1)
 
       const remaining = await Effect.runPromise(memMailbox.peek(recipient))
       expect(remaining.length).toBe(1)
       expect(remaining[0].content).toBe("fresh message")
+    })
+
+    test("purgeOlderThan does NOT purge messages exactly at the cutoff (lt is strict)", async () => {
+      const recipient = "sess_gc_boundary" as SessionID
+      const sender = "sess_gc_sender2" as SessionID
+
+      const msg = await Effect.runPromise(
+        memMailbox.send({
+          recipientSessionID: recipient,
+          senderSessionID: sender,
+          priority: "inbox",
+          type: "info",
+          content: "boundary message",
+        }),
+      )
+      // Backdate exactly to the cutoff boundary (created_at === now - maxAgeMs)
+      const stored = mailboxStore.get(msg.id)!
+      mailboxStore.set(msg.id, { ...stored, created_at: Date.now() - MAILBOX_MAX_AGE_MS })
+
+      // lt is strict — message exactly at boundary should survive
+      const purged = await Effect.runPromise(memMailbox.purgeOlderThan(MAILBOX_MAX_AGE_MS))
+      expect(purged).toBe(0)
+
+      const remaining = await Effect.runPromise(memMailbox.peek(recipient))
+      expect(remaining.length).toBe(1)
     })
 
     test("killEngineer purges that engineer's mailbox", async () => {
