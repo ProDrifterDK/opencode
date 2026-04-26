@@ -18,6 +18,7 @@ import { cmd } from "./cmd"
 import { bootstrap } from "../bootstrap"
 import { AppRuntime } from "@/effect/app-runtime"
 import { runEngineerLoop } from "@/team/engineer-loop"
+import { hasEngineerCompleted } from "@/team/events"
 import { runPermissionAutoReplier } from "./skip-permissions"
 import type { SessionID } from "@/session/schema"
 import { Log } from "@/util"
@@ -121,6 +122,29 @@ export const TeamEngineerRunCommand = cmd({
       pid: process.pid,
     })
 
+    // Diagnostics — surface silent exits and rejected promises through
+    // stderr so the lead's `engineerStderrLogger` captures them. Without
+    // these, an unhandled rejection or a runtime that drains the event
+    // loop mid-loop produces an exit-0 subprocess with no clue why.
+    let completedSuccessfully = false
+    process.on("uncaughtException", (err) => {
+      const line = `engineer uncaughtException: ${String(err)}\n`
+      try { process.stderr.write(line) } catch {}
+      log.error("uncaughtException", { error: String(err), engineerID })
+    })
+    process.on("unhandledRejection", (reason) => {
+      const line = `engineer unhandledRejection: ${String(reason)}\n`
+      try { process.stderr.write(line) } catch {}
+      log.error("unhandledRejection", { reason: String(reason), engineerID })
+    })
+    process.on("beforeExit", (code) => {
+      if (!completedSuccessfully) {
+        const line = `engineer beforeExit code=${code} completedSuccessfully=false — event loop drained before engineer-loop resolved\n`
+        try { process.stderr.write(line) } catch {}
+        log.warn("beforeExit without completion", { code, engineerID })
+      }
+    })
+
     try {
       await bootstrap(worktreePath, async () => {
         const engineerLoopPromise = AppRuntime.runPromise(
@@ -177,36 +201,38 @@ export const TeamEngineerRunCommand = cmd({
         }
       })
 
+      completedSuccessfully = true
       log.info("engineer subprocess completed", { engineerID, pid: process.pid })
       process.exitCode = 0
     } catch (err) {
-      // Tolerate post-completion teardown noise: the lead's
-      // `team_dissolve` deletes the engineer's session row mid-flight,
-      // and any subscription / read that races the delete throws a
-      // NotFoundError ("Session not found"). The engineer has already
-      // completed via `team_report` at that point, so surfacing exit
-      // code 1 here would make the lead's heartbeat treat the
-      // subprocess as a genuine failure (and emit a spurious
-      // `EngineerFailed` event with `error: "killed by coordinator"`).
-      // Detect the post-dissolve case by string-match — the actual
-      // NotFoundError class lives in `@/storage` and arrives wrapped
-      // in Effect causes, so isInstance matching is unreliable.
+      // Tolerate post-completion teardown noise ONLY when the engineer
+      // has confirmed completion via `EngineerCompleted` (the latch in
+      // events.ts flips when the event is emitted). Without the latch
+      // gate, a pre-completion NotFoundError (engineer never reached
+      // team_report) was silently turned into exit 0 — the lead then
+      // saw state="working" + code=0, marked the engineer failed, and
+      // the heartbeat sweep eventually fired `all-engineers-failed`.
       const errStr = String(err)
-      const isPostDissolveTeardown =
+      const looksLikeSessionGone =
         errStr.includes("Session not found") || errStr.includes("NotFoundError")
-      if (isPostDissolveTeardown) {
+      const completed = hasEngineerCompleted()
+      if (looksLikeSessionGone && completed) {
         log.info("engineer subprocess completed (session removed by lead during dissolve)", {
           engineerID,
           pid: process.pid,
           error: errStr,
         })
+        completedSuccessfully = true
         process.exitCode = 0
       } else {
         log.error("engineer subprocess failed", {
           engineerID,
           error: errStr,
+          completed,
         })
-        process.stderr.write(`engineer subprocess failed: ${errStr}\n`)
+        process.stderr.write(
+          `engineer subprocess failed (completed=${completed}): ${errStr}\n`,
+        )
         process.exitCode = 1
       }
     }

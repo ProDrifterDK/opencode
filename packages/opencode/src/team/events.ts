@@ -117,6 +117,25 @@ export const Event = {
 const isEngineerSubprocess = (): boolean => process.env.OPENCODE_TEAM_ENGINEER === "1"
 
 /**
+ * Module-level latch flipped to `true` once an `EngineerCompleted`
+ * event is emitted from this process. The engineer subprocess uses
+ * this to distinguish post-completion teardown errors (safe to swallow
+ * as exit 0) from pre-completion failures (must surface as exit 1).
+ *
+ * Reset by `resetEngineerCompletedLatch` for tests; production code
+ * should never need to reset it.
+ */
+let engineerCompletedLatch = false
+
+export function hasEngineerCompleted(): boolean {
+  return engineerCompletedLatch
+}
+
+export function resetEngineerCompletedLatch(): void {
+  engineerCompletedLatch = false
+}
+
+/**
  * Encode an event as a JSON-line and write it to stdout. Defensive:
  * if stdout.write throws (broken pipe, etc.) we catch + log + drop the
  * event. The engineer must NOT crash because the lead disconnected.
@@ -140,6 +159,14 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
   def: D,
   properties: Schema.Schema.Type<D["properties"]>,
 ): void {
+  // Flip the completion latch BEFORE emitting so that any synchronous
+  // teardown observer reads the same truth the lead will. Both lead
+  // and engineer paths flip the same flag — only the engineer reads it
+  // (via team-engineer.ts), but flipping in both keeps semantics
+  // uniform regardless of process role.
+  if (def.type === "engineer.completed") {
+    engineerCompletedLatch = true
+  }
   if (isEngineerSubprocess()) {
     // engineer subprocess publishes only via stdout — local Bus is the lead's path.
     // Bus.publish is intentionally skipped here: there are no in-process subscribers
