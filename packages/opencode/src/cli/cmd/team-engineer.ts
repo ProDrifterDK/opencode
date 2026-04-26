@@ -22,7 +22,7 @@ import { runPermissionAutoReplier } from "./skip-permissions"
 import type { SessionID } from "@/session/schema"
 import { Log } from "@/util"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { Server } from "@/server"
+import { Server } from "@/server/server"
 
 const log = Log.create({ service: "cli.team-engineer-run" })
 
