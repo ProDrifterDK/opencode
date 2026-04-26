@@ -22,6 +22,9 @@ const makeSlot = (overrides: Partial<EngineerSlot> = {}): EngineerSlot => ({
   name: "engineer-a",
   state: "idle",
   currentTask: null,
+  agentName: null,
+  agentColor: null,
+  fallbackAgent: null,
   startedAt: Date.now(),
   lastHeartbeat: Date.now(),
   ...overrides,
@@ -95,6 +98,13 @@ const memCoordinator = SessionCoordinatorService.of({
       return slot ?? makeSlot({ engineerID })
     }),
   getTeamForSession: () => Effect.succeed(null),
+  resumeTeam: (teamID) =>
+    Effect.sync(() => {
+      const team = teams.get(teamID)
+      if (!team) throw new Error(`Team not found: ${teamID}`)
+      const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
+      return { team: { ...team, state: "active" as const }, engineers: slots }
+    }),
 })
 
 const memLead = LeadCoordinatorService.of({
@@ -106,6 +116,10 @@ const memLead = LeadCoordinatorService.of({
   reassign: (input: { taskId: TaskBoardID; toEngineer: EngineerID }) =>
     Effect.sync(() => {
       return { id: input.taskId, assigned_engineer_id: input.toEngineer } as Task
+    }),
+  retask: (input) =>
+    Effect.sync(() => {
+      return { id: input.taskId } as import("./task-board.sql").Task
     }),
   validateFileScopes: () => Effect.succeed(true),
   formatStatus: () => "",
@@ -137,6 +151,7 @@ const memMailbox = MailboxService.of({
   peek: () => Effect.succeed([]),
   markRead: () => Effect.void,
   purge: () => Effect.void,
+  purgeOlderThan: (_maxAgeMs) => Effect.succeed(0),
   hasUnread: (input) =>
     Effect.sync(() => mailboxUnread.get(input.recipientSessionID) ?? false),
 })

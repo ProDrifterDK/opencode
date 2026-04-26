@@ -15,7 +15,7 @@
 import { describe, test, expect, beforeEach } from "bun:test"
 import { Effect, Layer, Scope } from "effect"
 import { Service as HeartbeatService } from "./heartbeat"
-import { Service as SessionCoordinatorService, type EngineerSlot, type TeamRecord } from "./session-coordinator"
+import { Service as SessionCoordinatorService, CoordinatorError, type EngineerSlot, type TeamRecord } from "./session-coordinator"
 import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as MailboxService } from "./mailbox"
 import { Service as TaskBoardRepoService } from "./task-board"
@@ -186,6 +186,17 @@ const memCoordinator = SessionCoordinatorService.of({
       if (asEngineer) return asEngineer.teamID
       return null
     }),
+  resumeTeam: (teamID) =>
+    Effect.gen(function* () {
+      const team = teams.get(teamID)
+      if (!team) {
+        return yield* Effect.fail(new CoordinatorError({ message: `Team not found: ${teamID}` }))
+      }
+      const next: TeamRecord = { ...team, state: "active" as const, updatedAt: Date.now() }
+      teams.set(teamID, next)
+      const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
+      return { team: next, engineers: slots }
+    }),
 })
 
 const memMailbox = MailboxService.of({
@@ -255,6 +266,18 @@ const memMailbox = MailboxService.of({
         if (row.recipient_session_id === recipientSessionID) mailboxStore.delete(id)
       }
     }),
+  purgeOlderThan: (maxAgeMs) =>
+    Effect.sync(() => {
+      const cutoff = Date.now() - maxAgeMs
+      let purged = 0
+      for (const [id, row] of mailboxStore) {
+        if (row.created_at < cutoff) {
+          mailboxStore.delete(id)
+          purged++
+        }
+      }
+      return purged
+    }),
   hasUnread: (input) =>
     Effect.sync(() =>
       [...mailboxStore.values()].some(
@@ -289,6 +312,7 @@ const memTaskBoard = TaskBoardRepoService.of({
         time_created: now,
         time_updated: now,
         completed_at: null,
+        archived_at: null,
       }
       tasks.set(id, task)
       return task
@@ -371,6 +395,7 @@ const memLead = LeadCoordinatorService.of({
           time_created: now,
           time_updated: now,
           completed_at: null,
+          archived_at: null,
         }
         tasks.set(id, task)
         results.push(task)
@@ -429,6 +454,20 @@ const memLead = LeadCoordinatorService.of({
       const task = [...tasks.values()].find((t) => t.id === input.taskId)
       if (!task) throw new Error(`Task not found: ${input.taskId}`)
       const updated: Task = { ...task, assigned_engineer_id: input.toEngineer, status: "in-progress", time_updated: Date.now() }
+      tasks.set(task.id, updated)
+      return updated
+    }),
+  retask: (input) =>
+    Effect.sync(() => {
+      const task = tasks.get(input.taskId)
+      if (!task) throw new Error(`Task not found: ${input.taskId}`)
+      const updated: Task = {
+        ...task,
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.description !== undefined ? { description: input.description } : {}),
+        ...(input.fileScope !== undefined ? { file_scope: JSON.stringify(input.fileScope) } : {}),
+        time_updated: Date.now(),
+      }
       tasks.set(task.id, updated)
       return updated
     }),

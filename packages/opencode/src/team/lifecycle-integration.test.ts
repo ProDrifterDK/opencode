@@ -56,6 +56,9 @@ const makeSlot = (overrides: Partial<EngineerSlot> = {}): EngineerSlot => ({
   name: "engineer-a",
   state: "idle",
   currentTask: null,
+  agentName: null,
+  agentColor: null,
+  fallbackAgent: null,
   startedAt: Date.now(),
   lastHeartbeat: Date.now(),
   ...overrides,
@@ -169,12 +172,39 @@ const memCoordinator = SessionCoordinatorService.of({
       const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
       return { team: next, engineers: slots }
     }),
-
   getTeam: (teamID) => Effect.sync(() => teams.get(teamID) ?? null),
   getEngineer: (engineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
   listTeamEngineers: (teamID) =>
     Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listAllEngineers: () => Effect.sync(() => [...engineers.values()]),
   listTeams: () => Effect.sync(() => [...teams.values()]),
+  isLead: (sessionID) =>
+    Effect.sync(() => [...teams.values()].some((t) => t.leadSessionID === sessionID)),
+  isEngineer: (sessionID) =>
+    Effect.sync(() => [...engineers.values()].some((e) => e.sessionID === sessionID)),
+  getEngineerBySession: (sessionID) =>
+    Effect.sync(() => [...engineers.values()].find((e) => e.sessionID === sessionID) ?? null),
+  updateEngineer: (engineerID, updates) =>
+    Effect.sync(() => {
+      const slot = engineers.get(engineerID)
+      if (!slot) throw new Error(`Engineer not found: ${engineerID}`)
+      const updated: EngineerSlot = {
+        ...slot,
+        ...(updates.state !== undefined ? { state: updates.state } : {}),
+        ...(updates.currentTask !== undefined ? { currentTask: updates.currentTask } : {}),
+        lastHeartbeat: updates.lastHeartbeat ?? Date.now(),
+      }
+      engineers.set(engineerID, updated)
+      return updated
+    }),
+  getTeamForSession: (sessionID) =>
+    Effect.sync(() => {
+      const asLead = [...teams.values()].find((t) => t.leadSessionID === sessionID)
+      if (asLead) return asLead.teamID
+      const asEngineer = [...engineers.values()].find((e) => e.sessionID === sessionID)
+      if (asEngineer) return asEngineer.teamID
+      return null
+    }),
 })
 
 const memMailbox = MailboxService.of({
@@ -295,6 +325,7 @@ const memTaskBoard = TaskBoardRepoService.of({
         time_created: now,
         time_updated: now,
         completed_at: null,
+        archived_at: null,
       }
       tasks.set(id, task)
       return task
@@ -364,6 +395,19 @@ const memLead = LeadCoordinatorService.of({
       const task = [...tasks.values()].find((t) => t.id === input.taskId)
       if (!task) throw new Error(`Task not found: ${input.taskId}`)
       const updated = { ...task, assigned_engineer_id: input.toEngineer, status: "in-progress" as const }
+      tasks.set(task.id, updated)
+      return updated
+    }),
+  retask: (input) =>
+    Effect.sync(() => {
+      const task = tasks.get(input.taskId)
+      if (!task) throw new Error(`Task not found: ${input.taskId}`)
+      const updated = {
+        ...task,
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.description !== undefined ? { description: input.description } : {}),
+        ...(input.fileScope !== undefined ? { file_scope: JSON.stringify(input.fileScope) } : {}),
+      }
       tasks.set(task.id, updated)
       return updated
     }),
@@ -1288,7 +1332,7 @@ describe("Team Lifecycle Integration", () => {
 
       expect(result.engineers).toHaveLength(1)
       expect(result.engineers[0].engineerID).toBe(ENG_A)
-      expect(result.engineers[0].sessionID).toBe("sess_resume_a")
+      expect(result.engineers[0].sessionID as string).toBe("sess_resume_a")
       expect(result.engineers[0].name).toBe("engineer-resume-a")
     })
   })
