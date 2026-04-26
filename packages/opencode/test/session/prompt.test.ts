@@ -19,6 +19,11 @@ import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "../../src/session"
+import { SessionCoordinator } from "../../src/team/session-coordinator"
+import { LeadCoordinator } from "../../src/team/lead-coordinator"
+import { TaskBoardRepo } from "../../src/team/task-board"
+import { Mailbox } from "../../src/team/mailbox"
+import { RateLimiter } from "../../src/team/rate-limiter"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
@@ -177,6 +182,11 @@ function makeHttp() {
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Ripgrep.defaultLayer),
     Layer.provide(Format.defaultLayer),
+    Layer.provide(SessionCoordinator.defaultLayer),
+    Layer.provide(TaskBoardRepo.layer),
+    Layer.provide(Mailbox.defaultLayer),
+    Layer.provide(RateLimiter.layer),
+    Layer.provide(LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer), Layer.provide(RateLimiter.layer))),
     Layer.provideMerge(todo),
     Layer.provideMerge(question),
     Layer.provideMerge(deps),

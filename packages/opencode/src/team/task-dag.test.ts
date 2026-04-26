@@ -50,6 +50,7 @@ const makeMemoryTaskBoard = () => {
           time_created: now,
           time_updated: now,
           completed_at: null,
+          archived_at: null,
         }
         tasks.set(id, task)
         return task

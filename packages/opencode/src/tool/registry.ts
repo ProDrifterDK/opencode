@@ -31,6 +31,7 @@ import { SessionCoordinator } from "../team/session-coordinator"
 import { LeadCoordinator } from "../team/lead-coordinator"
 import { TaskBoardRepo } from "../team/task-board"
 import { Mailbox } from "../team/mailbox"
+import { RateLimiter } from "../team/rate-limiter"
 import { Glob } from "@opencode-ai/shared/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -330,6 +331,23 @@ export const layer: Layer.Layer<
   }),
 )
 
+const teamLayers = Layer.suspend(() => {
+  const taskBoard = TaskBoardRepo.layer
+  const rateLimiter = RateLimiter.layer
+  const mailbox = Mailbox.defaultLayer
+  const leadCoordinator = LeadCoordinator.layer.pipe(
+    Layer.provide(taskBoard),
+    Layer.provide(rateLimiter),
+  )
+  return Layer.mergeAll(
+    SessionCoordinator.defaultLayer,
+    taskBoard,
+    mailbox,
+    rateLimiter,
+    leadCoordinator,
+  )
+})
+
 const baseRegistryLayer = Layer.suspend(() =>
   layer.pipe(
     Layer.provide(Config.defaultLayer),
@@ -349,6 +367,7 @@ const baseRegistryLayer = Layer.suspend(() =>
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Ripgrep.defaultLayer),
     Layer.provide(Truncate.defaultLayer),
+    Layer.provide(teamLayers),
   ),
 )
 

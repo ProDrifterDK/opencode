@@ -3,7 +3,7 @@ import { Bus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
 import z from "zod"
 import { LEAD_CONTEXT_BUDGET } from "./constants"
-import type { MailboxRow } from "./mailbox.sql"
+import type { MailboxRow, MessageBatch } from "./mailbox.sql"
 import { Mailbox } from "./mailbox"
 import { SessionID } from "@/session/schema"
 import { Log } from "@/util"
@@ -27,7 +27,7 @@ export class SummarizerError extends Schema.TaggedErrorClass<SummarizerError>()(
   { message: Schema.String },
 ) {}
 
-export interface SummarizerConfig {
+export type SummarizerConfig = {
   readonly triggerThreshold: number
   readonly contextBudget: number
 }
@@ -37,19 +37,14 @@ export const DEFAULT_CONFIG: SummarizerConfig = {
   contextBudget: LEAD_CONTEXT_BUDGET,
 }
 
-export interface MessageBatch {
-  readonly type: string
-  readonly messages: MailboxRow[]
-}
-
-export interface SummaryResult {
+export type SummaryResult = {
   readonly summaryContent: string
   readonly batchedCount: number
   readonly preservedUrgent: MailboxRow[]
   readonly timestamp: number
 }
 
-export interface Interface {
+export type Interface = {
   readonly shouldSummarize: (input: {
     sessionID: SessionID
     config?: Partial<SummarizerConfig>
@@ -58,7 +53,7 @@ export interface Interface {
   readonly summarize: (input: {
     sessionID: SessionID
     config?: Partial<SummarizerConfig>
-    summarizeFn?: (batched: MessageBatch[]) => Effect.Effect<string, SummarizerError>
+    summarizeFn?: (batched: ReadonlyArray<MessageBatch>) => Effect.Effect<string, SummarizerError>
   }) => Effect.Effect<SummaryResult, SummarizerError, Mailbox.Service | Bus.Service>
   readonly replaceWithSummary: (input: {
     sessionID: SessionID
@@ -70,7 +65,7 @@ export class Service extends Context.Service<Service, Interface>()(
   "@opencode/MessageSummarizer",
 ) {}
 
-export const defaultSummarizeFn = (batched: MessageBatch[]): Effect.Effect<string, SummarizerError> =>
+export const defaultSummarizeFn = (batched: ReadonlyArray<MessageBatch>): Effect.Effect<string, SummarizerError> =>
   Effect.sync(() => {
     const parts = batched.map((batch) => {
       const msgs = batch.messages
@@ -93,7 +88,7 @@ export const layer = Layer.effect(
       }) {
         const threshold = input.config?.triggerThreshold ?? DEFAULT_CONFIG.triggerThreshold
         const mailbox = yield* Mailbox.Service
-        const messages = yield* mailbox.peek(input.sessionID)
+        const messages = yield* mailbox.peek(input.sessionID).pipe(Effect.orDie)
         return messages.length >= threshold
       },
     )
@@ -111,14 +106,14 @@ export const layer = Layer.effect(
       return [...groups.entries()].map(([type, messages]) => ({ type, messages }))
     }
 
-    const summarize = Effect.fn("MessageSummarizer.summarize")(
+    const summarize = Effect.fnUntraced(
       function* (input: {
         sessionID: SessionID
         config?: Partial<SummarizerConfig>
-        summarizeFn?: (batched: MessageBatch[]) => Effect.Effect<string, SummarizerError>
+        summarizeFn?: (batched: ReadonlyArray<MessageBatch>) => Effect.Effect<string, SummarizerError>
       }) {
         const mailbox = yield* Mailbox.Service
-        const messages = yield* mailbox.peek(input.sessionID)
+        const messages = yield* mailbox.peek(input.sessionID).pipe(Effect.orDie)
 
         const urgent = messages.filter((m) => m.priority === "urgent")
         const summarizable = messages.filter((m) => m.priority !== "urgent")
@@ -169,7 +164,7 @@ export const layer = Layer.effect(
         const mailbox = yield* Mailbox.Service
         const { sessionID, result } = input
 
-        yield* mailbox.purge(sessionID)
+        yield* mailbox.purge(sessionID).pipe(Effect.orDie)
 
         if (result.summaryContent) {
           yield* mailbox.send({
@@ -178,7 +173,7 @@ export const layer = Layer.effect(
             priority: "queue",
             type: "summary",
             content: result.summaryContent,
-          })
+          }).pipe(Effect.orDie)
         }
 
         for (const msg of result.preservedUrgent) {
@@ -188,7 +183,7 @@ export const layer = Layer.effect(
             priority: msg.priority,
             type: msg.type,
             content: msg.content,
-          })
+          }).pipe(Effect.orDie)
         }
       },
     )
@@ -203,5 +198,3 @@ export const layer = Layer.effect(
 )
 
 export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
-
-export * as MessageSummarizer from "./message-summarizer"

@@ -20,6 +20,11 @@ export interface MailboxRow {
   read_at: number | null
 }
 
+export type MessageBatch = {
+  readonly type: string
+  readonly messages: MailboxRow[]
+}
+
 // =============================================================================
 // Table
 // =============================================================================

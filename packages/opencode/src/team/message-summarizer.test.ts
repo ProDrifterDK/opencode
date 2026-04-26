@@ -1,8 +1,8 @@
 import { describe, test, expect, beforeEach } from "bun:test"
 import { Effect, Layer, Stream } from "effect"
-import { Service as MessageSummarizerService, defaultSummarizeFn, type MessageBatch } from "./message-summarizer"
+import { Service as MessageSummarizerService, defaultSummarizeFn } from "./message-summarizer"
 import { Service as MailboxService } from "./mailbox"
-import type { MailboxRow, MailboxID } from "./mailbox.sql"
+import type { MailboxRow, MailboxID, MessageBatch } from "./mailbox.sql"
 import type { SessionID } from "@/session/schema"
 import { Bus } from "@/bus"
 
@@ -74,6 +74,8 @@ const makeMailboxFromState = (state: MailboxState) => {
           (m) => m.recipient_session_id === input.recipientSessionID && m.read_at === null && (input.priority ? m.priority === input.priority : true),
         ),
       ),
+
+    purgeOlderThan: (_maxAgeMs: number) => Effect.succeed(0),
   })
 }
 
@@ -327,7 +329,7 @@ describe("MessageSummarizer", () => {
       await addMessage("inbox", "task-update", `Message ${i}`)
     }
 
-    const customFn = (batches: MessageBatch[]) =>
+    const customFn = (batches: ReadonlyArray<MessageBatch>) =>
       Effect.sync(() => `CUSTOM: ${batches.length} batches`)
 
     const svc = await runWith(Effect.gen(function* () {

@@ -1342,13 +1342,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       },
     )
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
+    const runLoop = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown | undefined
         let step = 0
         const session = yield* sessions.get(sessionID)
+        let lastUserOuter: MessageV2.User | undefined
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1371,6 +1372,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          lastUserOuter = lastUser
 
           // Auto-team detection: on first step of lead session, check if request is complex
           if (step === 0 && !session.parentID) {
@@ -1705,7 +1707,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 const waitForMessage = Effect.raceFirst(
                   Stream.runHead(eventStream).pipe(
                     Effect.map(() => "event" as const),
-                    Effect.catchAll(() => Effect.succeed("timeout" as const)),
+                    Effect.orElseSucceed(() => "timeout" as const),
                   ),
                   Effect.sleep(`${LEAD_DAEMON_POLL_INTERVAL} millis`).pipe(
                     Effect.map(() => "timeout" as const),
@@ -1732,10 +1734,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       sessionID,
                       time: { created: Date.now() },
                       role: "user",
-                      agent: lastUser.agent,
-                      model: lastUser.model,
-                      tools: lastUser.tools,
-                      format: lastUser.format,
+                      agent: lastUserOuter!.agent,
+                      model: lastUserOuter!.model,
+                      tools: lastUserOuter!.tools,
+                      format: lastUserOuter!.format,
                     }
                     yield* sessions.updateMessage(userMsg)
                     const userPart: MessageV2.Part = {
@@ -1768,7 +1770,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
       "SessionPrompt.loop",
     )(function* (input: z.infer<typeof LoopInput>) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID) as Effect.Effect<MessageV2.WithParts>,
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(

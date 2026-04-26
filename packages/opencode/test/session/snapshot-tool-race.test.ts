@@ -17,6 +17,11 @@ import { FetchHttpClient } from "effect/unstable/http"
 import fs from "fs/promises"
 import path from "path"
 import { Session } from "../../src/session"
+import { SessionCoordinator } from "../../src/team/session-coordinator"
+import { LeadCoordinator } from "../../src/team/lead-coordinator"
+import { TaskBoardRepo } from "../../src/team/task-board"
+import { Mailbox } from "../../src/team/mailbox"
+import { RateLimiter } from "../../src/team/rate-limiter"
 import { LLM } from "../../src/session/llm"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
@@ -130,6 +135,11 @@ function makeHttp() {
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Ripgrep.defaultLayer),
     Layer.provide(Format.defaultLayer),
+    Layer.provide(SessionCoordinator.defaultLayer),
+    Layer.provide(TaskBoardRepo.layer),
+    Layer.provide(Mailbox.defaultLayer),
+    Layer.provide(RateLimiter.layer),
+    Layer.provide(LeadCoordinator.layer.pipe(Layer.provide(TaskBoardRepo.layer), Layer.provide(RateLimiter.layer))),
     Layer.provideMerge(todo),
     Layer.provideMerge(question),
     Layer.provideMerge(deps),

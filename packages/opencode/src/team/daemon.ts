@@ -1,4 +1,5 @@
 import { Effect, Layer, Context, Cause } from "effect"
+import z from "zod"
 import { Bus } from "@/bus"
 import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
@@ -731,21 +732,10 @@ export const layer = Layer.effect(
     // Track last emitted tool per engineer to avoid duplicate progress updates
     const lastToolPerEngineer = new Map<string, string>()
 
-    const handlePartUpdated = (event: {
-      type: string
-      properties: {
-        sessionID: string
-        part: {
-          type: string
-          tool?: string
-          state?: { type: string }
-        }
-        time: number
-      }
-    }) => {
+    const handlePartUpdated = (event: { type: string; properties: z.infer<(typeof MessageEvent.PartUpdated)["properties"]> }) => {
       // Only process tool parts that are running
       if (event.properties.part.type !== "tool") return
-      if (event.properties.part.state?.type !== "running") return
+      if ((event.properties.part.state as { status?: string } | undefined)?.status !== "running") return
 
       const toolName = event.properties.part.tool
       if (!toolName) return

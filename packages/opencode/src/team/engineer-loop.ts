@@ -26,6 +26,7 @@ import { Event, publishTeamEvent } from "./events"
 import { RateLimiter } from "./rate-limiter"
 import type { EngineerID, TeamID } from "./types"
 import { deleteRunning } from "./daemon-running"
+import { ProviderID, ModelID } from "@/provider/schema"
 
 const log = Log.create({ service: "team.engineer-loop" })
 
@@ -87,7 +88,7 @@ export interface EngineerLoopInput {
  */
 const attemptTask = (
   input: EngineerLoopInput,
-  modelParam: { providerID: string; modelID: string } | undefined,
+  modelParam: { providerID: ProviderID; modelID: ModelID } | undefined,
   attemptLabel: "primary" | "fallback",
 ) =>
   Effect.gen(function* () {
@@ -253,10 +254,10 @@ export const runEngineerLoop = (input: EngineerLoopInput) =>
     })
 
     const primaryModel = input.providerID && input.modelID
-      ? { providerID: input.providerID, modelID: input.modelID }
+      ? { providerID: ProviderID.make(input.providerID), modelID: ModelID.make(input.modelID) }
       : undefined
     const fallbackModel = input.fallbackProviderID && input.fallbackModelID
-      ? { providerID: input.fallbackProviderID, modelID: input.fallbackModelID }
+      ? { providerID: ProviderID.make(input.fallbackProviderID), modelID: ModelID.make(input.fallbackModelID) }
       : undefined
 
     return yield* attemptTask(input, primaryModel, "primary").pipe(
