@@ -146,7 +146,9 @@ export const TeamEngineerRunCommand = cmd({
     })
 
     try {
+      log.info("entering bootstrap", { engineerID, worktreePath })
       await bootstrap(worktreePath, async () => {
+        log.info("bootstrap callback entered", { engineerID })
         const engineerLoopPromise = AppRuntime.runPromise(
           runEngineerLoop({
             teamID,
@@ -199,7 +201,9 @@ export const TeamEngineerRunCommand = cmd({
         } else {
           await engineerLoopPromise
         }
+        log.info("bootstrap callback returning normally", { engineerID })
       })
+      log.info("bootstrap exited normally", { engineerID })
 
       completedSuccessfully = true
       log.info("engineer subprocess completed", { engineerID, pid: process.pid })
