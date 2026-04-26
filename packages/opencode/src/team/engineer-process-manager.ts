@@ -166,8 +166,20 @@ export class Service extends Context.Service<Service, Interface>()(
 function resolveOpencodeCommand(): string[] {
   const bun = process.execPath || process.argv[0]
   const script = process.argv[1]
-  const isScript = typeof script === "string" && /\.(?:js|ts|mjs|tsx)$/.test(script)
-  if (isScript) return [bun, script]
+  // Three cases to distinguish:
+  //   1. Compiled binary, launched directly: argv0 = opencode binary,
+  //      argv1 = user's first positional or undefined → return [execPath]
+  //   2. Compiled binary, running as TUI worker subprocess: argv1 is
+  //      a `/$bunfs/...` virtual path inside Bun's sandbox; passing it
+  //      to a child process is meaningless and yargs in the child would
+  //      treat it as a positional → return [execPath]
+  //   3. Dev mode (`bun run src/index.ts`): argv0 = bun binary,
+  //      argv1 = real on-disk script path → return [bun, script]
+  const isRealScript =
+    typeof script === "string" &&
+    !script.startsWith("/$bunfs/") &&
+    /\.(?:js|ts|mjs|tsx)$/.test(script)
+  if (isRealScript) return [bun, script]
   return [bun]
 }
 
@@ -218,11 +230,7 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
             engineerID,
             sessionID,
             worktreePath,
-            cmd: cmd.join(" "),
-            firstArgs: args.slice(0, 5).join(" "),
-            execPath: process.execPath,
-            argv0: process.argv[0],
-            argv1: process.argv[1] ?? "<undef>",
+            cmd: cmd[0],
           })
 
           const subprocess = Bun.spawn(args, {
