@@ -147,17 +147,27 @@ export class Service extends Context.Service<Service, Interface>()(
 
 /**
  * Resolve the binary that the lead is currently running so we can spawn
- * the engineer using the same opencode build. We bias toward
- * `process.execPath` (the bun runtime that booted the lead) plus the
- * lead's main script, falling back to `process.argv[0]` for safety.
+ * the engineer using the same opencode build.
+ *
+ * Two cases:
+ *   1. Standalone Bun-compiled binary (production install). `execPath`
+ *      is the opencode binary itself, and `argv[1]` is the user's first
+ *      positional (e.g. project path) — NOT a script. Return [execPath]
+ *      only; appending argv[1] would inject the user's project path
+ *      into the engineer subprocess command line and yargs would treat
+ *      `team-engineer-run` as an unknown extra positional.
+ *   2. Dev mode (`bun run src/index.ts`). `execPath` is the bun
+ *      runtime, and `argv[1]` is the entry script. Return [bun, script]
+ *      so the subprocess invokes the same script under the same bun.
+ *
+ * We distinguish by checking whether `argv[1]` looks like a script path
+ * (ends with .js/.ts/.mjs/.tsx).
  */
 function resolveOpencodeCommand(): string[] {
-  // process.argv[0] is the bun binary; argv[1] is the script path
-  // (e.g. /path/to/dist/index.js). Spawning the same script under the
-  // same bun ensures we don't accidentally diverge versions in dev.
   const bun = process.execPath || process.argv[0]
   const script = process.argv[1]
-  if (script) return [bun, script]
+  const isScript = typeof script === "string" && /\.(?:js|ts|mjs|tsx)$/.test(script)
+  if (isScript) return [bun, script]
   return [bun]
 }
 
