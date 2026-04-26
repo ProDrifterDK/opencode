@@ -68,7 +68,10 @@ export interface Interface {
   readonly resumeTeam: (teamID: TeamID) => Effect.Effect<{ team: TeamRecord; engineers: EngineerSlot[] }, CoordinatorError>
   readonly getTeam: (teamID: TeamID) => Effect.Effect<TeamRecord | null, CoordinatorError>
   readonly getEngineer: (engineerID: EngineerID) => Effect.Effect<EngineerSlot | null, CoordinatorError>
-  readonly listTeamEngineers: (teamID: TeamID) => Effect.Effect<EngineerSlot[], CoordinatorError>
+  readonly listTeamEngineers: (
+    teamID: TeamID,
+    options?: { liveOnly?: boolean },
+  ) => Effect.Effect<EngineerSlot[], CoordinatorError>
   readonly listAllEngineers: () => Effect.Effect<EngineerSlot[], CoordinatorError>
   readonly listTeams: () => Effect.Effect<TeamRecord[], CoordinatorError>
   readonly isLead: (sessionID: SessionID) => Effect.Effect<boolean, CoordinatorError>
@@ -466,10 +469,24 @@ export const layer = Layer.effect(
       fetchEngineer(engineerID),
     )
 
-    const listTeamEngineers = Effect.fn("SessionCoordinator.listTeamEngineers")((teamID: TeamID) =>
-      dbQuery((db) =>
-        db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.team_id, teamID)).all(),
-      ).pipe(Effect.map((rows) => rows.map(rowToSlot))),
+    const listTeamEngineers = Effect.fn("SessionCoordinator.listTeamEngineers")(
+      (teamID: TeamID, options?: { liveOnly?: boolean }) =>
+        dbQuery((db) =>
+          db.select().from(EngineerSlotTable).where(eq(EngineerSlotTable.team_id, teamID)).all(),
+        ).pipe(
+          Effect.map((rows) => {
+            const slots = rows.map(rowToSlot)
+            if (options?.liveOnly) {
+              // Live engineers are those still doing or about to do work.
+              // Idle engineers may have just finished their task via
+              // team_report; failed/terminated engineers are gone. Both
+              // are excluded so heartbeat-driven "all engineers failed"
+              // checks don't fire transiently during dissolve.
+              return slots.filter((s) => s.state === "working" || s.state === "blocked")
+            }
+            return slots
+          }),
+        ),
     )
 
     const listAllEngineers = Effect.fn("SessionCoordinator.listAllEngineers")(() =>

@@ -154,8 +154,14 @@ const memCoordinator = SessionCoordinatorService.of({
     }),
   getTeam: (teamID) => Effect.sync(() => teams.get(teamID) ?? null),
   getEngineer: (engineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
-  listTeamEngineers: (teamID) =>
-    Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listTeamEngineers: (teamID, options) =>
+    Effect.sync(() => {
+      const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
+      if (options?.liveOnly) {
+        return slots.filter((s) => s.state === "working" || s.state === "blocked")
+      }
+      return slots
+    }),
   listAllEngineers: () =>
     Effect.sync(() => [...engineers.values()]),
   listTeams: () =>

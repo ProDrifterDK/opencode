@@ -180,12 +180,35 @@ export const TeamEngineerRunCommand = cmd({
       log.info("engineer subprocess completed", { engineerID, pid: process.pid })
       process.exitCode = 0
     } catch (err) {
-      log.error("engineer subprocess failed", {
-        engineerID,
-        error: String(err),
-      })
-      process.stderr.write(`engineer subprocess failed: ${String(err)}\n`)
-      process.exitCode = 1
+      // Tolerate post-completion teardown noise: the lead's
+      // `team_dissolve` deletes the engineer's session row mid-flight,
+      // and any subscription / read that races the delete throws a
+      // NotFoundError ("Session not found"). The engineer has already
+      // completed via `team_report` at that point, so surfacing exit
+      // code 1 here would make the lead's heartbeat treat the
+      // subprocess as a genuine failure (and emit a spurious
+      // `EngineerFailed` event with `error: "killed by coordinator"`).
+      // Detect the post-dissolve case by string-match — the actual
+      // NotFoundError class lives in `@/storage` and arrives wrapped
+      // in Effect causes, so isInstance matching is unreliable.
+      const errStr = String(err)
+      const isPostDissolveTeardown =
+        errStr.includes("Session not found") || errStr.includes("NotFoundError")
+      if (isPostDissolveTeardown) {
+        log.info("engineer subprocess completed (session removed by lead during dissolve)", {
+          engineerID,
+          pid: process.pid,
+          error: errStr,
+        })
+        process.exitCode = 0
+      } else {
+        log.error("engineer subprocess failed", {
+          engineerID,
+          error: errStr,
+        })
+        process.stderr.write(`engineer subprocess failed: ${errStr}\n`)
+        process.exitCode = 1
+      }
     }
   },
 })

@@ -174,8 +174,14 @@ const memCoordinator = SessionCoordinatorService.of({
     }),
   getTeam: (teamID) => Effect.sync(() => teams.get(teamID) ?? null),
   getEngineer: (engineerID) => Effect.sync(() => engineers.get(engineerID) ?? null),
-  listTeamEngineers: (teamID) =>
-    Effect.sync(() => [...engineers.values()].filter((e) => e.teamID === teamID)),
+  listTeamEngineers: (teamID, options) =>
+    Effect.sync(() => {
+      const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
+      if (options?.liveOnly) {
+        return slots.filter((s) => s.state === "working" || s.state === "blocked")
+      }
+      return slots
+    }),
   listAllEngineers: () => Effect.sync(() => [...engineers.values()]),
   listTeams: () => Effect.sync(() => [...teams.values()]),
   isLead: (sessionID) =>
@@ -1398,6 +1404,176 @@ describe("Team Lifecycle Integration", () => {
       ).resolves.toBeUndefined()
 
       expect(teams.has(TEAM_ID)).toBe(false)
+    })
+  })
+
+  // ── Bug 3 regression: dissolve mid-flight does not fire false alarms ──
+  describe("dissolve-time false-positive suppression", () => {
+    test("runDiagnostic during dissolving team skips killEngineer and all-failed mailbox", async () => {
+      // Three engineers in the team. ENG_A's session crashed (subprocess
+      // exited 1 after team_dissolve deleted its session row). The team
+      // is mid-dissolve. ENG_B and ENG_C are still working.
+      teams.set(TEAM_ID, makeTeam({ state: "dissolving", engineerCount: 3 }))
+      engineers.set(ENG_A, makeSlot({
+        engineerID: ENG_A,
+        sessionID: "sess_eng_a" as SessionID,
+        state: "idle",
+        currentTask: null,
+      }))
+      engineers.set(ENG_B, makeSlot({
+        engineerID: ENG_B,
+        sessionID: "sess_eng_b" as SessionID,
+        name: "engineer-b",
+        state: "working",
+        currentTask: "task_b" as TaskBoardID,
+      }))
+      engineers.set(ENG_C, makeSlot({
+        engineerID: ENG_C,
+        sessionID: "sess_eng_c" as SessionID,
+        name: "engineer-c",
+        state: "working",
+        currentTask: "task_c" as TaskBoardID,
+      }))
+      const initialMsgCount = mailboxStore.size
+      const initialEngCount = engineers.size
+
+      const service = await runHeartbeat(Effect.gen(function* () {
+        return yield* HeartbeatService
+      }))
+
+      await runHeartbeat(service.recordHeartbeat(ENG_A))
+
+      const health = service.getHealth(ENG_A)!
+      health.isDead = true
+      health.isStuck = true
+      health.stuckCount = 3
+
+      const result = await runHeartbeat(service.runDiagnostic(ENG_A, TEAM_ID))
+
+      // The diagnostic should bail early — no killEngineer call (so the
+      // engineer slot is left for dissolveTeam to clean up) and no
+      // urgent mailbox.
+      expect(result.action).toBe("killed")
+      expect(engineers.size).toBe(initialEngCount)
+      const allFailedMsgs = [...mailboxStore.values()].filter(
+        (m) => m.type === "all-engineers-failed",
+      )
+      expect(allFailedMsgs).toHaveLength(0)
+      expect(mailboxStore.size).toBe(initialMsgCount)
+    })
+
+    test("runDiagnostic with terminated team also skips both kill and mailbox", async () => {
+      teams.set(TEAM_ID, makeTeam({
+        state: "terminated" as TeamRecord["state"],
+        engineerCount: 1,
+      }))
+      engineers.set(ENG_A, makeSlot({ engineerID: ENG_A }))
+
+      const service = await runHeartbeat(Effect.gen(function* () {
+        return yield* HeartbeatService
+      }))
+
+      await runHeartbeat(service.recordHeartbeat(ENG_A))
+      const health = service.getHealth(ENG_A)!
+      health.isDead = true
+      health.isStuck = true
+      health.stuckCount = 3
+
+      const result = await runHeartbeat(service.runDiagnostic(ENG_A, TEAM_ID))
+      expect(result.action).toBe("killed")
+      // Engineer not removed (the dissolve path owns cleanup)
+      expect(engineers.has(ENG_A)).toBe(true)
+      const allFailedMsgs = [...mailboxStore.values()].filter(
+        (m) => m.type === "all-engineers-failed",
+      )
+      expect(allFailedMsgs).toHaveLength(0)
+    })
+
+    test("runDiagnostic on active team with one dead + idle peer does NOT trigger all-failed", async () => {
+      // ENG_A crashed; ENG_B is idle (just completed via team_report).
+      // Pre-fix: liveOnly was missing, the remaining count was 1
+      // (ENG_B), so the check returned 1 — but if ENG_B were missing
+      // (count 0) the lead would get a false all-failed. The new
+      // liveOnly filter excludes idle engineers from the live roster
+      // so the remaining count drops to 0, but the team is active and
+      // we DO want the urgent in this case (genuine all-failed when no
+      // engineer is alive). Verify the kill happens and mailbox fires.
+      engineers.set(ENG_A, makeSlot({
+        engineerID: ENG_A,
+        currentTask: "task_1" as TaskBoardID,
+        state: "working",
+      }))
+      engineers.set(ENG_B, makeSlot({
+        engineerID: ENG_B,
+        sessionID: "sess_eng_b" as SessionID,
+        name: "engineer-b",
+        state: "idle",
+      }))
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 2 }))
+
+      const service = await runHeartbeat(Effect.gen(function* () {
+        return yield* HeartbeatService
+      }))
+
+      await runHeartbeat(service.recordHeartbeat(ENG_A))
+      const health = service.getHealth(ENG_A)!
+      health.isDead = true
+      health.isStuck = true
+      health.stuckCount = 3
+
+      const result = await runHeartbeat(service.runDiagnostic(ENG_A, TEAM_ID))
+
+      // ENG_A is dead with task_1; ENG_B is idle (free) → reassignable.
+      expect(result.action).toBe("reassigned")
+      expect(result.taskReassignedTo).toBe(ENG_B)
+    })
+  })
+
+  // ── Bug 3 regression: listTeamEngineers liveOnly filter ──────────────
+  describe("listTeamEngineers liveOnly", () => {
+    test("liveOnly excludes idle, failed engineers", async () => {
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 4 }))
+      engineers.set(ENG_A, makeSlot({ engineerID: ENG_A, state: "working" }))
+      engineers.set(ENG_B, makeSlot({
+        engineerID: ENG_B,
+        sessionID: "sess_b" as SessionID,
+        state: "idle",
+      }))
+      engineers.set(ENG_C, makeSlot({
+        engineerID: ENG_C,
+        sessionID: "sess_c" as SessionID,
+        state: "blocked",
+      }))
+      engineers.set(ENG_D, makeSlot({
+        engineerID: ENG_D,
+        sessionID: "sess_d" as SessionID,
+        state: "failed",
+      }))
+
+      const all = await Effect.runPromise(memCoordinator.listTeamEngineers(TEAM_ID))
+      expect(all).toHaveLength(4)
+
+      const live = await Effect.runPromise(
+        memCoordinator.listTeamEngineers(TEAM_ID, { liveOnly: true }),
+      )
+      expect(live).toHaveLength(2)
+      const liveIds = live.map((s) => s.engineerID).sort()
+      expect(liveIds).toEqual([ENG_A, ENG_C].sort())
+    })
+
+    test("liveOnly: false (default) returns all engineers", async () => {
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 2 }))
+      engineers.set(ENG_A, makeSlot({ engineerID: ENG_A, state: "idle" }))
+      engineers.set(ENG_B, makeSlot({
+        engineerID: ENG_B,
+        sessionID: "sess_b" as SessionID,
+        state: "failed",
+      }))
+
+      const all = await Effect.runPromise(
+        memCoordinator.listTeamEngineers(TEAM_ID, { liveOnly: false }),
+      )
+      expect(all).toHaveLength(2)
     })
   })
 })

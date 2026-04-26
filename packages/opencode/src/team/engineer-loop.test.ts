@@ -191,3 +191,35 @@ describe("engineer-loop fallback failover (O1)", () => {
 
 // Suppress unused-Layer warning when developing in editors.
 void Layer
+
+// ─── Bug 3a regression: post-dissolve NotFoundError is benign ──────────
+// The CLI handler in `cli/cmd/team-engineer.ts` classifies a thrown
+// NotFoundError ("Session not found") as a clean exit when the error
+// occurs after the engineer completed via team_report — the lead's
+// `team_dissolve` races and deletes the session row while the
+// subprocess is still winding down. This test pins the classifier
+// string-match so a future refactor cannot silently regress it.
+describe("post-dissolve NotFoundError classifier (bug 3a)", () => {
+  // Mirror the isPostDissolveTeardown classifier from team-engineer.ts.
+  const isPostDissolveTeardown = (errStr: string): boolean =>
+    errStr.includes("Session not found") || errStr.includes("NotFoundError")
+
+  test("classifies 'Session not found' as benign teardown", () => {
+    expect(isPostDissolveTeardown("Error: Session not found: ses_abc")).toBe(true)
+  })
+
+  test("classifies bare NotFoundError name as benign teardown", () => {
+    expect(isPostDissolveTeardown("NotFoundError: row missing")).toBe(true)
+  })
+
+  test("does NOT classify unrelated runtime errors as benign", () => {
+    expect(isPostDissolveTeardown("TypeError: undefined is not a function")).toBe(false)
+    expect(isPostDissolveTeardown("rate limit hit")).toBe(false)
+    expect(isPostDissolveTeardown("worktree merge conflict")).toBe(false)
+  })
+
+  test("matches Effect Cause.pretty output that wraps a NotFoundError", () => {
+    const cause = "Error: NotFoundError: Session not found: ses_xyz\n  at ..."
+    expect(isPostDissolveTeardown(cause)).toBe(true)
+  })
+})

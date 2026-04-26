@@ -149,6 +149,29 @@ export const layer = Layer.effect(
         const now = Date.now()
 
         if (health.isDead) {
+          // If the team is in a teardown state, the lead is already
+          // taking the engineers down. Calling killEngineer here would
+          // emit a spurious `EngineerFailed` with `error: "killed by
+          // coordinator"` for engineers that may have completed cleanly
+          // via team_report — and the subsequent listTeamEngineers
+          // could see an empty roster mid-transaction and fire a false
+          // "all-engineers-failed" mailbox urgent. Skip both during
+          // dissolve/terminated.
+          const teamForGate = yield* coordinator.getTeam(teamID).pipe(
+            Effect.orElseSucceed(() => null),
+          )
+          if (teamForGate && teamForGate.state !== "active") {
+            healthMap.delete(engineerID)
+            const result: DiagnosticResult = {
+              engineerID,
+              pingSucceeded: false,
+              action: "killed",
+              taskReassignedTo: null,
+              timestamp: now,
+            }
+            return result
+          }
+
           const slot = yield* coordinator.getEngineer(engineerID).pipe(
             Effect.orElseSucceed(() => null),
           )
@@ -187,14 +210,27 @@ export const layer = Layer.effect(
             }
           }
 
-          const remaining = yield* coordinator.listTeamEngineers(teamID).pipe(
+          // Only count engineers that are still alive and could pick up
+          // work — exclude `idle` (may have just completed via
+          // team_report) and `failed`/`terminated`. Without this filter
+          // a single crashed engineer racing a clean dissolve would
+          // make the team look empty, triggering a bogus urgent
+          // "all-engineers-failed" notification to the lead.
+          const remaining = yield* coordinator.listTeamEngineers(teamID, { liveOnly: true }).pipe(
             Effect.orElseSucceed(() => [] as EngineerSlot[]),
           )
           if (remaining.length === 0) {
-        const team = yield* coordinator.getTeam(teamID).pipe(
-          Effect.orElseSucceed(() => null),
-        )
-            if (team) {
+            const team = yield* coordinator.getTeam(teamID).pipe(
+              Effect.orElseSucceed(() => null),
+            )
+            // Only fire the urgent mailbox when the team is NOT in a
+            // teardown state. During dissolve/terminated the lead is
+            // already tearing things down; the urgent message would be
+            // spurious. Note: killEngineer transitions the team to
+            // "idle" when the last engineer slot is removed, so we
+            // cannot check for "active" here — we check for the
+            // absence of the two teardown states instead.
+            if (team && team.state !== "dissolving" && team.state !== "terminated") {
               yield* mailbox.send({
                 recipientSessionID: team.leadSessionID,
                 senderSessionID: "system" as SessionID,
