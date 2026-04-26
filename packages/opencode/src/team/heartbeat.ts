@@ -4,8 +4,11 @@ import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as MailboxService } from "./mailbox"
 import { HEARTBEAT_INTERVAL, ENGINEER_MAX_IDLE, HEARTBEAT_UPDATE_INTERVAL, HEARTBEAT_CHECK_INTERVAL, HEARTBEAT_TIMEOUT } from "./constants"
 import { iterAllRunning } from "./daemon-running"
+import { Log } from "@/util"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
+
+const log = Log.create({ service: "team.heartbeat" })
 
 export class HeartbeatError extends Schema.TaggedErrorClass<HeartbeatError>()("HeartbeatError", {
   message: Schema.String,
@@ -177,6 +180,11 @@ export const layer = Layer.effect(
           )
           const currentTask = slot?.currentTask
 
+          log.warn("heartbeat runDiagnostic killing engineer (isDead)", {
+            engineerID,
+            teamID,
+            stuckCount: health.stuckCount,
+          })
           yield* coordinator.killEngineer({ engineerID, teamID }).pipe(
             Effect.catchCause(() => Effect.void),
           )
@@ -367,7 +375,12 @@ export const layer = Layer.effect(
         )
         const terminated: EngineerID[] = []
 
+        log.warn("detectOrphans killing all engineers (lead dead)", {
+          teamID,
+          engineerCount: engineers.length,
+        })
         for (const eng of engineers) {
+          log.warn("detectOrphans killing engineer", { engineerID: eng.engineerID, teamID })
           yield* coordinator.killEngineer({ engineerID: eng.engineerID, teamID }).pipe(
             Effect.catchCause(() => Effect.void),
           )

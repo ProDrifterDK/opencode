@@ -1,6 +1,9 @@
 import { eq } from "drizzle-orm"
 import { Effect, Layer, Context, Schema, Cause } from "effect"
 import { Database } from "@/storage"
+import { Log } from "@/util"
+
+const log = Log.create({ service: "team.session-coordinator" })
 import { Service as SessionService, defaultLayer as sessionDefaultLayer } from "@/session/session"
 import { Service as MailboxService, defaultLayer as mailboxDefaultLayer } from "./mailbox"
 import { Service as TaskBoardService, layer as taskBoardLayer } from "./task-board"
@@ -315,6 +318,13 @@ export const layer = Layer.effect(
         return yield* Effect.fail(new CoordinatorError({ message: `Engineer not found: ${input.engineerID}` }))
       }
 
+      log.warn("killEngineer invoked — removing engineer session", {
+        engineerID: input.engineerID,
+        teamID: input.teamID,
+        sessionID: slot.sessionID,
+        stack: new Error().stack?.split("\n").slice(1, 6).join(" | "),
+      })
+
       yield* session.remove(slot.sessionID).pipe(
         Effect.catchCause((cause) => {
           console.error("[Coordinator] Failed to remove session:", Cause.pretty(cause))
@@ -368,6 +378,11 @@ export const layer = Layer.effect(
       if (!team) {
         return yield* Effect.fail(new CoordinatorError({ message: `Team not found: ${input.teamID}` }))
       }
+
+      log.warn("dissolveTeam invoked — removing all engineer sessions", {
+        teamID: input.teamID,
+        stack: new Error().stack?.split("\n").slice(1, 6).join(" | "),
+      })
 
       yield* dbTx((db) => {
         db.update(TeamStateTable)
