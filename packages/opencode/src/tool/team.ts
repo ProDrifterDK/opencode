@@ -50,7 +50,7 @@ const toolErrorBoundary = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   )
 
 // Role guards — previously copy-pasted 13 times.
-const requireLead = (ctx: Tool.Context, coordinator: any, action = "use this tool") =>
+const requireLead = (ctx: Tool.Context, coordinator: SessionCoordinator.Interface, action = "use this tool") =>
   Effect.gen(function* () {
     const isLead = yield* coordinator.isLead(ctx.sessionID)
     if (!isLead) {
@@ -58,7 +58,7 @@ const requireLead = (ctx: Tool.Context, coordinator: any, action = "use this too
     }
   })
 
-const requireEngineer = (ctx: Tool.Context, coordinator: any, action = "use this tool") =>
+const requireEngineer = (ctx: Tool.Context, coordinator: SessionCoordinator.Interface, action = "use this tool") =>
   Effect.gen(function* () {
     const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
     if (!isEngineer) {
@@ -111,6 +111,7 @@ export const TeamCreateTool = Tool.define(
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
     const daemon = yield* TeamDaemon.Service
+    const heartbeatMonitor = yield* HeartbeatMonitor.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_create,
@@ -134,9 +135,8 @@ export const TeamCreateTool = Tool.define(
             goal: params.goal,
           })
 
-          const heartbeatMonitor = yield* HeartbeatMonitor.Service
           yield* heartbeatMonitor.startTeamMonitoring(record.teamID, record.leadSessionID).pipe(
-            Effect.catchAll((err) =>
+            Effect.catch((err) =>
               Effect.sync(() =>
                 log.warn("failed to start heartbeat monitoring", {
                   teamID: record.teamID,
@@ -163,7 +163,7 @@ export const TeamCreateTool = Tool.define(
               state: record.state,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -213,7 +213,7 @@ export const TeamMonitorTool = Tool.define(
               rateLimits: report.rateLimits ?? null,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -377,7 +377,7 @@ export const TeamSpawnTool = Tool.define(
               taskID: task.id,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -440,7 +440,7 @@ export const TeamAssignTool = Tool.define(
               })),
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -510,7 +510,7 @@ export const TeamDecomposeTool = Tool.define(
               tasks: tasks.map((t) => ({ taskID: t.id, title: t.title })),
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -562,7 +562,7 @@ export const TeamReassignTool = Tool.define(
               toEngineerID: params.toEngineerID,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -610,7 +610,7 @@ export const TeamRetaskTool = Tool.define(
               status: task.status,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -670,7 +670,7 @@ export const TeamKillTool = Tool.define(
               tasksReassigned: inProgressTasks.length,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -723,7 +723,7 @@ export const TeamMessageTool = Tool.define(
             return {
               title: `Message to ${params.recipientID}`,
               output: `Rate limit exceeded: 10 messages/min per sender. Retry in ~${Math.ceil(rateCheck.retryAfterMs! / 1000)}s.`,
-              metadata: { rateLimited: true },
+              metadata: { rateLimited: true, messageID: "", recipientID: params.recipientID, priority: params.priority },
             }
           }
 
@@ -747,12 +747,13 @@ export const TeamMessageTool = Tool.define(
             title: `Message to ${params.recipientID}`,
             output,
             metadata: {
+              rateLimited: false,
               messageID: message.id,
               recipientID: params.recipientID,
               priority: params.priority,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -842,7 +843,7 @@ export const TeamStatusTool = Tool.define(
               currentTask: engineer.currentTask ?? null,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -859,6 +860,7 @@ export const TeamDissolveTool = Tool.define(
     const lead = yield* LeadCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
     const gitManager = yield* GitManager.Service
+    const hbMonitor = yield* HeartbeatMonitor.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_dissolve,
@@ -904,7 +906,6 @@ export const TeamDissolveTool = Tool.define(
 
           yield* coordinator.dissolveTeam({ teamID })
 
-          const hbMonitor = yield* HeartbeatMonitor.Service
           yield* hbMonitor.stopTeamMonitoring(teamID).pipe(Effect.ignore)
 
           // Delete any team/<teamID>/* git branches that were created for
@@ -981,7 +982,7 @@ const branchCleanup = yield* gitManager
               summaryPath: summaryWrite.ok ? summaryRelPath : null,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1034,7 +1035,7 @@ export const TeamResumeTool = Tool.define(
               engineerCount: resumed.engineers.length,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1156,7 +1157,7 @@ export const TeamCommitTool = Tool.define(
               skipped: skipped.map((s) => s.engineerID),
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1192,7 +1193,7 @@ export const TeamReportTool = Tool.define(
             return yield* Effect.fail(new Error("No task assigned to this engineer"))
           }
 
-          const taskID = engineer.currentTask
+          const taskID = engineer.currentTask as import("../team/task-board.sql").TaskBoardID
           const task = yield* taskBoard.get(taskID)
           const taskTitle = task?.title ?? taskID
 
@@ -1267,7 +1268,7 @@ export const TeamReportTool = Tool.define(
               engineerID: engineer.engineerID,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1296,7 +1297,7 @@ export const TeamInboxTool = Tool.define(
             return {
               title: "Check inbox",
               output: "📭 No new messages.",
-              metadata: { messageCount: 0 },
+              metadata: { messageCount: 0, messages: [] as { id: string; priority: string; from: string }[] },
             }
           }
 
@@ -1318,7 +1319,7 @@ export const TeamInboxTool = Tool.define(
               })),
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1347,7 +1348,6 @@ export const TeamRosterTool = Tool.define(
 
           const lines: string[] = [
             `Team: ${teamID}`,
-            `Goal: ${team?.goal ?? "N/A"}`,
             ``,
             `Teammates:`,
           ]
@@ -1379,7 +1379,7 @@ export const TeamRosterTool = Tool.define(
               })),
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1470,7 +1470,7 @@ export const TeamTasksTool = Tool.define(
               })),
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1594,7 +1594,7 @@ export const TeamClaimTool = Tool.define(
               engineerID: engineer.engineerID,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1651,7 +1651,7 @@ export const TeamAgentsTool = Tool.define(
                 "",
                 "Or use includeNative: true to see built-in agents.",
               ].join("\n"),
-              metadata: { agentCount: 0, defaultAgent },
+              metadata: { agentCount: 0, defaultAgent, agents: [] as string[] },
             }
           }
 
@@ -1681,7 +1681,7 @@ export const TeamAgentsTool = Tool.define(
             output: lines.join("\n"),
             metadata: { agentCount: agents.length, defaultAgent, agents: agents.map((a) => a.name) },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1744,7 +1744,7 @@ export const TeamShareTool = Tool.define(
               engineers: engineerShares,
             },
           }
-        }).pipe(toolErrorBoundary),
+        }).pipe(toolErrorBoundary, Effect.orDie),
     }
   }),
 )
@@ -1752,7 +1752,7 @@ export const TeamShareTool = Tool.define(
 // ─── Export all tools ───────────────────────────────────────────────────────
 
 export const TeamTools = Effect.gen(function* () {
-  const infos = yield* Effect.all([
+  const infos = (yield* Effect.all([
     TeamCreateTool,
     TeamSpawnTool,
     TeamDecomposeTool,
@@ -1773,6 +1773,6 @@ export const TeamTools = Effect.gen(function* () {
     TeamClaimTool,
     TeamAgentsTool,
     TeamShareTool,
-  ])
+  ])) as Tool.Info[]
   return yield* Effect.all(infos.map(Tool.init))
 })

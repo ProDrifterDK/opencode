@@ -47,7 +47,7 @@ export const PlanExitTool = Tool.define(
             tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
           })
 
-          if (answers[0]?.[0] === "No") yield* new Question.RejectedError()
+          if (answers[0]?.[0] === "No") return yield* new Question.RejectedError()
 
           const model = getLastModel(ctx.sessionID) ?? (yield* provider.defaultModel())
 

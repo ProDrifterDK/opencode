@@ -182,7 +182,7 @@ export const layer: Layer.Layer<
         }
 
         const teamTools = Flag.OPENCODE_TEAM_ENABLED
-          ? yield* TeamTools.pipe(Effect.catch(() => Effect.succeed([])))
+          ? yield* (TeamTools.pipe(Effect.catch(() => Effect.succeed([]))) as Effect.Effect<Tool.Def[], never, never>)
           : []
 
         yield* config.get()
