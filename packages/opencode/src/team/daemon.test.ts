@@ -171,6 +171,7 @@ describe("Phase 1 of A3: EngineerProcessManager spawn path", () => {
         return Effect.succeed({
           pid: 4242,
           subprocess: { pid: 4242, kill: () => {} } as any,
+          eventReaderDone: Promise.resolve(),
         })
       },
     })

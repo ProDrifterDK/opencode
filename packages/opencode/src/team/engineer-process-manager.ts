@@ -135,6 +135,14 @@ export interface SpawnedEngineer {
    * attaches a handler via `attachExitHandler` in daemon.ts after spawn returns.
    */
   subprocess: import("bun").Subprocess
+  /**
+   * Promise that resolves when the stdout JSONL reader has finished
+   * draining. The exit handler awaits this BEFORE reconciling DB state
+   * to close a race: a clean-exit engineer publishes `EngineerCompleted`
+   * to stdout right before exit, and the line can still be buffered
+   * when `.exited` resolves. See daemon-running.ts for details.
+   */
+  eventReaderDone: Promise<void>
 }
 
 export interface Interface {
@@ -270,9 +278,13 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
           // throwing — keeping spawn itself defensive.
           const stdout = subprocess.stdout as ReadableStream<Uint8Array> | null | undefined
           const stderr = subprocess.stderr as ReadableStream<Uint8Array> | null | undefined
-          if (stdout && typeof stdout.getReader === "function") {
-            void readEngineerEvents(stdout)
-          }
+          // Capture the stdout-reader promise so the exit handler can
+          // await it before reconciling DB state. If stdout is missing
+          // (test fakes) we resolve immediately so the await is a no-op.
+          const eventReaderDone =
+            stdout && typeof stdout.getReader === "function"
+              ? readEngineerEvents(stdout)
+              : Promise.resolve()
           if (stderr && typeof stderr.getReader === "function") {
             // Route engineer stderr through the lead's structured Log so
             // crash messages land in the main log file (under
@@ -285,7 +297,7 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
             pid: subprocess.pid,
           })
 
-          return { pid: subprocess.pid, subprocess }
+          return { pid: subprocess.pid, subprocess, eventReaderDone }
         },
         catch: (err) =>
           new SpawnError({

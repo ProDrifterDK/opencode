@@ -238,6 +238,7 @@ const startEngineerInBackground = (
       branch,
       pid: spawned.pid,
       subprocess: spawned.subprocess,
+      eventReaderDone: spawned.eventReaderDone,
     })
 
     // Phase 3 of A3: wire the centralized exit handler. This is the
@@ -315,8 +316,23 @@ export const layer = Layer.effect(
       subprocess: import("bun").Subprocess
     }) => {
       void params.subprocess.exited
-        .then((code) => {
+        .then(async (code) => {
           const slot = getRunningEngineer(params.teamID, params.engineerID)
+
+          // Wait for the engineer's stdout JSONL reader to drain before
+          // reconciling DB state. A clean-exit engineer publishes
+          // `EngineerCompleted` to stdout right before terminating; the
+          // line is still buffered when `.exited` resolves. Without this
+          // await, `reconcileExitedEngineer` reads state="working", marks
+          // the engineer failed, and the heartbeat sweep fires a spurious
+          // `all-engineers-failed` urgent. A 5s timeout guards against a
+          // wedged reader so we never hang the cleanup path forever.
+          if (slot?.eventReaderDone) {
+            await Promise.race([
+              slot.eventReaderDone,
+              new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+            ]).catch(() => {})
+          }
 
           AppRuntime.runFork(
             Effect.gen(function* () {
