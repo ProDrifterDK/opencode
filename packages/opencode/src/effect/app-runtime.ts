@@ -54,11 +54,72 @@ import { TeamDaemon } from "@/team/daemon"
 import { GitManager } from "@/team/git-manager"
 import { RateLimiter } from "@/team/rate-limiter"
 import { HeartbeatMonitor } from "@/team/heartbeat"
-import { layer as engineerProcessManagerLayer } from "@/team/engineer-process-manager"
+import { layer as engineerProcessManagerLayer, Service as EngineerProcessManagerService } from "@/team/engineer-process-manager"
 import { Npm } from "@/npm"
 import { memoMap } from "./memo-map"
 
-export const AppLayer = Layer.mergeAll(
+// Explicit service union for the application's root layer. Annotating
+// AppLayer breaks the implicit-any cycle between AppLayer, the
+// ManagedRuntime, and AppRuntime (TS7022/TS2456/TS2502).
+type AppServices =
+  | Npm.Service
+  | AppFileSystem.Service
+  | Bus.Service
+  | Auth.Service
+  | Account.Service
+  | Config.Service
+  | Git.Service
+  | Ripgrep.Service
+  | File.Service
+  | FileWatcher.Service
+  | Storage.Service
+  | Snapshot.Service
+  | Plugin.Service
+  | Provider.Service
+  | ProviderAuth.Service
+  | Agent.Service
+  | Skill.Service
+  | Discovery.Service
+  | Question.Service
+  | Permission.Service
+  | Todo.Service
+  | Session.Service
+  | SessionStatus.Service
+  | SessionRunState.Service
+  | SessionProcessor.Service
+  | SessionCompaction.Service
+  | SessionRevert.Service
+  | SessionSummary.Service
+  | SessionPrompt.Service
+  | Instruction.Service
+  | LLM.Service
+  | LSP.Service
+  | MCP.Service
+  | McpAuth.Service
+  | Command.Service
+  | Truncate.Service
+  | ToolRegistry.Service
+  | Format.Service
+  | Project.Service
+  | Vcs.Service
+  | Worktree.Service
+  | Pty.Service
+  | Installation.Service
+  | ShareNext.Service
+  | SessionShare.Service
+  | TaskBoardRepo.Service
+  | Mailbox.Service
+  | LeadCoordinator.Service
+  | SessionCoordinator.Service
+  | GitManager.Service
+  | RateLimiter.Service
+  | EngineerProcessManagerService
+  | HeartbeatMonitor.Service
+  | TeamDaemon.Service
+
+// Layers whose dependencies are entirely satisfied by other members of
+// AppLayer. Composed in parallel via Layer.mergeAll.
+const baseLayer = Layer.mergeAll(
   Npm.defaultLayer,
   AppFileSystem.defaultLayer,
   Bus.defaultLayer,
@@ -87,7 +148,6 @@ export const AppLayer = Layer.mergeAll(
   SessionCompaction.defaultLayer,
   SessionRevert.defaultLayer,
   SessionSummary.defaultLayer,
-  SessionPrompt.defaultLayer,
   Instruction.defaultLayer,
   LLM.defaultLayer,
   LSP.defaultLayer,
@@ -95,7 +155,6 @@ export const AppLayer = Layer.mergeAll(
   McpAuth.defaultLayer,
   Command.defaultLayer,
   Truncate.defaultLayer,
-  ToolRegistry.defaultLayer,
   Format.defaultLayer,
   Project.defaultLayer,
   Vcs.defaultLayer,
@@ -104,44 +163,43 @@ export const AppLayer = Layer.mergeAll(
   Installation.defaultLayer,
   ShareNext.defaultLayer,
   SessionShare.defaultLayer,
-  TaskBoardRepo.layer,
-  Mailbox.defaultLayer,
-  LeadCoordinator.layer.pipe(
-    Layer.provide(TaskBoardRepo.layer),
-    Layer.provide(RateLimiter.layer),
-  ),
-  SessionCoordinator.defaultLayer,
   GitManager.layer,
   RateLimiter.layer,
   engineerProcessManagerLayer,
-  // HeartbeatMonitor exposes richer per-team monitoring (orphan
-  // detection, per-engineer rate-limit backoff, diagnostic pings) that
-  // the daemon's simpler setInterval sweep doesn't cover. It is wired
-  // into AppLayer so consumers can resolve the service, but nothing
-  // auto-calls `startMonitoring` today — doing so needs a team-scoped
-  // Scope lifetime, which is future work. See src/team/heartbeat.ts.
-  HeartbeatMonitor.layer.pipe(
-    Layer.provide(SessionCoordinator.defaultLayer),
-    Layer.provide(
-      LeadCoordinator.layer.pipe(
-        Layer.provide(TaskBoardRepo.layer),
-        Layer.provide(RateLimiter.layer),
-      ),
-    ),
-    Layer.provide(Mailbox.defaultLayer),
-  ),
-  TeamDaemon.layer.pipe(
-    Layer.provide(Bus.defaultLayer),
-    Layer.provide(SessionPrompt.defaultLayer),
-    Layer.provide(SessionCoordinator.defaultLayer),
-    Layer.provide(Mailbox.defaultLayer),
-    Layer.provide(TaskBoardRepo.layer),
-    Layer.provide(RateLimiter.layer),
-    Layer.provide(engineerProcessManagerLayer),
-  ),
-).pipe(Layer.provideMerge(Observability.layer))
+  TaskBoardRepo.layer,
+  Mailbox.defaultLayer,
+)
 
-const rt = ManagedRuntime.make(AppLayer, { memoMap })
+// LeadCoordinator depends on TaskBoardRepo + RateLimiter (both in baseLayer).
+// SessionCoordinator depends on Session + Mailbox + TaskBoardRepo + GitManager
+// (all in baseLayer). Compose them after baseLayer with Layer.provideMerge so
+// their dependencies resolve cleanly.
+const coordinatorLayer = Layer.mergeAll(
+  LeadCoordinator.layer,
+  SessionCoordinator.defaultLayer,
+).pipe(Layer.provideMerge(baseLayer))
+
+// ToolRegistry.defaultLayer requires SessionCoordinator + LeadCoordinator +
+// TaskBoardRepo + Mailbox to be provided externally. SessionPrompt.defaultLayer
+// requires TaskBoardRepo + Mailbox + ToolRegistry as well, so they share a tier.
+const toolRegistryLayer = Layer.mergeAll(
+  ToolRegistry.defaultLayer,
+  SessionPrompt.defaultLayer,
+).pipe(Layer.provideMerge(coordinatorLayer))
+
+// HeartbeatMonitor depends on SessionCoordinator + LeadCoordinator + Mailbox
+// (all satisfied by coordinatorLayer).
+const heartbeatLayer = HeartbeatMonitor.layer.pipe(Layer.provideMerge(toolRegistryLayer))
+
+// TeamDaemon depends on Bus + SessionPrompt + SessionCoordinator + Mailbox +
+// TaskBoardRepo + RateLimiter + EngineerProcessManager + HeartbeatMonitor.
+const daemonLayer = TeamDaemon.layer.pipe(Layer.provideMerge(heartbeatLayer))
+
+export const AppLayer: Layer.Layer<AppServices> = daemonLayer.pipe(
+  Layer.provideMerge(Observability.layer),
+)
+
+const rt: ManagedRuntime.ManagedRuntime<AppServices, never> = ManagedRuntime.make(AppLayer, { memoMap })
 type Runtime = Pick<typeof rt, "runSync" | "runPromise" | "runPromiseExit" | "runFork" | "runCallback" | "dispose">
 const wrap = (effect: Parameters<typeof rt.runSync>[0]) => attach(effect as never) as never
 
