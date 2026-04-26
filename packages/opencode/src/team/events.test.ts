@@ -1,7 +1,13 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test"
 import { Exit, Schema } from "effect"
 import { BusEvent } from "@/bus/bus-event"
-import { Event, publishTeamEvent, subscribeTeamEvent } from "./events"
+import {
+  Event,
+  publishTeamEvent,
+  subscribeTeamEvent,
+  hasEngineerCompleted,
+  resetEngineerCompletedLatch,
+} from "./events"
 import * as PluginModule from "@/plugin"
 import type { Hooks } from "@opencode-ai/plugin"
 
@@ -169,6 +175,11 @@ describe("publishTeamEvent plugin trigger (O2)", () => {
     recorded.length = 0
     // Reset all getters so each test starts clean
     PluginModule._clearHooksGetters()
+    // Reset the module-level engineerCompletedLatch so a prior test
+    // emitting EngineerCompleted can't leak its sticky `true` into this
+    // test (the latch is mutable module state by design — tests must
+    // clear it between cases).
+    resetEngineerCompletedLatch()
     // Register a test hooks getter that captures event calls
     PluginModule._registerHooksGetter(() => [
       {
@@ -255,5 +266,67 @@ describe("publishTeamEvent plugin trigger (O2)", () => {
     } finally {
       delete process.env.OPENCODE_TEAM_ENGINEER
     }
+  })
+})
+
+describe("engineerCompletedLatch", () => {
+  beforeEach(() => {
+    resetEngineerCompletedLatch()
+  })
+
+  test("latch starts cleared", () => {
+    expect(hasEngineerCompleted()).toBe(false)
+  })
+
+  test("publishing EngineerCompleted flips the latch", () => {
+    expect(hasEngineerCompleted()).toBe(false)
+    publishTeamEvent(Event.EngineerCompleted, {
+      teamID: "t1",
+      engineerID: "e1",
+      taskId: "task1",
+    })
+    expect(hasEngineerCompleted()).toBe(true)
+  })
+
+  test("publishing other events does NOT flip the latch", () => {
+    publishTeamEvent(Event.EngineerProgress, {
+      teamID: "t1",
+      engineerID: "e1",
+      progressText: "thinking",
+      timestamp: 1,
+    })
+    publishTeamEvent(Event.EngineerFailed, {
+      teamID: "t1",
+      engineerID: "e1",
+      taskId: "task1",
+      error: "boom",
+    })
+    expect(hasEngineerCompleted()).toBe(false)
+  })
+
+  test("latch flips in engineer-subprocess mode too", () => {
+    process.env.OPENCODE_TEAM_ENGINEER = "1"
+    try {
+      expect(hasEngineerCompleted()).toBe(false)
+      publishTeamEvent(Event.EngineerCompleted, {
+        teamID: "t1",
+        engineerID: "e1",
+        taskId: "task1",
+      })
+      expect(hasEngineerCompleted()).toBe(true)
+    } finally {
+      delete process.env.OPENCODE_TEAM_ENGINEER
+    }
+  })
+
+  test("resetEngineerCompletedLatch clears the latch", () => {
+    publishTeamEvent(Event.EngineerCompleted, {
+      teamID: "t1",
+      engineerID: "e1",
+      taskId: "task1",
+    })
+    expect(hasEngineerCompleted()).toBe(true)
+    resetEngineerCompletedLatch()
+    expect(hasEngineerCompleted()).toBe(false)
   })
 })

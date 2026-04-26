@@ -137,7 +137,7 @@ export const TeamEngineerRunCommand = cmd({
       try { process.stderr.write(line) } catch {}
       log.error("unhandledRejection", { reason: String(reason), engineerID })
     })
-    process.on("beforeExit", (code) => {
+    process.once("beforeExit", (code) => {
       if (!completedSuccessfully) {
         const line = `engineer beforeExit code=${code} completedSuccessfully=false — event loop drained before engineer-loop resolved\n`
         try { process.stderr.write(line) } catch {}

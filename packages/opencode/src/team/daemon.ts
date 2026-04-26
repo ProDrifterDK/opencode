@@ -328,10 +328,23 @@ export const layer = Layer.effect(
           // `all-engineers-failed` urgent. A 5s timeout guards against a
           // wedged reader so we never hang the cleanup path forever.
           if (slot?.eventReaderDone) {
-            await Promise.race([
-              slot.eventReaderDone,
-              new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-            ]).catch(() => {})
+            const READER_DRAIN_TIMEOUT_MS = 5_000
+            let timer: ReturnType<typeof setTimeout> | undefined
+            const TIMED_OUT = Symbol("reader-drain-timeout")
+            const timeoutPromise = new Promise<typeof TIMED_OUT>((resolve) => {
+              timer = setTimeout(() => resolve(TIMED_OUT), READER_DRAIN_TIMEOUT_MS)
+            })
+            const winner = await Promise.race([
+              slot.eventReaderDone.then(() => "drained" as const),
+              timeoutPromise,
+            ]).catch(() => "drained" as const) // reader rejection → proceed
+            if (timer !== undefined) clearTimeout(timer)
+            if (winner === TIMED_OUT) {
+              log.warn("engineer stdout reader did not drain before reconcile", {
+                engineerID: params.engineerID,
+                timeoutMs: READER_DRAIN_TIMEOUT_MS,
+              })
+            }
           }
 
           AppRuntime.runFork(

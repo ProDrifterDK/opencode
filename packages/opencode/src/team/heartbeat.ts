@@ -211,11 +211,16 @@ export const layer = Layer.effect(
           }
 
           // Only count engineers that are still alive and could pick up
-          // work — exclude `idle` (may have just completed via
-          // team_report) and `failed`/`terminated`. Without this filter
-          // a single crashed engineer racing a clean dissolve would
-          // make the team look empty, triggering a bogus urgent
-          // "all-engineers-failed" notification to the lead.
+          // work. The `liveOnly` filter (in session-coordinator.ts)
+          // excludes only `failed` engineers — `idle`, `working`, and
+          // `blocked` all count as alive. Idle is alive because:
+          //   - just-spawned engineers are idle until they pick a task
+          //   - just-completed engineers are idle after team_report
+          // and in both cases the subprocess is still around to pick
+          // up reassigned work. The earlier semantics (idle excluded)
+          // produced spurious `all-engineers-failed` urgents when one
+          // engineer died while siblings were still in their post-spawn
+          // idle window.
           const remaining = yield* coordinator.listTeamEngineers(teamID, { liveOnly: true }).pipe(
             Effect.orElseSucceed(() => [] as EngineerSlot[]),
           )
