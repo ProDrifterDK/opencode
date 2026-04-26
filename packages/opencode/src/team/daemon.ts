@@ -1,5 +1,4 @@
-import { Effect, Layer, Context, Cause } from "effect"
-import z from "zod"
+import { Effect, Layer, Context, Cause, Schema } from "effect"
 import { Bus } from "@/bus"
 import { Log } from "@/util"
 import { SessionPrompt } from "@/session/prompt"
@@ -547,13 +546,8 @@ export const layer = Layer.effect(
     // duplicate EngineerMessageSent + LeadMessageReceived publishes that used
     // to fire for every send regardless of recipient role.
     const handleMailboxReceived = (event: {
-      type: string
-      properties: {
-        messageID: string
-        senderSessionID: string
-        recipientSessionID: string
-        priority: "urgent" | "inbox" | "queue"
-      }
+      type: typeof MailboxEvent.Received.type
+      properties: Schema.Schema.Type<typeof MailboxEvent.Received.properties>
     }) => {
       AppRuntime.runFork(Effect.gen(function* () {
         const recipient = event.properties.recipientSessionID as SessionID
@@ -642,22 +636,8 @@ export const layer = Layer.effect(
     }
 
     const handleEngineerSpawned = (event: {
-      type: string
-      properties: {
-        teamID: string
-        engineerID: string
-        sessionID: string
-        name: string
-        state: string
-        taskID: string
-        taskTitle: string
-        taskDescription: string
-        providerID?: string
-        modelID?: string
-        fallbackAgent?: string
-        fallbackProviderID?: string
-        fallbackModelID?: string
-      }
+      type: typeof Event.EngineerSpawned.type
+      properties: Schema.Schema.Type<typeof Event.EngineerSpawned.properties>
     }) => {
       log.info("received engineer.spawned event", {
         engineerID: event.properties.engineerID,
@@ -732,7 +712,10 @@ export const layer = Layer.effect(
     // Track last emitted tool per engineer to avoid duplicate progress updates
     const lastToolPerEngineer = new Map<string, string>()
 
-    const handlePartUpdated = (event: { type: string; properties: z.infer<(typeof MessageEvent.PartUpdated)["properties"]> }) => {
+    const handlePartUpdated = (event: {
+      type: typeof MessageEvent.PartUpdated.type
+      properties: Schema.Schema.Type<typeof MessageEvent.PartUpdated.properties>
+    }) => {
       // Only process tool parts that are running
       if (event.properties.part.type !== "tool") return
       if ((event.properties.part.state as { status?: string } | undefined)?.status !== "running") return

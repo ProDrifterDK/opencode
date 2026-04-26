@@ -1,8 +1,8 @@
 import { Layer, ManagedRuntime } from "effect"
 import { attach } from "./run-service"
-import * as Observability from "./observability"
+import * as Observability from "@opencode-ai/core/effect/observability"
 
-import { AppFileSystem } from "@opencode-ai/shared/filesystem"
+import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Bus } from "@/bus"
 import { Auth } from "@/auth"
 import { Account } from "@/account/account"
@@ -55,8 +55,8 @@ import { GitManager } from "@/team/git-manager"
 import { RateLimiter } from "@/team/rate-limiter"
 import { HeartbeatMonitor } from "@/team/heartbeat"
 import { layer as engineerProcessManagerLayer, Service as EngineerProcessManagerService } from "@/team/engineer-process-manager"
-import { Npm } from "@/npm"
-import { memoMap } from "./memo-map"
+import { Npm } from "@opencode-ai/core/npm"
+import { memoMap } from "@opencode-ai/core/effect/memo-map"
 
 // Explicit service union for the application's root layer. Annotating
 // AppLayer breaks the implicit-any cycle between AppLayer, the

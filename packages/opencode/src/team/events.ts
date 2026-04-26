@@ -1,4 +1,4 @@
-import z from "zod"
+import { Schema } from "effect"
 import { BusEvent } from "@/bus/bus-event"
 import * as Bus from "@/bus"
 import { GlobalBus } from "@/bus/global"
@@ -8,73 +8,100 @@ import { notifyPluginEvent } from "@/plugin"
 const log = Log.create({ service: "team.events" })
 
 export const Event = {
-  TeamCreated: BusEvent.define("team.created", z.object({
-    teamID: z.string(),
-    leadSessionID: z.string(),
-    goal: z.string(),
-  })),
+  TeamCreated: BusEvent.define(
+    "team.created",
+    Schema.Struct({
+      teamID: Schema.String,
+      leadSessionID: Schema.String,
+      goal: Schema.String,
+    }),
+  ),
 
-  TeamDissolved: BusEvent.define("team.dissolved", z.object({
-    teamID: z.string(),
-    reason: z.string(),
-  })),
+  TeamDissolved: BusEvent.define(
+    "team.dissolved",
+    Schema.Struct({
+      teamID: Schema.String,
+      reason: Schema.String,
+    }),
+  ),
 
-  EngineerSpawned: BusEvent.define("engineer.spawned", z.object({
-    teamID: z.string(),
-    engineerID: z.string(),
-    sessionID: z.string(),
-    name: z.string(),
-    state: z.string(),
-    taskID: z.string(),
-    taskTitle: z.string(),
-    taskDescription: z.string(),
-    providerID: z.string().optional(),
-    modelID: z.string().optional(),
-    agentName: z.string().optional(),
-    agentColor: z.string().optional(),
-    fallbackAgent: z.string().optional(),
-    fallbackProviderID: z.string().optional(),
-    fallbackModelID: z.string().optional(),
-  })),
+  EngineerSpawned: BusEvent.define(
+    "engineer.spawned",
+    Schema.Struct({
+      teamID: Schema.String,
+      engineerID: Schema.String,
+      sessionID: Schema.String,
+      name: Schema.String,
+      state: Schema.String,
+      taskID: Schema.String,
+      taskTitle: Schema.String,
+      taskDescription: Schema.String,
+      providerID: Schema.optional(Schema.String),
+      modelID: Schema.optional(Schema.String),
+      agentName: Schema.optional(Schema.String),
+      agentColor: Schema.optional(Schema.String),
+      fallbackAgent: Schema.optional(Schema.String),
+      fallbackProviderID: Schema.optional(Schema.String),
+      fallbackModelID: Schema.optional(Schema.String),
+    }),
+  ),
 
-  EngineerCompleted: BusEvent.define("engineer.completed", z.object({
-    teamID: z.string(),
-    engineerID: z.string(),
-    taskId: z.string(),
-  })),
+  EngineerCompleted: BusEvent.define(
+    "engineer.completed",
+    Schema.Struct({
+      teamID: Schema.String,
+      engineerID: Schema.String,
+      taskId: Schema.String,
+    }),
+  ),
 
-  EngineerFailed: BusEvent.define("engineer.failed", z.object({
-    teamID: z.string(),
-    engineerID: z.string(),
-    taskId: z.string(),
-    error: z.string(),
-  })),
+  EngineerFailed: BusEvent.define(
+    "engineer.failed",
+    Schema.Struct({
+      teamID: Schema.String,
+      engineerID: Schema.String,
+      taskId: Schema.String,
+      error: Schema.String,
+    }),
+  ),
 
-  TaskAssigned: BusEvent.define("task.assigned", z.object({
-    teamID: z.string(),
-    taskId: z.string(),
-    engineerID: z.string(),
-  })),
+  TaskAssigned: BusEvent.define(
+    "task.assigned",
+    Schema.Struct({
+      teamID: Schema.String,
+      taskId: Schema.String,
+      engineerID: Schema.String,
+    }),
+  ),
 
-  TaskUpdated: BusEvent.define("task.updated", z.object({
-    teamID: z.string(),
-    taskId: z.string(),
-    status: z.string(),
-    oldStatus: z.string(),
-  })),
+  TaskUpdated: BusEvent.define(
+    "task.updated",
+    Schema.Struct({
+      teamID: Schema.String,
+      taskId: Schema.String,
+      status: Schema.String,
+      oldStatus: Schema.String,
+    }),
+  ),
 
-  TaskCompleted: BusEvent.define("task.completed", z.object({
-    teamID: z.string(),
-    taskId: z.string(),
-    engineerID: z.string(),
-  })),
+  TaskCompleted: BusEvent.define(
+    "task.completed",
+    Schema.Struct({
+      teamID: Schema.String,
+      taskId: Schema.String,
+      engineerID: Schema.String,
+    }),
+  ),
 
-  EngineerProgress: BusEvent.define("engineer.progress", z.object({
-    teamID: z.string(),
-    engineerID: z.string(),
-    progressText: z.string(),
-    timestamp: z.number(),
-  })),
+  EngineerProgress: BusEvent.define(
+    "engineer.progress",
+    Schema.Struct({
+      teamID: Schema.String,
+      engineerID: Schema.String,
+      progressText: Schema.String,
+      timestamp: Schema.Number,
+    }),
+  ),
 } as const
 
 /**
@@ -111,7 +138,7 @@ function writeEngineerEventToStdout(type: string, properties: unknown): void {
 
 export function publishTeamEvent<D extends BusEvent.Definition>(
   def: D,
-  properties: z.output<D["properties"]>,
+  properties: Schema.Schema.Type<D["properties"]>,
 ): void {
   if (isEngineerSubprocess()) {
     // engineer subprocess publishes only via stdout — local Bus is the lead's path.
@@ -161,10 +188,10 @@ export function publishTeamEvent<D extends BusEvent.Definition>(
 
 export function subscribeTeamEvent<D extends BusEvent.Definition>(
   def: D,
-  callback: (event: { type: D["type"]; properties: z.infer<D["properties"]> }) => unknown,
+  callback: (event: { type: D["type"]; properties: Schema.Schema.Type<D["properties"]> }) => unknown,
 ): () => void {
   try {
-    return Bus.subscribe(def, callback)
+    return Bus.subscribe(def, callback as (event: { type: D["type"]; properties: Schema.Schema.Type<D["properties"]> }) => unknown)
   } catch (err) {
     log.error("failed to subscribe to team event", { type: def.type, error: String(err) })
     return () => {}

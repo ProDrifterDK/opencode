@@ -24,7 +24,7 @@
  * ends when stdout closes; the exit handler calls `deleteRunning` and
  * reconciles DB state after the exit promise resolves.
  */
-import z from "zod"
+import { Exit, Schema } from "effect"
 import { BusEvent } from "@/bus/bus-event"
 import * as Bus from "@/bus"
 import { GlobalBus } from "@/bus/global"
@@ -81,15 +81,16 @@ const defaultOnEvent = (event: { type: string; properties: unknown }) => {
   // subprocess that emits a known event type but with the wrong shape
   // is a programming error in the engineer; we don't want to inject
   // garbage into the lead's bus.
-  const parsed = (def.properties as z.ZodType).safeParse(event.properties)
-  if (!parsed.success) {
+  const decoded = Schema.decodeUnknownExit(def.properties as unknown as Schema.Decoder<unknown>)(event.properties)
+  if (Exit.isFailure(decoded)) {
     log.warn("engineer event failed schema validation", {
       type: event.type,
-      error: parsed.error.message,
+      error: String(decoded.cause),
     })
     return
   }
-  Bus.publish(def, parsed.data).catch((err) => {
+  const data = decoded.value
+  Bus.publish(def, data as never).catch((err) => {
     const msg = String(err)
     if (!msg.includes("No context found for instance")) {
       log.error("failed to republish engineer event", { type: event.type, error: msg })
@@ -97,7 +98,7 @@ const defaultOnEvent = (event: { type: string; properties: unknown }) => {
   })
   GlobalBus.emit("event", {
     directory: "global",
-    payload: { type: event.type, properties: parsed.data },
+    payload: { type: event.type, properties: data },
   })
 }
 

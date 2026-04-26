@@ -21,7 +21,7 @@
  */
 import { Context, Effect, Layer, Schema } from "effect"
 import { Log } from "@/util"
-import { sanitizedProcessEnv } from "@/util/opencode-process"
+import { sanitizedProcessEnv } from "@opencode-ai/core/util/opencode-process"
 import type { EngineerID, TeamID } from "./types"
 import { readEngineerEvents, drainEngineerStderr } from "./engineer-event-reader"
 import { ENGINEER_KILL_TIMEOUT_MS } from "./constants"

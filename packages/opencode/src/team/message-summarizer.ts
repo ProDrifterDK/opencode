@@ -1,7 +1,6 @@
 import { Effect, Layer, Context, Schema } from "effect"
 import { Bus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
-import z from "zod"
 import { LEAD_CONTEXT_BUDGET } from "./constants"
 import type { MailboxRow, MessageBatch } from "./mailbox.sql"
 import { Mailbox } from "./mailbox"
@@ -13,11 +12,11 @@ const log = Log.create({ service: "team.message-summarizer" })
 export const Event = {
   Summarized: BusEvent.define(
     "message-summarizer.summarized",
-    z.object({
-      sessionID: z.string(),
-      originalCount: z.number(),
-      summaryCount: z.number(),
-      preservedUrgent: z.number(),
+    Schema.Struct({
+      sessionID: Schema.String,
+      originalCount: Schema.Number,
+      summaryCount: Schema.Number,
+      preservedUrgent: Schema.Number,
     }),
   ),
 }

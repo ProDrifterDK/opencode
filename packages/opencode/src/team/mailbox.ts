@@ -1,5 +1,4 @@
 import { eq, and, asc, isNull, lt, sql } from "drizzle-orm"
-import z from "zod"
 import { Effect, Layer, Context } from "effect"
 import { Schema } from "effect"
 import { BusEvent } from "@/bus/bus-event"
@@ -16,18 +15,18 @@ export class DbError extends Schema.TaggedErrorClass<DbError>()("Mailbox.DbError
 export const Event = {
   Received: BusEvent.define(
     "mailbox.message.received",
-    z.object({
-      messageID: z.string(),
-      senderSessionID: z.string(),
-      recipientSessionID: z.string(),
-      priority: z.enum(["urgent", "inbox", "queue"]),
+    Schema.Struct({
+      messageID: Schema.String,
+      senderSessionID: Schema.String,
+      recipientSessionID: Schema.String,
+      priority: Schema.Literals(["urgent", "inbox", "queue"]),
     }),
   ),
   Read: BusEvent.define(
     "mailbox.message.read",
-    z.object({
-      messageID: z.string(),
-      recipientSessionID: z.string(),
+    Schema.Struct({
+      messageID: Schema.String,
+      recipientSessionID: Schema.String,
     }),
   ),
 }

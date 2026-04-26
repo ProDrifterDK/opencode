@@ -1,8 +1,19 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test"
+import { Exit, Schema } from "effect"
 import { BusEvent } from "@/bus/bus-event"
 import { Event, publishTeamEvent, subscribeTeamEvent } from "./events"
 import * as PluginModule from "@/plugin"
 import type { Hooks } from "@opencode-ai/plugin"
+
+// Thin shim around Effect Schema's decode API to preserve the
+// `safeParse(...).success` shape these tests historically asserted on.
+// The team event schemas are no longer Zod, so the Zod safeParse method
+// is gone — but the test contract (success boolean for "does this
+// payload validate?") is unchanged.
+function safeParse<S extends Schema.Top>(schema: S, value: unknown): { success: boolean } {
+  const exit = Schema.decodeUnknownExit(schema as unknown as Schema.Decoder<unknown>)(value)
+  return { success: Exit.isSuccess(exit) }
+}
 
 describe("TeamEvents", () => {
   test("Event definitions have correct types", () => {
@@ -43,7 +54,7 @@ describe("TeamEvents", () => {
 
   test("Event payloads validate against their schemas", () => {
     const teamCreatedProps = Event.TeamCreated.properties
-    const parsed = teamCreatedProps.safeParse({
+    const parsed = safeParse(teamCreatedProps, {
       teamID: "team_123",
       leadSessionID: "sess_456",
       goal: "implement auth",
@@ -51,7 +62,7 @@ describe("TeamEvents", () => {
     expect(parsed.success).toBe(true)
 
     const engineerFailedProps = Event.EngineerFailed.properties
-    const parsed2 = engineerFailedProps.safeParse({
+    const parsed2 = safeParse(engineerFailedProps, {
       teamID: "team_x",
       engineerID: "eng_bad",
       taskId: "task_1",
@@ -60,7 +71,7 @@ describe("TeamEvents", () => {
     expect(parsed2.success).toBe(true)
 
     const taskUpdatedProps = Event.TaskUpdated.properties
-    const parsed3 = taskUpdatedProps.safeParse({
+    const parsed3 = safeParse(taskUpdatedProps, {
       teamID: "team_z",
       taskId: "task_3",
       status: "in-progress",
@@ -71,7 +82,7 @@ describe("TeamEvents", () => {
 
   test("Event payloads reject invalid data", () => {
     const teamCreatedProps = Event.TeamCreated.properties
-    const parsed = teamCreatedProps.safeParse({
+    const parsed = safeParse(teamCreatedProps, {
       teamID: 123,
     })
     expect(parsed.success).toBe(false)
@@ -83,7 +94,7 @@ describe("TeamEvents", () => {
     // null). The earlier "nullable taskId" contract is gone.
     const props = Event.EngineerSpawned.properties
 
-    const complete = props.safeParse({
+    const complete = safeParse(props, {
       teamID: "team_1",
       engineerID: "eng_1",
       sessionID: "sess_1",
@@ -96,7 +107,7 @@ describe("TeamEvents", () => {
     expect(complete.success).toBe(true)
 
     // Optional fields should pass when present.
-    const withOptional = props.safeParse({
+    const withOptional = safeParse(props, {
       teamID: "team_1",
       engineerID: "eng_1",
       sessionID: "sess_1",
@@ -114,7 +125,7 @@ describe("TeamEvents", () => {
 
     // Missing taskID should now fail — spawning without a task is no
     // longer a valid state.
-    const missingTask = props.safeParse({
+    const missingTask = safeParse(props, {
       teamID: "team_1",
       engineerID: "eng_1",
       sessionID: "sess_1",

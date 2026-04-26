@@ -1,5 +1,4 @@
-import z from "zod"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { SessionShare } from "../share"
 import { SessionCoordinator } from "../team/session-coordinator"
@@ -115,8 +114,8 @@ export const TeamCreateTool = Tool.define(
 
     return {
       description: TOOL_DESCRIPTIONS.team_create,
-      parameters: z.object({
-        goal: z.string().describe("The goal or mission for the team to accomplish"),
+      parameters: Schema.Struct({
+        goal: Schema.String.annotate({ description: "The goal or mission for the team to accomplish" }),
       }),
       execute: (params: { goal: string }, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -176,8 +175,8 @@ export const TeamMonitorTool = Tool.define(
 
     return {
       description: TOOL_DESCRIPTIONS.team_monitor,
-      parameters: z.object({
-        teamID: z.string().describe("The team ID to monitor"),
+      parameters: Schema.Struct({
+        teamID: Schema.String.annotate({ description: "The team ID to monitor" }),
       }),
       execute: (params: { teamID: string }, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -218,16 +217,16 @@ export const TeamMonitorTool = Tool.define(
   }),
 )
 
-const teamSpawnParams = z.object({
-  teamID: z.string().describe("Team ID from team_create"),
-  name: z.string().describe("Engineer name (e.g., 'engineer-auth')"),
-  task: z.object({
-    title: z.string().describe("Task title"),
-    description: z.string().describe("Task description"),
-    fileScope: z.array(z.string()).optional().describe("Files this task may modify"),
+const teamSpawnParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID from team_create" }),
+  name: Schema.String.annotate({ description: "Engineer name (e.g., 'engineer-auth')" }),
+  task: Schema.Struct({
+    title: Schema.String.annotate({ description: "Task title" }),
+    description: Schema.String.annotate({ description: "Task description" }),
+    fileScope: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Files this task may modify" }),
   }),
-  agent: z.string().optional().describe("Agent name to use for this engineer (use team_agents to list). If not specified, uses session's default model."),
-  fallbackAgent: z.string().optional().describe("Fallback agent name. If the primary agent's provider trips the team's circuit breaker (sustained 429s), the engineer swaps to this agent and retries the task ONCE. Use a different provider for true cross-provider failover."),
+  agent: Schema.optional(Schema.String).annotate({ description: "Agent name to use for this engineer (use team_agents to list). If not specified, uses session's default model." }),
+  fallbackAgent: Schema.optional(Schema.String).annotate({ description: "Fallback agent name. If the primary agent's provider trips the team's circuit breaker (sustained 429s), the engineer swaps to this agent and retries the task ONCE. Use a different provider for true cross-provider failover." }),
 })
 
 export const TeamSpawnTool = Tool.define(
@@ -240,7 +239,7 @@ export const TeamSpawnTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_spawn,
       parameters: teamSpawnParams,
-      execute: (params: z.infer<typeof teamSpawnParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamSpawnParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -382,8 +381,8 @@ export const TeamSpawnTool = Tool.define(
   }),
 )
 
-const teamAssignParams = z.object({
-  teamID: z.string().describe("Team ID"),
+const teamAssignParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID" }),
 })
 
 export const TeamAssignTool = Tool.define(
@@ -395,7 +394,7 @@ export const TeamAssignTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_assign,
       parameters: teamAssignParams,
-      execute: (params: z.infer<typeof teamAssignParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamAssignParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -445,26 +444,27 @@ export const TeamAssignTool = Tool.define(
   }),
 )
 
-const teamDecomposeParams = z.object({
-  teamID: z.string().describe("Team ID"),
-  subtasks: z
-    .array(
-      z.object({
-        id: z.string().optional().describe("Optional client-side identifier for dependency references"),
-        title: z.string(),
-        description: z.string(),
-        files: z.array(z.string()).default([]),
-        dependencies: z
-          .array(z.string())
-          .optional()
-          .describe("IDs of subtasks (from `id` field) that must complete before this one can start"),
-        complexity: z
-          .enum(["low", "medium", "high"])
-          .optional()
-          .describe("Hint for agent routing: low = fast/cheap agent, high = deep/powerful agent"),
+const teamDecomposeParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID" }),
+  subtasks: Schema.Array(
+    Schema.Struct({
+      id: Schema.optional(Schema.String).annotate({ description: "Optional client-side identifier for dependency references" }),
+      title: Schema.String,
+      description: Schema.String,
+      files: Schema.Array(Schema.String).pipe(
+        Schema.optional,
+        Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>)),
+      ),
+      dependencies: Schema.optional(Schema.Array(Schema.String)).annotate({
+        description: "IDs of subtasks (from `id` field) that must complete before this one can start",
       }),
-    )
-    .describe("Subtasks to create (pre-parsed by LLM). Use `id` + `dependencies` to declare execution order."),
+      complexity: Schema.optional(Schema.Literals(["low", "medium", "high"])).annotate({
+        description: "Hint for agent routing: low = fast/cheap agent, high = deep/powerful agent",
+      }),
+    }),
+  ).annotate({
+    description: "Subtasks to create (pre-parsed by LLM). Use `id` + `dependencies` to declare execution order.",
+  }),
 })
 
 export const TeamDecomposeTool = Tool.define(
@@ -476,7 +476,7 @@ export const TeamDecomposeTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_decompose,
       parameters: teamDecomposeParams,
-      execute: (params: z.infer<typeof teamDecomposeParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamDecomposeParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -490,8 +490,8 @@ export const TeamDecomposeTool = Tool.define(
               id: s.id,
               title: s.title,
               description: s.description,
-              files: s.files,
-              dependencies: s.dependencies,
+              files: s.files ? [...s.files] : [],
+              dependencies: s.dependencies ? [...s.dependencies] : undefined,
               complexity: s.complexity,
             })),
             request: `Decomposed into ${params.subtasks.length} subtasks`,
@@ -515,9 +515,9 @@ export const TeamDecomposeTool = Tool.define(
   }),
 )
 
-const teamReassignParams = z.object({
-  taskID: z.string().describe("Task ID to reassign"),
-  toEngineerID: z.string().describe("Target engineer ID"),
+const teamReassignParams = Schema.Struct({
+  taskID: Schema.String.annotate({ description: "Task ID to reassign" }),
+  toEngineerID: Schema.String.annotate({ description: "Target engineer ID" }),
 })
 
 export const TeamReassignTool = Tool.define(
@@ -529,7 +529,7 @@ export const TeamReassignTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_reassign,
       parameters: teamReassignParams,
-      execute: (params: z.infer<typeof teamReassignParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamReassignParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -567,11 +567,11 @@ export const TeamReassignTool = Tool.define(
   }),
 )
 
-const teamRetaskParams = z.object({
-  taskID: z.string().describe("Task ID to update"),
-  title: z.string().optional().describe("New title for the task"),
-  description: z.string().optional().describe("New description for the task"),
-  fileScope: z.array(z.string()).optional().describe("Replacement file scope for the task"),
+const teamRetaskParams = Schema.Struct({
+  taskID: Schema.String.annotate({ description: "Task ID to update" }),
+  title: Schema.optional(Schema.String).annotate({ description: "New title for the task" }),
+  description: Schema.optional(Schema.String).annotate({ description: "New description for the task" }),
+  fileScope: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Replacement file scope for the task" }),
 })
 
 export const TeamRetaskTool = Tool.define(
@@ -583,7 +583,7 @@ export const TeamRetaskTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_retask,
       parameters: teamRetaskParams,
-      execute: (params: z.infer<typeof teamRetaskParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamRetaskParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           yield* requireLead(ctx, coordinator, "retask a task")
 
@@ -591,7 +591,7 @@ export const TeamRetaskTool = Tool.define(
             taskId: params.taskID as import("../team/task-board.sql").TaskBoardID,
             title: params.title,
             description: params.description,
-            fileScope: params.fileScope,
+            fileScope: params.fileScope ? [...params.fileScope] : undefined,
           })
 
           const output = [
@@ -615,8 +615,8 @@ export const TeamRetaskTool = Tool.define(
   }),
 )
 
-const teamKillParams = z.object({
-  engineerID: z.string().describe("Engineer ID to terminate"),
+const teamKillParams = Schema.Struct({
+  engineerID: Schema.String.annotate({ description: "Engineer ID to terminate" }),
 })
 
 export const TeamKillTool = Tool.define(
@@ -628,7 +628,7 @@ export const TeamKillTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_kill,
       parameters: teamKillParams,
-      execute: (params: z.infer<typeof teamKillParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamKillParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -675,10 +675,13 @@ export const TeamKillTool = Tool.define(
   }),
 )
 
-const teamMessageParams = z.object({
-  recipientID: z.string().describe("Engineer ID, or 'lead' to message the lead"),
-  content: z.string().describe("Message content"),
-  priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"),
+const teamMessageParams = Schema.Struct({
+  recipientID: Schema.String.annotate({ description: "Engineer ID, or 'lead' to message the lead" }),
+  content: Schema.String.annotate({ description: "Message content" }),
+  priority: Schema.Literals(["low", "normal", "high", "urgent"]).pipe(
+    Schema.optional,
+    Schema.withDecodingDefault(Effect.succeed("normal" as const)),
+  ),
 })
 
 export const TeamMessageTool = Tool.define(
@@ -690,7 +693,7 @@ export const TeamMessageTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_message,
       parameters: teamMessageParams,
-      execute: (params: z.infer<typeof teamMessageParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamMessageParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const teamID = yield* coordinator.getTeamForSession(ctx.sessionID)
           if (!teamID) {
@@ -727,7 +730,7 @@ export const TeamMessageTool = Tool.define(
             }
           }
 
-          const mailboxPriority = translatePriority(params.priority)
+          const mailboxPriority = translatePriority(params.priority ?? "normal")
           const message = yield* mailbox.send({
             recipientSessionID,
             senderSessionID: ctx.sessionID,
@@ -758,10 +761,10 @@ export const TeamMessageTool = Tool.define(
   }),
 )
 
-const teamStatusParams = z.object({
-  state: z.enum(["working", "blocked", "completed"]).describe("Current state"),
-  progress: z.string().optional().describe("Progress description"),
-  blocker: z.string().optional().describe("Blocker description if blocked"),
+const teamStatusParams = Schema.Struct({
+  state: Schema.Literals(["working", "blocked", "completed"]).annotate({ description: "Current state" }),
+  progress: Schema.optional(Schema.String).annotate({ description: "Progress description" }),
+  blocker: Schema.optional(Schema.String).annotate({ description: "Blocker description if blocked" }),
 })
 
 export const TeamStatusTool = Tool.define(
@@ -773,7 +776,7 @@ export const TeamStatusTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_status,
       parameters: teamStatusParams,
-      execute: (params: z.infer<typeof teamStatusParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamStatusParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
           if (!isEngineer) {
@@ -848,9 +851,12 @@ export const TeamStatusTool = Tool.define(
   }),
 )
 
-const teamDissolveParams = z.object({
-  teamID: z.string().describe("Team ID to dissolve"),
-  force: z.boolean().default(false).describe("Force dissolve even with in-progress tasks"),
+const teamDissolveParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID to dissolve" }),
+  force: Schema.Boolean.pipe(
+    Schema.optional,
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ).annotate({ description: "Force dissolve even with in-progress tasks" }),
 })
 
 export const TeamDissolveTool = Tool.define(
@@ -865,7 +871,7 @@ export const TeamDissolveTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_dissolve,
       parameters: teamDissolveParams,
-      execute: (params: z.infer<typeof teamDissolveParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamDissolveParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -987,8 +993,8 @@ const branchCleanup = yield* gitManager
   }),
 )
 
-const teamResumeParams = z.object({
-  teamID: z.string().describe("Team ID to resume (must be in `terminated` state)"),
+const teamResumeParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID to resume (must be in `terminated` state)" }),
 })
 
 export const TeamResumeTool = Tool.define(
@@ -1000,7 +1006,7 @@ export const TeamResumeTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_resume,
       parameters: teamResumeParams,
-      execute: (params: z.infer<typeof teamResumeParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamResumeParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           // Resume is invoked from a fresh lead session that may not yet
           // be registered as the lead of the team being resumed. We
@@ -1040,8 +1046,8 @@ export const TeamResumeTool = Tool.define(
   }),
 )
 
-const teamCommitParams = z.object({
-  teamID: z.string().describe("Team ID from team_create"),
+const teamCommitParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID from team_create" }),
 })
 
 export const TeamCommitTool = Tool.define(
@@ -1054,7 +1060,7 @@ export const TeamCommitTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_commit,
       parameters: teamCommitParams,
-      execute: (params: z.infer<typeof teamCommitParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamCommitParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (!isLead) {
@@ -1162,9 +1168,9 @@ export const TeamCommitTool = Tool.define(
   }),
 )
 
-const teamReportParams = z.object({
-  status: z.enum(["completed", "blocked", "failed"]).describe("Task completion status"),
-  summary: z.string().describe("Brief summary of work done or reason for failure/block"),
+const teamReportParams = Schema.Struct({
+  status: Schema.Literals(["completed", "blocked", "failed"]).annotate({ description: "Task completion status" }),
+  summary: Schema.String.annotate({ description: "Brief summary of work done or reason for failure/block" }),
 })
 
 export const TeamReportTool = Tool.define(
@@ -1177,7 +1183,7 @@ export const TeamReportTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_report,
       parameters: teamReportParams,
-      execute: (params: z.infer<typeof teamReportParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamReportParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
           if (!isEngineer) {
@@ -1282,8 +1288,8 @@ export const TeamInboxTool = Tool.define(
 
     return {
       description: TOOL_DESCRIPTIONS.team_inbox,
-      parameters: z.object({
-        peek: z.boolean().optional().describe("If true, preview messages without marking as read"),
+      parameters: Schema.Struct({
+        peek: Schema.optional(Schema.Boolean).annotate({ description: "If true, preview messages without marking as read" }),
       }),
       execute: (params: { peek?: boolean }, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -1333,7 +1339,7 @@ export const TeamRosterTool = Tool.define(
 
     return {
       description: TOOL_DESCRIPTIONS.team_roster,
-      parameters: z.object({}),
+      parameters: Schema.Struct({}),
       execute: (_params: Record<string, never>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const teamID = yield* coordinator.getTeamForSession(ctx.sessionID)
@@ -1394,8 +1400,8 @@ export const TeamTasksTool = Tool.define(
 
     return {
       description: TOOL_DESCRIPTIONS.team_tasks,
-      parameters: z.object({
-        showAll: z.boolean().optional().describe("Show all tasks including assigned ones (default: only unassigned)"),
+      parameters: Schema.Struct({
+        showAll: Schema.optional(Schema.Boolean).annotate({ description: "Show all tasks including assigned ones (default: only unassigned)" }),
       }),
       execute: (params: { showAll?: boolean }, ctx: Tool.Context) =>
         Effect.gen(function* () {
@@ -1477,8 +1483,8 @@ export const TeamTasksTool = Tool.define(
 
 // ─── Team Claim Tool (claim a task) ─────────────────────────────────────────
 
-const teamClaimParams = z.object({
-  taskID: z.string().describe("Task ID to claim (from team_tasks)"),
+const teamClaimParams = Schema.Struct({
+  taskID: Schema.String.annotate({ description: "Task ID to claim (from team_tasks)" }),
 })
 
 export const TeamClaimTool = Tool.define(
@@ -1490,7 +1496,7 @@ export const TeamClaimTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_claim,
       parameters: teamClaimParams,
-      execute: (params: z.infer<typeof teamClaimParams>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamClaimParams>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const isEngineer = yield* coordinator.isEngineer(ctx.sessionID)
           if (!isEngineer) {
@@ -1604,10 +1610,10 @@ export const TeamClaimTool = Tool.define(
 // Module-level cache for the agents list. Intentionally mutable; invalidated only by process restart.
 let _agentsCache: { value: Agent.Info[]; expiresAt: number } | null = null
 
-const teamAgentsParams = z.object({
-  includeNative: z.boolean().optional().describe(
-    "Include native/built-in agents (default: false, only show user-configured agents)"
-  ),
+const teamAgentsParams = Schema.Struct({
+  includeNative: Schema.optional(Schema.Boolean).annotate({
+    description: "Include native/built-in agents (default: false, only show user-configured agents)",
+  }),
 })
 
 export const TeamAgentsTool = Tool.define(
@@ -1618,7 +1624,7 @@ export const TeamAgentsTool = Tool.define(
     return {
       description: TOOL_DESCRIPTIONS.team_agents,
       parameters: teamAgentsParams,
-      execute: (params: z.infer<typeof teamAgentsParams>, _ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof teamAgentsParams>, _ctx: Tool.Context) =>
         Effect.gen(function* () {
           const now = Date.now()
           const allAgents =
@@ -1696,8 +1702,8 @@ export const TeamShareTool = Tool.define(
 
     return {
       description: TOOL_DESCRIPTIONS.team_share,
-      parameters: z.object({
-        teamID: z.string().describe("Team ID whose sessions to share"),
+      parameters: Schema.Struct({
+        teamID: Schema.String.annotate({ description: "Team ID whose sessions to share" }),
       }),
       execute: (params: { teamID: string }, ctx: Tool.Context) =>
         Effect.gen(function* () {
