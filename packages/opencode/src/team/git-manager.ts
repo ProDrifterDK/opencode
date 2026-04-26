@@ -2,6 +2,20 @@ import { Effect, Layer, Context, Schema, Cause } from "effect"
 import { join } from "node:path"
 import { TeamID, EngineerID } from "./types"
 import { GIT_BRANCH_PREFIX } from "./constants"
+import { Instance } from "@/project/instance"
+
+// Resolve the project root for git operations.
+// Prefers Instance.directory (the active project root from ALS) so that
+// commands work even if the host process was launched from a non-repo cwd.
+// Falls back to process.cwd() when Instance ALS is unavailable (e.g. unit tests
+// that operate on an ad-hoc repo with `process.chdir`).
+const projectRoot = (): string => {
+  try {
+    return Instance.directory
+  } catch {
+    return process.cwd()
+  }
+}
 
 // --- Errors ---
 
@@ -86,10 +100,11 @@ const branchName = (teamID: TeamID, engineerID: EngineerID) =>
 const execGit = (args: string[], cwd?: string) =>
   Effect.try({
     try: () => {
+      const effectiveCwd = cwd ?? projectRoot()
       const proc = Bun.spawnSync(["git", ...args], {
         stdout: "pipe",
         stderr: "pipe",
-        ...(cwd ? { cwd } : {}),
+        cwd: effectiveCwd,
       })
       const stdout = new TextDecoder().decode(proc.stdout)
       const stderr = new TextDecoder().decode(proc.stderr)

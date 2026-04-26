@@ -20,6 +20,7 @@ import { buildDissolveSummary } from "../team/dissolve-summary"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { execSync } from "node:child_process"
+import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "tool.team" })
 // Priority translation: 4-tier (tool) -> 3-tier (mailbox).
@@ -122,6 +123,23 @@ export const TeamCreateTool = Tool.define(
           const isLead = yield* coordinator.isLead(ctx.sessionID)
           if (isLead) {
             return yield* Effect.fail(new Error("A team already exists for this session"))
+          }
+
+          // Eagerly verify the project directory is a git repository.
+          // Without this, engineer worktree creation fails later with a
+          // mysterious "killed by coordinator" symptom.
+          const projectDir = Instance.directory
+          const gitCheck = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], {
+            cwd: projectDir,
+            stdout: "pipe",
+            stderr: "pipe",
+          })
+          if (gitCheck.exitCode !== 0) {
+            return yield* Effect.fail(
+              new Error(
+                `team_create requires a git repository. Current directory: ${projectDir}. Please run opencode from inside a git project.`,
+              ),
+            )
           }
 
           // Start the team daemon (ensures event subscriptions are active)
