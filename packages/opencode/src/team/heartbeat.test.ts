@@ -200,16 +200,14 @@ describe("HeartbeatMonitor", () => {
   })
 
   test("checkHealth detects stuck engineer after ENGINEER_MAX_IDLE", async () => {
-    engineers.set(ENG_A, makeSlot())
+    // Source of liveness is the engineer slot's `lastHeartbeat` in DB
+    // (not the in-memory health record), so the test must age the slot
+    // to trigger the stuck threshold.
+    engineers.set(ENG_A, makeSlot({ lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000 }))
 
     const service = await runWith(Effect.gen(function* () {
       return yield* HeartbeatService
     }))
-
-    await runWith(service.recordHeartbeat(ENG_A))
-
-    const health = service.getHealth(ENG_A)!
-    health.lastHeartbeat = Date.now() - ENGINEER_MAX_IDLE - 1000
 
     const results = await runWith(service.checkHealth(TEAM_ID))
 
@@ -220,17 +218,21 @@ describe("HeartbeatMonitor", () => {
   })
 
   test("checkHealth marks engineer dead after 3 stuck cycles", async () => {
-    engineers.set(ENG_A, makeSlot())
+    engineers.set(ENG_A, makeSlot({ lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000 }))
 
     const service = await runWith(Effect.gen(function* () {
       return yield* HeartbeatService
     }))
 
-    await runWith(service.recordHeartbeat(ENG_A))
-
-    const health = service.getHealth(ENG_A)!
-    health.lastHeartbeat = Date.now() - ENGINEER_MAX_IDLE - 1000
+    // Pre-seed stuckCount=2 in the in-memory health record; the next
+    // checkHealth tick should bump to 3 (dead).
+    const health = service.getHealth(ENG_A) ?? { stuckCount: 0 } as any
     health.stuckCount = 2
+    // Some implementations create the health entry lazily on first
+    // checkHealth — ensure a record exists by recording a heartbeat first.
+    await runWith(service.recordHeartbeat(ENG_A))
+    const h2 = service.getHealth(ENG_A)!
+    h2.stuckCount = 2
 
     const results = await runWith(service.checkHealth(TEAM_ID))
 

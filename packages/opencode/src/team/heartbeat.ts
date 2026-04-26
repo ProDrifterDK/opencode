@@ -126,7 +126,18 @@ export const layer = Layer.effect(
 
         for (const eng of engineers) {
           const health = getOrCreateHealth(eng.engineerID)
-          const idleMs = now - health.lastHeartbeat
+          // Source of truth for liveness is the engineer slot's
+          // `lastHeartbeat` in the DB — refreshed every
+          // HEARTBEAT_UPDATE_INTERVAL by `updateHeartbeatsLoop`. The
+          // in-memory `health.lastHeartbeat` is only updated by
+          // `recordHeartbeat`, which has no production caller, so using
+          // it here marked every engineer dead after ENGINEER_MAX_IDLE
+          // and the heartbeat sweep reaped them mid-task. Keeping the
+          // in-memory mirror in sync with the DB row preserves the
+          // existing field for the health-output struct without changing
+          // the public shape.
+          health.lastHeartbeat = eng.lastHeartbeat
+          const idleMs = now - eng.lastHeartbeat
 
           if (health.backoffUntil && now < health.backoffUntil) {
             results.push(health)
@@ -137,6 +148,12 @@ export const layer = Layer.effect(
             health.isStuck = true
             health.stuckCount++
             health.isDead = health.stuckCount >= 3
+          } else {
+            // Healthy heartbeat → reset stuck/dead state so a transient
+            // late update doesn't accumulate toward a kill.
+            health.isStuck = false
+            health.stuckCount = 0
+            health.isDead = false
           }
 
           results.push(health)
