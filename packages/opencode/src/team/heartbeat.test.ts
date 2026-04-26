@@ -88,7 +88,7 @@ const memCoordinator = SessionCoordinatorService.of({
     Effect.sync(() => {
       const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
       if (options?.liveOnly) {
-        return slots.filter((s) => s.state === "working" || s.state === "blocked")
+        return slots.filter((s) => s.state !== "failed")
       }
       return slots
     }),

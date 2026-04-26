@@ -178,7 +178,7 @@ const memCoordinator = SessionCoordinatorService.of({
     Effect.sync(() => {
       const slots = [...engineers.values()].filter((e) => e.teamID === teamID)
       if (options?.liveOnly) {
-        return slots.filter((s) => s.state === "working" || s.state === "blocked")
+        return slots.filter((s) => s.state !== "failed")
       }
       return slots
     }),
@@ -1490,14 +1490,10 @@ describe("Team Lifecycle Integration", () => {
     })
 
     test("runDiagnostic on active team with one dead + idle peer does NOT trigger all-failed", async () => {
-      // ENG_A crashed; ENG_B is idle (just completed via team_report).
-      // Pre-fix: liveOnly was missing, the remaining count was 1
-      // (ENG_B), so the check returned 1 — but if ENG_B were missing
-      // (count 0) the lead would get a false all-failed. The new
-      // liveOnly filter excludes idle engineers from the live roster
-      // so the remaining count drops to 0, but the team is active and
-      // we DO want the urgent in this case (genuine all-failed when no
-      // engineer is alive). Verify the kill happens and mailbox fires.
+      // ENG_A is dead and holds task_1; ENG_B is idle (free). The
+      // diagnostic's reassign branch matches first and hands task_1 to
+      // ENG_B, so the liveOnly check is never reached. Test stays valid
+      // under both old and new liveOnly semantics.
       engineers.set(ENG_A, makeSlot({
         engineerID: ENG_A,
         currentTask: "task_1" as TaskBoardID,
@@ -1527,11 +1523,66 @@ describe("Team Lifecycle Integration", () => {
       expect(result.action).toBe("reassigned")
       expect(result.taskReassignedTo).toBe(ENG_B)
     })
+
+    test("runDiagnostic with one dead engineer + idle peers (no task to reassign) does NOT fire all-failed urgent", async () => {
+      // Regression for the bug where a heartbeat-killed engineer with
+      // no currentTask would skip the reassign branch and hit the
+      // liveOnly check. If the surviving siblings were still in their
+      // post-spawn idle window, the old liveOnly filter (working|blocked
+      // only) reported 0 alive → fired a false all-engineers-failed
+      // urgent even though the team had healthy engineers. With idle
+      // counted as alive the urgent must not fire.
+      engineers.set(ENG_A, makeSlot({
+        engineerID: ENG_A,
+        currentTask: null,
+        state: "idle",
+      }))
+      engineers.set(ENG_B, makeSlot({
+        engineerID: ENG_B,
+        sessionID: "sess_eng_b" as SessionID,
+        name: "engineer-b",
+        state: "idle",
+      }))
+      engineers.set(ENG_C, makeSlot({
+        engineerID: ENG_C,
+        sessionID: "sess_eng_c" as SessionID,
+        name: "engineer-c",
+        state: "idle",
+      }))
+      teams.set(TEAM_ID, makeTeam({ engineerCount: 3 }))
+
+      const service = await runHeartbeat(Effect.gen(function* () {
+        return yield* HeartbeatService
+      }))
+
+      await runHeartbeat(service.recordHeartbeat(ENG_A))
+      const health = service.getHealth(ENG_A)!
+      health.isDead = true
+      health.isStuck = true
+      health.stuckCount = 3
+
+      const before = mailboxStore.size
+      const result = await runHeartbeat(service.runDiagnostic(ENG_A, TEAM_ID))
+
+      // No task to reassign and idle peers are alive → killed action,
+      // not all-failed; no urgent mail.
+      expect(result.action).toBe("killed")
+      const allFailedMsgs = [...mailboxStore.values()].filter(
+        (m) => m.type === "all-engineers-failed",
+      )
+      expect(allFailedMsgs).toHaveLength(0)
+      expect(mailboxStore.size).toBe(before)
+    })
   })
 
   // ── Bug 3 regression: listTeamEngineers liveOnly filter ──────────────
   describe("listTeamEngineers liveOnly", () => {
-    test("liveOnly excludes idle, failed engineers", async () => {
+    test("liveOnly excludes only failed engineers (idle/working/blocked are alive)", async () => {
+      // Idle engineers are alive: a just-spawned engineer is idle until
+      // it picks its first task, and a just-completed engineer is idle
+      // after team_report. Treating idle as dead caused a false
+      // all-engineers-failed urgent when one peer crashed before its
+      // siblings transitioned out of post-spawn idle.
       teams.set(TEAM_ID, makeTeam({ engineerCount: 4 }))
       engineers.set(ENG_A, makeSlot({ engineerID: ENG_A, state: "working" }))
       engineers.set(ENG_B, makeSlot({
@@ -1556,9 +1607,9 @@ describe("Team Lifecycle Integration", () => {
       const live = await Effect.runPromise(
         memCoordinator.listTeamEngineers(TEAM_ID, { liveOnly: true }),
       )
-      expect(live).toHaveLength(2)
+      expect(live).toHaveLength(3)
       const liveIds = live.map((s) => s.engineerID).sort()
-      expect(liveIds).toEqual([ENG_A, ENG_C].sort())
+      expect(liveIds).toEqual([ENG_A, ENG_B, ENG_C].sort())
     })
 
     test("liveOnly: false (default) returns all engineers", async () => {

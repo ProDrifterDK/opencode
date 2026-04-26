@@ -477,12 +477,18 @@ export const layer = Layer.effect(
           Effect.map((rows) => {
             const slots = rows.map(rowToSlot)
             if (options?.liveOnly) {
-              // Live engineers are those still doing or about to do work.
-              // Idle engineers may have just finished their task via
-              // team_report; failed/terminated engineers are gone. Both
-              // are excluded so heartbeat-driven "all engineers failed"
-              // checks don't fire transiently during dissolve.
-              return slots.filter((s) => s.state === "working" || s.state === "blocked")
+              // Live = engineer slot has not failed. Excluding only
+              // "failed" covers all the cases where the subprocess is
+              // still around to pick up reassigned work:
+              //   - "idle"    just-spawned (haven't picked task yet) OR
+              //               just-completed via team_report
+              //   - "working" actively running a task
+              //   - "blocked" waiting on a dependency
+              // The heartbeat-driven "all-engineers-failed" check uses
+              // this filter; treating idle as alive prevents spurious
+              // urgents when a single engineer dies while siblings are
+              // still in their post-spawn idle window.
+              return slots.filter((s) => s.state !== "failed")
             }
             return slots
           }),
