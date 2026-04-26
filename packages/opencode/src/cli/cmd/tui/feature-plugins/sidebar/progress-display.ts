@@ -51,6 +51,14 @@ export function progressDisplayController(
   }
 
   function push(text: string | undefined) {
+    // No-op when the incoming text matches what is already displayed.
+    // The reactive layer (Solid createEffect) re-runs on any slot field
+    // change — even ones unrelated to progressText. Without this guard
+    // every state change would refresh `lastShownAt` and re-trigger the
+    // recency-based spinner for an engineer that has not actually made
+    // any progress.
+    if (text === currentText && queued === undefined) return
+
     const now = Date.now()
     const elapsed = now - lastShownAt
 

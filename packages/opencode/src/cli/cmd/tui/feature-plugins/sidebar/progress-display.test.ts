@@ -186,4 +186,24 @@ describe("progressDisplayController", () => {
 
     expect(t2).toBeGreaterThan(t1)
   })
+
+  test("duplicate push of currentText does not refresh updatedAt", () => {
+    // Reactive layer (Solid createEffect) re-runs whenever any tracked
+    // slot field changes. The controller must ignore pushes where the
+    // text matches what is already displayed — otherwise unrelated
+    // state changes would refresh `lastShownAt` and re-trigger the
+    // recency-based spinner for an engineer that has not actually made
+    // any progress.
+    const calls: string[] = []
+    const ctrl = progressDisplayController(undefined, (t) => calls.push(t ?? ""))
+
+    ctrl.push("Thinking...")
+    const initialUpdatedAt = ctrl.getUpdatedAt()
+
+    advanceTime(MIN_DWELL_MS + 5000) // way past the dwell window
+    ctrl.push("Thinking...") // duplicate — should be ignored
+
+    expect(calls).toEqual(["Thinking..."]) // onChange fired only once
+    expect(ctrl.getUpdatedAt()).toBe(initialUpdatedAt) // timestamp not refreshed
+  })
 })
