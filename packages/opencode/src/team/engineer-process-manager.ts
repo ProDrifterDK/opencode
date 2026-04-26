@@ -23,7 +23,7 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { Log } from "@/util"
 import { sanitizedProcessEnv } from "@opencode-ai/core/util/opencode-process"
 import type { EngineerID, TeamID } from "./types"
-import { readEngineerEvents, drainEngineerStderr } from "./engineer-event-reader"
+import { readEngineerEvents, drainEngineerStderr, engineerStderrLogger } from "./engineer-event-reader"
 import { ENGINEER_KILL_TIMEOUT_MS } from "./constants"
 
 const log = Log.create({ service: "team.engineer-process-manager" })
@@ -252,7 +252,10 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
             void readEngineerEvents(stdout)
           }
           if (stderr && typeof stderr.getReader === "function") {
-            void drainEngineerStderr(stderr)
+            // Route engineer stderr through the lead's structured Log so
+            // crash messages land in the main log file (under
+            // service=engineer-stderr) instead of the lead's TUI.
+            void drainEngineerStderr(stderr, engineerStderrLogger(engineerID))
           }
 
           log.info("engineer subprocess spawned", {

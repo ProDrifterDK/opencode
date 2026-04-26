@@ -222,16 +222,24 @@ export async function readEngineerEvents(
 }
 
 /**
- * Drain a ReadableStream of bytes to `process.stderr`. The lead's
- * skip-permissions auto-replier already writes warnings/errors to
- * stderr from inside the engineer process; this hop just keeps the OS
- * pipe buffer empty so the engineer doesn't block on a full stderr.
+ * Drain a ReadableStream of bytes from an engineer subprocess. The
+ * default sink is a no-op that simply consumes the bytes — this keeps
+ * the OS pipe buffer empty so the engineer doesn't block on a full
+ * stderr, but does NOT forward those bytes to the lead's
+ * `process.stderr`. The lead typically runs as a TUI; writing raw
+ * stderr bytes there corrupts the curses-style UI with stack-trace
+ * fragments and bundled source paths.
+ *
+ * Callers that want to capture engineer stderr (recommended) should
+ * pass an explicit sink built from `engineerStderrLogger(engineerID)`,
+ * which buffers lines and forwards them through the lead's structured
+ * `Log` so they land in the main log file under `service=engineer-stderr`.
  *
  * Returns a promise that resolves when the stream closes. Never throws.
  */
 export async function drainEngineerStderr(
   stderr: ReadableStream<Uint8Array>,
-  sink: { write: (chunk: Uint8Array) => unknown } = process.stderr,
+  sink: { write: (chunk: Uint8Array) => unknown } = NOOP_STDERR_SINK,
 ): Promise<void> {
   const reader = stderr.getReader()
   try {
@@ -241,10 +249,17 @@ export async function drainEngineerStderr(
       try {
         sink.write(value)
       } catch (err) {
-        // If the lead's stderr is closed there's nothing useful to do.
+        // If the sink is broken there's nothing useful to do.
         // Keep draining the source so the engineer doesn't block.
         log.warn("engineer stderr sink write failed", { error: String(err) })
       }
+    }
+    // Let line-buffered sinks flush a final partial line on close.
+    try {
+      const flushable = sink as { flush?: () => unknown }
+      if (typeof flushable.flush === "function") flushable.flush()
+    } catch (err) {
+      log.warn("engineer stderr sink flush failed", { error: String(err) })
     }
   } catch (err) {
     log.warn("engineer stderr drain stopped on error", { error: String(err) })
@@ -254,6 +269,54 @@ export async function drainEngineerStderr(
     } catch {
       // ignore
     }
+  }
+}
+
+const NOOP_STDERR_SINK = {
+  write: (_chunk: Uint8Array) => {
+    // Intentionally empty: drains the pipe without forwarding.
+  },
+}
+
+/**
+ * Build a stderr sink that decodes UTF-8 bytes, splits on newlines,
+ * and emits each non-empty line via the lead's structured logger at
+ * WARN level. Lines are tagged with the engineer's identity so they
+ * can be grepped easily out of the main log.
+ *
+ * The sink is line-buffered: a partial trailing line is held until the
+ * next chunk completes it, or until `flush()` is called when the
+ * stream closes (drainEngineerStderr does this automatically).
+ */
+export function engineerStderrLogger(engineerID: string): {
+  write: (chunk: Uint8Array) => void
+  flush: () => void
+} {
+  const stderrLog = Log.create({ service: "engineer-stderr" })
+  const decoder = new TextDecoder("utf-8")
+  let buffer = ""
+  const emit = (line: string) => {
+    if (line.length === 0) return
+    stderrLog.warn("engineer stderr", { engineerID, line })
+  }
+  return {
+    write(chunk: Uint8Array) {
+      buffer += decoder.decode(chunk, { stream: true })
+      let idx = buffer.indexOf("\n")
+      while (idx !== -1) {
+        const line = buffer.slice(0, idx).replace(/\r$/, "")
+        emit(line)
+        buffer = buffer.slice(idx + 1)
+        idx = buffer.indexOf("\n")
+      }
+    },
+    flush() {
+      buffer += decoder.decode()
+      if (buffer.length > 0) {
+        emit(buffer.replace(/\r$/, ""))
+        buffer = ""
+      }
+    },
   }
 }
 
