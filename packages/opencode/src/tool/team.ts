@@ -45,7 +45,7 @@ function translatePriority(priority: ToolPriority): MailboxPriority {
 const toolErrorBoundary = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
     Effect.tapError((error) =>
-      Effect.sync(() => console.error("[toolErrorBoundary]", error)),
+      Effect.sync(() => log.warn("tool error", { error: String(error) })),
     ),
   )
 

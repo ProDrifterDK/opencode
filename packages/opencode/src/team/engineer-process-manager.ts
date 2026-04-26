@@ -218,7 +218,11 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
             engineerID,
             sessionID,
             worktreePath,
-            cmd: cmd[0],
+            cmd: cmd.join(" "),
+            firstArgs: args.slice(0, 5).join(" "),
+            execPath: process.execPath,
+            argv0: process.argv[0],
+            argv1: process.argv[1] ?? "<undef>",
           })
 
           const subprocess = Bun.spawn(args, {
