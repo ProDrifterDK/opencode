@@ -36,6 +36,8 @@ export const Event = {
       taskID: Schema.String,
       taskTitle: Schema.String,
       taskDescription: Schema.String,
+      fileScope: Schema.optional(Schema.Array(Schema.String)),
+      coordinationWarnings: Schema.optional(Schema.Array(Schema.String)),
       providerID: Schema.optional(Schema.String),
       modelID: Schema.optional(Schema.String),
       agentName: Schema.optional(Schema.String),
@@ -52,6 +54,9 @@ export const Event = {
       teamID: Schema.String,
       engineerID: Schema.String,
       taskId: Schema.String,
+      taskTitle: Schema.optional(Schema.String),
+      engineerName: Schema.optional(Schema.String),
+      summary: Schema.optional(Schema.String),
     }),
   ),
 

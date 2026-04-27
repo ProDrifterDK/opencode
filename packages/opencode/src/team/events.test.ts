@@ -84,6 +84,17 @@ describe("TeamEvents", () => {
       oldStatus: "pending",
     })
     expect(parsed3.success).toBe(true)
+
+    const engineerCompletedProps = Event.EngineerCompleted.properties
+    const parsed4 = safeParse(engineerCompletedProps, {
+      teamID: "team_x",
+      engineerID: "eng_frontend",
+      taskId: "task_1",
+      taskTitle: "Frontend Review",
+      engineerName: "engineer-frontend",
+      summary: "Report written to .tmp/report.md",
+    })
+    expect(parsed4.success).toBe(true)
   })
 
   test("Event payloads reject invalid data", () => {

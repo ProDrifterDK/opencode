@@ -49,6 +49,23 @@ describe("decodeEventLine", () => {
     expect(out!.type).toBe("engineer.spawned")
   })
 
+  test("accepts enriched engineer.completed report payload", () => {
+    const line = JSON.stringify({
+      type: "engineer.completed",
+      properties: {
+        teamID: "t1",
+        engineerID: "e1",
+        taskId: "task1",
+        taskTitle: "Frontend Review",
+        engineerName: "engineer-frontend",
+        summary: "Report written to .tmp/report.md",
+      },
+    })
+    const out = decodeEventLine(line)
+    expect(out).not.toBeNull()
+    expect(out!.type).toBe("engineer.completed")
+  })
+
   test("rejects malformed JSON", () => {
     const errors: string[] = []
     const out = decodeEventLine("{not-json", { onError: (r) => errors.push(r) })
