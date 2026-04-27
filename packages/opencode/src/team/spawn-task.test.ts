@@ -25,6 +25,34 @@ describe("team_spawn task matching", () => {
     })).toEqual({ kind: "claim", task })
   })
 
+
+
+  test("claims decomposed task when file scope order differs", () => {
+    const task = { ...base, file_scope: '["src/b.ts","src/a.ts"]' }
+
+    expect(resolveSpawnTaskCandidate({
+      tasks: [task],
+      task: {
+        title: "Frontend Code Quality Review",
+        description: "Review the frontend",
+        fileScope: '["src/a.ts","src/b.ts"]',
+      },
+    })).toEqual({ kind: "claim", task })
+  })
+
+  test("treats null and empty file scopes as the same unscoped task", () => {
+    const task = { ...base, file_scope: null }
+
+    expect(resolveSpawnTaskCandidate({
+      tasks: [task],
+      task: {
+        title: "Frontend Code Quality Review",
+        description: "Review the frontend",
+        fileScope: "[]",
+      },
+    })).toEqual({ kind: "claim", task })
+  })
+
   test("creates a new task when no pending unassigned task matches exactly", () => {
     expect(resolveSpawnTaskCandidate({
       tasks: [{ ...base, status: "completed" }],
