@@ -18,7 +18,7 @@ export function buildTeamCompleteMessage(input: {
   return [
     `✅ Team ${input.teamID} complete`,
     `All ${input.completedTasks} task${input.completedTasks === 1 ? "" : "s"} completed.`,
-    `All engineers are idle. Review the reports, then run team_commit or team_dissolve when ready.`,
+    `All engineers are idle. Use team_tasks(showAll: true) to get completed task IDs, review reports and changed files, then run team_commit with reviewedTaskIDs for the tasks you approved or team_dissolve when ready.`,
   ].join("\n")
 }
 

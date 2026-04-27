@@ -151,7 +151,7 @@ const TOOL_DESCRIPTIONS = {
   team_resume:
     "Re-attach a team that was left in `terminated` state (daemon shut down before dissolve). Re-spawns engineer subprocesses for active tasks and resets any in-progress tasks back to pending. Lead-only.",
   team_commit:
-    "Squash-merge each completed engineer's branch into the lead's current branch using the engineer's task title as the commit message. Conflicts are surfaced and require manual resolution. Lead-only.",
+    "Squash-merge reviewed completed engineer branches into the lead's current branch. Only reviewedTaskIDs are merged; unreviewed completed tasks are skipped. Lead-only.",
 } as const
 
 export const TeamCreateTool = Tool.define(
@@ -1189,6 +1189,10 @@ export const TeamResumeTool = Tool.define(
 
 const teamCommitParams = Schema.Struct({
   teamID: Schema.String.annotate({ description: "Team ID from team_create" }),
+  reviewedTaskIDs: Schema.Array(Schema.String).pipe(
+    Schema.optional,
+    Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>)),
+  ).annotate({ description: "Completed task IDs the Lead has reviewed and approved for merge; only these tasks are merged" }),
 })
 
 export const TeamCommitTool = Tool.define(
@@ -1215,12 +1219,32 @@ export const TeamCommitTool = Tool.define(
           const completedTasks = allTasks.filter(
             (t) => t.status === "completed" && t.assigned_engineer_id !== null,
           )
+          const completedTaskIDs = completedTasks.map((task) => task.id as string)
+          const reviewedTaskIDs = [...new Set(params.reviewedTaskIDs)]
+          const completedSet = new Set(completedTaskIDs)
+          const reviewedSet = new Set(reviewedTaskIDs)
+          const unknownReviews = reviewedTaskIDs.filter((taskID) => !completedSet.has(taskID))
+          const unreviewedTasks = completedTasks.filter((task) => !reviewedSet.has(task.id as string))
+          const reviewedTasks = completedTasks.filter((task) => reviewedSet.has(task.id as string))
+
+          if ((completedTaskIDs.length > 0 && reviewedTaskIDs.length === 0) || unknownReviews.length > 0) {
+            return yield* Effect.fail(
+              new Error([
+                "Review gate blocked team_commit.",
+                "Review completed engineer reports and changed files before merging.",
+                completedTaskIDs.length > 0 ? `Completed task IDs: ${completedTaskIDs.join(", ")}` : "Completed task IDs: (none)",
+                completedTaskIDs.length > 0 && reviewedTaskIDs.length === 0 ? `Missing reviewedTaskIDs: ${completedTaskIDs.join(", ")}` : "Missing reviewedTaskIDs: (none)",
+                unknownReviews.length > 0 ? `Unknown reviewedTaskIDs: ${unknownReviews.join(", ")}` : "Unknown reviewedTaskIDs: (none)",
+                "Re-run team_commit with reviewedTaskIDs set to the completed task IDs you approved.",
+              ].join("\n")),
+            )
+          }
 
           // Also check engineers listed on the team to handle the "skipped" reporting
           const engineers = yield* coordinator.listTeamEngineers(teamID)
 
           const merged: { engineerID: string; taskTitle: string }[] = []
-          const conflicts: { engineerID: string; branch: string; files: readonly string[] }[] = []
+          const conflicts: { engineerID: string; taskID: string; taskTitle: string; branch: string; files: readonly string[] }[] = []
           const skipped: { engineerID: string; reason: string }[] = []
 
           // Collect engineers that are not idle/completed for the skipped list
@@ -1237,7 +1261,7 @@ export const TeamCommitTool = Tool.define(
           }
 
           // Process completed tasks — stop on first conflict
-          for (const task of completedTasks) {
+          for (const task of reviewedTasks) {
             const engineerID = task.assigned_engineer_id!
 
             const mergeResult = yield* gitManager
@@ -1248,6 +1272,9 @@ export const TeamCommitTool = Tool.define(
               })
               .pipe(
                 Effect.map(() => ({ ok: true as const })),
+                // GitManager.mergeBranch aborts the failed squash with
+                // `git reset --merge` before throwing MergeConflictError.
+                // team_commit only owns the handoff/reporting layer here.
                 Effect.catchTag("MergeConflictError", (err) =>
                   Effect.succeed({
                     ok: false as const,
@@ -1260,7 +1287,7 @@ export const TeamCommitTool = Tool.define(
             if (mergeResult.ok) {
               merged.push({ engineerID, taskTitle: task.title })
             } else {
-              conflicts.push({ engineerID, branch: mergeResult.branch, files: mergeResult.files })
+              conflicts.push({ engineerID, taskID: task.id as string, taskTitle: task.title, branch: mergeResult.branch, files: mergeResult.files })
               // Stop on first conflict — predictable behavior; user resolves and re-runs
               break
             }
@@ -1280,6 +1307,9 @@ export const TeamCommitTool = Tool.define(
           if (skipped.length > 0) {
             lines.push(`Skipped ${skipped.length}: ${skipped.map((s) => `${s.engineerID} (${s.reason})`).join(", ")}`)
           }
+          if (unreviewedTasks.length > 0) {
+            lines.push(`Not reviewed ${unreviewedTasks.length}: ${unreviewedTasks.map((task) => `${task.id as string} ("${task.title}")`).join(", ")}`)
+          }
 
           if (conflicts.length > 0) {
             lines.push(`Conflicts ${conflicts.length}:`)
@@ -1288,7 +1318,12 @@ export const TeamCommitTool = Tool.define(
               if (c.files.length > 0) {
                 lines.push(`    Conflicting files: ${c.files.join(", ")}`)
               }
-              lines.push(`    Resolve conflicts manually, then re-run team_commit.`)
+              lines.push(`    Engineer conflict handoff:`)
+              lines.push(`      Suggested task: Resolve merge conflict for ${c.taskID} ("${c.taskTitle}")`)
+              lines.push(`      Assign to: ${c.engineerID}`)
+              lines.push(`      File scope: ${c.files.length > 0 ? c.files.join(", ") : "(inspect git status for conflicted files)"}`)
+              lines.push(`      Context: merge ${c.branch} with the Lead branch, preserve both reviewed changes, coordinate with overlapping engineers via team_message, then report completed.`)
+              lines.push(`      After review, re-run team_commit with the remaining reviewedTaskIDs only.`)
             }
           } else {
             lines.push(`Conflicts 0`)
@@ -1299,8 +1334,10 @@ export const TeamCommitTool = Tool.define(
             output: lines.join("\n"),
             metadata: {
               teamID: params.teamID,
+              reviewedTaskIDs,
+              unreviewedTaskIDs: unreviewedTasks.map((task) => task.id as string),
               merged: merged.map((m) => m.engineerID),
-              conflicts: conflicts.map((c) => ({ engineerID: c.engineerID, branch: c.branch })),
+              conflicts: conflicts.map((c) => ({ engineerID: c.engineerID, taskID: c.taskID, taskTitle: c.taskTitle, branch: c.branch, files: c.files })),
               skipped: skipped.map((s) => s.engineerID),
             },
           }

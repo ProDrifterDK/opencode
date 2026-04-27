@@ -83,7 +83,7 @@ const makeGitManagerStub = (
 
 // ─── The execute logic under test (mirrors TeamCommitTool exactly) ──────────
 
-const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
+const teamCommitExecute = (params: { teamID: string; reviewedTaskIDs?: readonly string[] }, sessionID: SessionID) =>
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinatorService
     const gitManager = yield* GitManagerService
@@ -100,11 +100,31 @@ const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
     const completedTasks = (allTasks as unknown as TaskRow[]).filter(
       (t) => t.status === "completed" && t.assigned_engineer_id !== null,
     )
+    const completedTaskIDs = completedTasks.map((task) => task.id as string)
+    const reviewedTaskIDs = [...new Set(params.reviewedTaskIDs ?? [])]
+    const completedSet = new Set(completedTaskIDs)
+    const reviewedSet = new Set(reviewedTaskIDs)
+    const unknownReviews = reviewedTaskIDs.filter((taskID) => !completedSet.has(taskID))
+    const unreviewedTasks = completedTasks.filter((task) => !reviewedSet.has(task.id as string))
+    const reviewedTasks = completedTasks.filter((task) => reviewedSet.has(task.id as string))
+
+    if ((completedTaskIDs.length > 0 && reviewedTaskIDs.length === 0) || unknownReviews.length > 0) {
+      return yield* Effect.fail(
+        new Error([
+          "Review gate blocked team_commit.",
+          "Review completed engineer reports and changed files before merging.",
+          completedTaskIDs.length > 0 ? `Completed task IDs: ${completedTaskIDs.join(", ")}` : "Completed task IDs: (none)",
+          completedTaskIDs.length > 0 && reviewedTaskIDs.length === 0 ? `Missing reviewedTaskIDs: ${completedTaskIDs.join(", ")}` : "Missing reviewedTaskIDs: (none)",
+          unknownReviews.length > 0 ? `Unknown reviewedTaskIDs: ${unknownReviews.join(", ")}` : "Unknown reviewedTaskIDs: (none)",
+          "Re-run team_commit with reviewedTaskIDs set to the completed task IDs you approved.",
+        ].join("\n")),
+      )
+    }
 
     const engineers = yield* coordinator.listTeamEngineers(teamID)
 
     const merged: { engineerID: string; taskTitle: string }[] = []
-    const conflicts: { engineerID: string; branch: string; files: readonly string[] }[] = []
+    const conflicts: { engineerID: string; taskID: string; taskTitle: string; branch: string; files: readonly string[] }[] = []
     const skipped: { engineerID: string; reason: string }[] = []
 
     for (const eng of engineers as unknown as EngineerRow[]) {
@@ -119,7 +139,7 @@ const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
       }
     }
 
-    for (const task of completedTasks) {
+    for (const task of reviewedTasks) {
       const engineerID = task.assigned_engineer_id!
 
       const mergeResult = yield* gitManager
@@ -142,7 +162,7 @@ const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
       if (mergeResult.ok) {
         merged.push({ engineerID, taskTitle: task.title })
       } else {
-        conflicts.push({ engineerID, branch: mergeResult.branch, files: mergeResult.files })
+        conflicts.push({ engineerID, taskID: task.id as string, taskTitle: task.title, branch: mergeResult.branch, files: mergeResult.files })
         break
       }
     }
@@ -161,6 +181,9 @@ const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
     if (skipped.length > 0) {
       lines.push(`Skipped ${skipped.length}: ${skipped.map((s) => `${s.engineerID} (${s.reason})`).join(", ")}`)
     }
+    if (unreviewedTasks.length > 0) {
+      lines.push(`Not reviewed ${unreviewedTasks.length}: ${unreviewedTasks.map((task) => `${task.id as string} ("${task.title}")`).join(", ")}`)
+    }
 
     if (conflicts.length > 0) {
       lines.push(`Conflicts ${conflicts.length}:`)
@@ -169,7 +192,12 @@ const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
         if (c.files.length > 0) {
           lines.push(`    Conflicting files: ${c.files.join(", ")}`)
         }
-        lines.push(`    Resolve conflicts manually, then re-run team_commit.`)
+        lines.push(`    Engineer conflict handoff:`)
+        lines.push(`      Suggested task: Resolve merge conflict for ${c.taskID} ("${c.taskTitle}")`)
+        lines.push(`      Assign to: ${c.engineerID}`)
+        lines.push(`      File scope: ${c.files.length > 0 ? c.files.join(", ") : "(inspect git status for conflicted files)"}`)
+        lines.push(`      Context: merge ${c.branch} with the Lead branch, preserve both reviewed changes, coordinate with overlapping engineers via team_message, then report completed.`)
+        lines.push(`      After review, re-run team_commit with the remaining reviewedTaskIDs only.`)
       }
     } else {
       lines.push(`Conflicts 0`)
@@ -180,8 +208,10 @@ const teamCommitExecute = (params: { teamID: string }, sessionID: SessionID) =>
       output: lines.join("\n"),
       metadata: {
         teamID: params.teamID,
+        reviewedTaskIDs,
+        unreviewedTaskIDs: unreviewedTasks.map((task) => task.id as string),
         merged: merged.map((m) => m.engineerID),
-        conflicts: conflicts.map((c) => ({ engineerID: c.engineerID, branch: c.branch })),
+        conflicts: conflicts.map((c) => ({ engineerID: c.engineerID, taskID: c.taskID, taskTitle: c.taskTitle, branch: c.branch, files: c.files })),
         skipped: skipped.map((s) => s.engineerID),
       },
     }
@@ -196,12 +226,13 @@ const runWith = (
   tasks: TaskRow[],
   mergeFn?: (input: MergeCall) => Effect.Effect<void, GitError | MergeConflictError>,
   leadSessionID: SessionID = LEAD_SESSION,
+  reviewedTaskIDs: readonly string[] = tasks.filter((t) => t.status === "completed" && t.assigned_engineer_id !== null).map((t) => t.id as string),
 ) => {
   const coordLayer = Layer.succeed(SessionCoordinatorService, makeCoordinatorStub(leadSessionID, engineers))
   const gitLayer = Layer.succeed(GitManagerService, makeGitManagerStub(mergeFn))
   const taskLayer = Layer.succeed(TaskBoardService, makeTaskBoardStub(tasks))
   const testLayer = Layer.merge(Layer.merge(coordLayer, gitLayer), taskLayer)
-  return Effect.provide(teamCommitExecute({ teamID }, sessionID), testLayer).pipe(
+  return Effect.provide(teamCommitExecute({ teamID, reviewedTaskIDs }, sessionID), testLayer).pipe(
     Effect.runPromise,
   )
 }
@@ -246,11 +277,66 @@ describe("TeamCommitTool execute (Phase 3: squash-merge)", () => {
     expect(calls[2]).toMatchObject({ engineerID: "eng-c", message: "Wire HeartbeatMonitor" })
 
     expect(result.metadata.merged).toEqual(["eng-a", "eng-b", "eng-c"])
+    expect(result.metadata.reviewedTaskIDs).toEqual(["t1", "t2", "t3"])
     expect(result.metadata.conflicts).toHaveLength(0)
     expect(result.metadata.skipped).toHaveLength(0)
     expect(result.output).toContain("Merged 3 engineers")
     expect(result.output).toContain('"Refactor auth middleware"')
     expect(result.output).toContain("Conflicts 0")
+  })
+
+  test("review gate: blocks when reviewedTaskIDs are omitted for completed tasks", async () => {
+    const engineers = [eng("eng-a", "idle")]
+    const tasks = [task("t1", "Completed task", "eng-a")]
+    const calls: MergeCall[] = []
+
+    await expect(
+      runWith(
+        LEAD_SESSION,
+        TEAM_ID,
+        engineers,
+        tasks,
+        (input) => Effect.sync(() => { calls.push(input) }),
+        LEAD_SESSION,
+        [],
+      ),
+    ).rejects.toThrow("Missing reviewedTaskIDs: t1")
+
+    expect(calls).toHaveLength(0)
+  })
+
+  test("review gate: merges reviewed completed tasks and skips unreviewed completed tasks", async () => {
+    const engineers = [eng("eng-a", "idle"), eng("eng-b", "idle")]
+    const tasks = [
+      task("t1", "Reviewed task", "eng-a"),
+      task("t2", "Unreviewed task", "eng-b"),
+    ]
+    const calls: MergeCall[] = []
+
+    const result = await runWith(
+      LEAD_SESSION,
+      TEAM_ID,
+      engineers,
+      tasks,
+      (input) => Effect.sync(() => { calls.push(input) }),
+      LEAD_SESSION,
+      ["t1"],
+    )
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ engineerID: "eng-a", message: "Reviewed task" })
+    expect(result.metadata.merged).toEqual(["eng-a"])
+    expect(result.metadata.unreviewedTaskIDs).toEqual(["t2"])
+    expect(result.output).toContain('Not reviewed 1: t2 ("Unreviewed task")')
+  })
+
+  test("review gate: rejects reviewed IDs that are not completed tasks", async () => {
+    const engineers = [eng("eng-a", "idle")]
+    const tasks = [task("t1", "Reviewed task", "eng-a")]
+
+    await expect(
+      runWith(LEAD_SESSION, TEAM_ID, engineers, tasks, undefined, LEAD_SESSION, ["t1", "t999"]),
+    ).rejects.toThrow("Unknown reviewedTaskIDs: t999")
   })
 
   // 2. Mixed states: only completed (idle) engineers are merged; running/failed are skipped
@@ -284,7 +370,7 @@ describe("TeamCommitTool execute (Phase 3: squash-merge)", () => {
     expect(result.output).toContain("failed")
   })
 
-  // 3. Conflict path: stops on first conflict, engineer 3 not merged
+  // 3. Conflict path: stops on first conflict and hands resolution back to the engineer
   test("conflict path: stops at first conflict and reports it; remaining engineers not merged", async () => {
     const engineers = [eng("eng-a", "idle"), eng("eng-b", "idle"), eng("eng-c", "idle")]
     const tasks = [
@@ -315,11 +401,62 @@ describe("TeamCommitTool execute (Phase 3: squash-merge)", () => {
     expect(result.metadata.merged).toEqual(["eng-a"])
     expect(result.metadata.conflicts).toHaveLength(1)
     expect(result.metadata.conflicts[0].engineerID).toBe("eng-b")
+    expect(result.metadata.conflicts[0].taskID).toBe("t2")
+    expect(result.metadata.conflicts[0].taskTitle).toBe("Task B — conflicts")
+    expect(result.metadata.conflicts[0].files).toEqual(["src/foo.ts"])
     expect(result.output).toContain("Conflicts 1")
     expect(result.output).toContain("src/foo.ts")
-    expect(result.output).toContain("Resolve conflicts manually")
+    expect(result.output).toContain("Engineer conflict handoff")
+    expect(result.output).toContain("Resolve merge conflict for t2")
+    expect(result.output).toContain("Assign to: eng-b")
+    expect(result.output).toContain("coordinate with overlapping engineers via team_message")
     // eng-c should not appear in merged
     expect(result.metadata.merged).not.toContain("eng-c")
+  })
+
+  test("conflict rerun: reviewed subset can exclude already-merged tasks", async () => {
+    const engineers = [eng("eng-a", "idle"), eng("eng-b", "idle"), eng("eng-c", "idle")]
+    const tasks = [
+      task("t1", "Task A", "eng-a"),
+      task("t2", "Task B — conflicts once", "eng-b"),
+      task("t3", "Task C", "eng-c"),
+    ]
+    const calls: MergeCall[] = []
+    let conflictOnce = true
+    const mergeFn = (input: MergeCall) =>
+      Effect.sync(() => { calls.push(input) }).pipe(
+        Effect.flatMap(() => {
+          if (input.engineerID === "eng-b" && conflictOnce) {
+            conflictOnce = false
+            return Effect.fail(new MergeConflictError({
+              message: "conflict",
+              branch: "team/team_001/engineer-eng-b",
+              conflictingFiles: ["src/foo.ts"],
+            }))
+          }
+          return Effect.void
+        }),
+      )
+
+    const first = await runWith(LEAD_SESSION, TEAM_ID, engineers, tasks, mergeFn)
+
+    expect(first.metadata.merged).toEqual(["eng-a"])
+    expect(first.metadata.conflicts[0].engineerID).toBe("eng-b")
+    expect(calls.map((call) => call.engineerID as string)).toEqual(["eng-a", "eng-b"])
+
+    const second = await runWith(
+      LEAD_SESSION,
+      TEAM_ID,
+      engineers,
+      tasks,
+      mergeFn,
+      LEAD_SESSION,
+      ["t2", "t3"],
+    )
+
+    expect(second.metadata.merged).toEqual(["eng-b", "eng-c"])
+    expect(second.metadata.unreviewedTaskIDs).toEqual(["t1"])
+    expect(calls.map((call) => call.engineerID as string)).toEqual(["eng-a", "eng-b", "eng-b", "eng-c"])
   })
 
   // 4. Lead-only: non-lead session fails

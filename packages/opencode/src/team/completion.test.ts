@@ -26,7 +26,11 @@ describe("team completion detection", () => {
   })
 
   test("completion message tells lead the next action", () => {
-    expect(buildTeamCompleteMessage({ teamID: "team_1", completedTasks: 2 })).toContain("team_commit")
+    const message = buildTeamCompleteMessage({ teamID: "team_1", completedTasks: 2 })
+
+    expect(message).toContain("team_commit")
+    expect(message).toContain("reviewedTaskIDs")
+    expect(message).toContain("team_tasks")
   })
 
   test("engineer report message includes engineer, task, and summary", () => {
