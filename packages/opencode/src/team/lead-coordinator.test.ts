@@ -74,6 +74,15 @@ const makeMemoryTaskBoard = () => {
     delete: (taskId: TaskBoardID) =>
       Effect.sync(() => { tasks.delete(taskId) }),
 
+    claim: (taskId: TaskBoardID, engineerId: EngineerID) =>
+      Effect.sync(() => {
+        const existing = tasks.get(taskId)
+        if (!existing || existing.status !== "pending" || existing.assigned_engineer_id) return null
+        const updated: Task = { ...existing, status: "in-progress", assigned_engineer_id: engineerId, time_updated: Date.now() }
+        tasks.set(taskId, updated)
+        return updated
+      }),
+
     listReadyTasks: (teamId: TeamID) =>
       Effect.sync(() => {
         const all = [...tasks.values()].filter((t) => t.team_id === teamId)
@@ -158,7 +167,7 @@ describe("LeadCoordinator", () => {
       return yield* LeadCoordinatorService
     }))
 
-    const tasks = await runWith(
+    const result = await runWith(
       service.decompose({
         teamId: TEAM_ID,
         request: "implement auth",
@@ -169,6 +178,7 @@ describe("LeadCoordinator", () => {
         ],
       }),
     )
+    const tasks = result.tasks
 
     expect(tasks).toHaveLength(3)
     expect(tasks[0].title).toBe("Auth model")
@@ -180,12 +190,12 @@ describe("LeadCoordinator", () => {
     expect(tasks.every((t) => t.assigned_engineer_id === null)).toBe(true)
   })
 
-  test("decompose rejects overlapping file scopes", async () => {
+  test("decompose allows overlapping file scopes with warnings", async () => {
     const service = await runWith(Effect.gen(function* () {
       return yield* LeadCoordinatorService
     }))
 
-    const result = runWithCatch(
+    const result = await runWith(
       service.decompose({
         teamId: TEAM_ID,
         request: "broken",
@@ -196,15 +206,17 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    await expect(result).rejects.toThrow("Overlapping fileScopes detected")
+    expect(result.tasks).toHaveLength(2)
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0].message).toContain("Coordinate before editing")
   })
 
-  test("rejects fileScopes overlapping via globs (e.g. src/** vs src/auth/**)", async () => {
+  test("warns when fileScopes overlap via globs (e.g. src/** vs src/auth/**)", async () => {
     const service = await runWith(Effect.gen(function* () {
       return yield* LeadCoordinatorService
     }))
 
-    const result = runWithCatch(
+    const result = await runWith(
       service.decompose({
         teamId: "team_t1" as TeamID,
         request: "test",
@@ -215,15 +227,18 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    await expect(result).rejects.toThrow("Overlapping fileScopes detected")
+    expect(result.tasks).toHaveLength(2)
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0].task).toBe("a")
+    expect(result.warnings[0].conflictsWith).toBe("b")
   })
 
-  test("collects all overlapping pairs when 3+ subtasks overlap", async () => {
+  test("collects all overlap warnings when 3+ subtasks overlap", async () => {
     const service = await runWith(Effect.gen(function* () {
       return yield* LeadCoordinatorService
     }))
 
-    const result = runWithCatch(
+    const result = await runWith(
       service.decompose({
         teamId: "team_t2" as TeamID,
         request: "test",
@@ -235,10 +250,11 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    await expect(result).rejects.toMatchObject({
-      _tag: "FileScopeConflictError",
-      message: expect.stringMatching(/"a" vs "b"[\s\S]+"a" vs "c"/),
-    })
+    expect(result.tasks).toHaveLength(3)
+    expect(result.warnings.map((warning) => [warning.task, warning.conflictsWith])).toEqual([
+      ["a", "b"],
+      ["a", "c"],
+    ])
   })
 
   test("accepts disjoint glob fileScopes", async () => {
@@ -246,7 +262,7 @@ describe("LeadCoordinator", () => {
       return yield* LeadCoordinatorService
     }))
 
-    const tasks = await runWith(
+    const result = await runWith(
       service.decompose({
         teamId: "team_t3" as TeamID,
         request: "test",
@@ -256,7 +272,8 @@ describe("LeadCoordinator", () => {
         ],
       }),
     )
-    expect(tasks.length).toBe(2)
+    expect(result.tasks.length).toBe(2)
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("accepts single-task decompose with no pairs to compare", async () => {
@@ -264,7 +281,7 @@ describe("LeadCoordinator", () => {
       return yield* LeadCoordinatorService
     }))
 
-    const tasks = await runWith(
+    const result = await runWith(
       service.decompose({
         teamId: "team_t4" as TeamID,
         request: "test",
@@ -273,7 +290,8 @@ describe("LeadCoordinator", () => {
         ],
       }),
     )
-    expect(tasks.length).toBe(1)
+    expect(result.tasks.length).toBe(1)
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("treats empty fileScope arrays as non-overlapping", async () => {
@@ -281,7 +299,7 @@ describe("LeadCoordinator", () => {
       return yield* LeadCoordinatorService
     }))
 
-    const tasks = await runWith(
+    const result = await runWith(
       service.decompose({
         teamId: "team_t5" as TeamID,
         request: "test",
@@ -291,7 +309,8 @@ describe("LeadCoordinator", () => {
         ],
       }),
     )
-    expect(tasks.length).toBe(2)
+    expect(result.tasks.length).toBe(2)
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("assign distributes tasks to idle engineers with exclusive scopes", async () => {
@@ -318,6 +337,35 @@ describe("LeadCoordinator", () => {
     expect(assigned[0].status).toBe("in-progress")
     expect(assigned[1].assigned_engineer_id).toBe("eng_b" as EngineerID)
     expect(assigned[1].status).toBe("in-progress")
+  })
+
+  test("assign skips tasks that are no longer atomically claimable", async () => {
+    const service = await runWithBoth(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    await runWith(
+      service.decompose({
+        teamId: TEAM_ID,
+        request: "implement auth",
+        subtasks: [
+          { title: "Auth model", description: "Create auth types", files: ["src/auth/model.ts"] },
+        ],
+      }),
+    )
+
+    const ready = await runWithBoth(Effect.gen(function* () {
+      const repo = yield* TaskBoardRepoService
+      return yield* repo.listReadyTasks(TEAM_ID)
+    }))
+    await runWithBoth(Effect.gen(function* () {
+      const repo = yield* TaskBoardRepoService
+      yield* repo.update(ready[0].id, { status: "in-progress", assigned_engineer_id: "eng_other" as EngineerID })
+    }))
+
+    const assigned = await runWith(service.assign({ teamId: TEAM_ID, engineers: [makeEngineer("a")] }))
+
+    expect(assigned).toHaveLength(0)
   })
 
   test("assign respects MAX_TEAM_SIZE", async () => {
@@ -482,16 +530,18 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const reassigned = await runWith(
+    const result = await runWith(
       service.reassign({ taskId: tasks.id, toEngineer: "eng_backup" as EngineerID }),
     )
+    const reassigned = result.task
 
     expect(reassigned.assigned_engineer_id).toBe("eng_backup" as EngineerID)
     expect(reassigned.status).toBe("in-progress")
     expect(reassigned.title).toBe("Failed task")
+    expect(result.warnings).toHaveLength(0)
   })
 
-  test("reassign rejects if target engineer has file conflict", async () => {
+  test("reassign allows target engineer file conflict with warning", async () => {
     const service = await runWith(Effect.gen(function* () {
       return yield* LeadCoordinatorService
     }))
@@ -518,11 +568,13 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const result = runWithCatch(
+    const result = await runWith(
       service.reassign({ taskId: taskToReassign.id, toEngineer: "eng_backup" as EngineerID }),
     )
 
-    await expect(result).rejects.toThrow("file conflict")
+    expect(result.task.assigned_engineer_id).toBe("eng_backup" as EngineerID)
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0].conflictsWith).toBe("task_1")
   })
 
   test("validateFileScopes returns true for exclusive scopes", async () => {
@@ -723,12 +775,14 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const updated = await runWith(
+    const result = await runWith(
       service.retask({ taskId: task.id, title: "New title" }),
     )
+    const updated = result.task
 
     expect(updated.title).toBe("New title")
     expect(updated.description).toBe("desc")
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("retask updates description only", async () => {
@@ -749,12 +803,14 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const updated = await runWith(
+    const result = await runWith(
       service.retask({ taskId: task.id, description: "new desc" }),
     )
+    const updated = result.task
 
     expect(updated.description).toBe("new desc")
     expect(updated.title).toBe("My task")
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("retask updates fileScope only", async () => {
@@ -775,11 +831,13 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const updated = await runWith(
+    const result = await runWith(
       service.retask({ taskId: task.id, fileScope: ["src/b.ts"] }),
     )
+    const updated = result.task
 
     expect(updated.file_scope).toBe(JSON.stringify(["src/b.ts"]))
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("retask updates all three fields at once", async () => {
@@ -800,13 +858,15 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const updated = await runWith(
+    const result = await runWith(
       service.retask({ taskId: task.id, title: "New", description: "new desc", fileScope: ["src/c.ts"] }),
     )
+    const updated = result.task
 
     expect(updated.title).toBe("New")
     expect(updated.description).toBe("new desc")
     expect(updated.file_scope).toBe(JSON.stringify(["src/c.ts"]))
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("retask rejects when no fields provided", async () => {
@@ -908,7 +968,7 @@ describe("LeadCoordinator", () => {
     ).rejects.toMatchObject({ _tag: "LeadCoordinatorError" })
   })
 
-  test("retask rejects fileScope overlap with other active task", async () => {
+  test("retask allows fileScope overlap with other active task and warns", async () => {
     const service = await runWith(Effect.gen(function* () {
       return yield* LeadCoordinatorService
     }))
@@ -935,9 +995,13 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    await expect(
-      runWithCatch(service.retask({ taskId: taskToRetask.id, fileScope: ["src/auth.ts"] })),
-    ).rejects.toMatchObject({ _tag: "FileScopeConflictError" })
+    const result = await runWith(
+      service.retask({ taskId: taskToRetask.id, fileScope: ["src/auth.ts"] }),
+    )
+
+    expect(result.task.file_scope).toBe(JSON.stringify(["src/auth.ts"]))
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0].conflictsWith).toBe("task_1")
   })
 
   test("retask succeeds fileScope with no other active tasks", async () => {
@@ -958,11 +1022,12 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    const updated = await runWith(
+    const result = await runWith(
       service.retask({ taskId: task.id, fileScope: ["src/b.ts", "src/c.ts"] }),
     )
 
-    expect(updated.file_scope).toBe(JSON.stringify(["src/b.ts", "src/c.ts"]))
+    expect(result.task.file_scope).toBe(JSON.stringify(["src/b.ts", "src/c.ts"]))
+    expect(result.warnings).toHaveLength(0)
   })
 
   test("decompose accepts complexity field and returns correct task count", async () => {
@@ -970,7 +1035,7 @@ describe("LeadCoordinator", () => {
       return yield* LeadCoordinatorService
     }))
 
-    const tasks = await runWith(
+    const result = await runWith(
       service.decompose({
         teamId: "team_complexity_1" as TeamID,
         request: "test complexity",
@@ -981,6 +1046,7 @@ describe("LeadCoordinator", () => {
       }),
     )
 
+    const tasks = result.tasks
     expect(tasks).toHaveLength(2)
     expect(tasks[0].title).toBe("Update README")
     expect(tasks[1].title).toBe("Refactor auth flow")
@@ -992,7 +1058,7 @@ describe("LeadCoordinator", () => {
       return yield* LeadCoordinatorService
     }))
 
-    const tasks = await runWith(
+    const result = await runWith(
       service.decompose({
         teamId: "team_complexity_2" as TeamID,
         request: "test no complexity",
@@ -1002,7 +1068,7 @@ describe("LeadCoordinator", () => {
       }),
     )
 
-    expect(tasks).toHaveLength(1)
-    expect(tasks[0].title).toBe("No complexity task")
+    expect(result.tasks).toHaveLength(1)
+    expect(result.tasks[0].title).toBe("No complexity task")
   })
 })

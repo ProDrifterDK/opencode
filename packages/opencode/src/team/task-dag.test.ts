@@ -98,6 +98,15 @@ const makeMemoryTaskBoard = () => {
 
     delete: (taskId: TaskBoardID) => Effect.sync(() => { tasks.delete(taskId) }),
 
+    claim: (taskId: TaskBoardID, engineerId: EngineerID) =>
+      Effect.sync(() => {
+        const existing = tasks.get(taskId)
+        if (!existing || existing.status !== "pending" || existing.assigned_engineer_id) return null
+        const updated: Task = { ...existing, status: "in-progress", assigned_engineer_id: engineerId, time_updated: Date.now() }
+        tasks.set(taskId, updated)
+        return updated
+      }),
+
     listReadyTasks: (teamId: TeamID) =>
       Effect.sync(() => {
         const all = [...tasks.values()].filter((t) => t.team_id === teamId)
@@ -171,7 +180,7 @@ describe("Task DAG — dependency validation at decompose", () => {
     const exit = await runWithCatch(
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
-        return yield* lead.decompose({
+        return (yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -184,7 +193,7 @@ describe("Task DAG — dependency validation at decompose", () => {
               dependencies: ["unknown-id"],
             },
           ],
-        })
+        })).tasks
       }),
     )
 
@@ -199,14 +208,14 @@ describe("Task DAG — dependency validation at decompose", () => {
     const exit = await runWithCatch(
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
-        return yield* lead.decompose({
+        return (yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
             { id: "a", title: "Task A", description: "desc a", files: [], dependencies: ["b"] },
             { id: "b", title: "Task B", description: "desc b", files: [], dependencies: ["a"] },
           ],
-        })
+        })).tasks
       }),
     )
 
@@ -221,7 +230,7 @@ describe("Task DAG — dependency validation at decompose", () => {
     const exit = await runWithCatch(
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
-        return yield* lead.decompose({
+        return (yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -229,7 +238,7 @@ describe("Task DAG — dependency validation at decompose", () => {
             { id: "b", title: "Task B", description: "d", files: [], dependencies: ["a"] },
             { id: "c", title: "Task C", description: "d", files: [], dependencies: ["b"] },
           ],
-        })
+        })).tasks
       }),
     )
 
@@ -240,7 +249,7 @@ describe("Task DAG — dependency validation at decompose", () => {
     const tasks = await runWith(
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
-        return yield* lead.decompose({
+        return (yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -254,7 +263,7 @@ describe("Task DAG — dependency validation at decompose", () => {
               dependencies: ["b"],
             },
           ],
-        })
+        })).tasks
       }),
     )
 
@@ -277,7 +286,7 @@ describe("Task DAG — claimability (listReadyTasks)", () => {
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
 
-        const tasks = yield* lead.decompose({
+        const result = yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -298,6 +307,7 @@ describe("Task DAG — claimability (listReadyTasks)", () => {
             },
           ],
         })
+        const tasks = result.tasks
 
         const ready = yield* memBoard.listReadyTasks(TEAM_ID)
         return { tasks, ready }
@@ -313,7 +323,7 @@ describe("Task DAG — claimability (listReadyTasks)", () => {
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
 
-        const tasks = yield* lead.decompose({
+        const result = yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -334,6 +344,7 @@ describe("Task DAG — claimability (listReadyTasks)", () => {
             },
           ],
         })
+        const tasks = result.tasks
 
         const taskA = tasks.find((t) => t.title === "Task A")!
 
@@ -354,7 +365,7 @@ describe("Task DAG — claimability (listReadyTasks)", () => {
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
 
-        const tasks = yield* lead.decompose({
+        const result = yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -375,6 +386,7 @@ describe("Task DAG — claimability (listReadyTasks)", () => {
             },
           ],
         })
+        const tasks = result.tasks
 
         const taskA = tasks.find((t) => t.title === "Task A")!
         const taskB = tasks.find((t) => t.title === "Task B")!
@@ -419,7 +431,7 @@ describe("Task DAG — assign does not auto-assign blocked tasks", () => {
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
 
-        const tasks = yield* lead.decompose({
+        const result = yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -433,6 +445,7 @@ describe("Task DAG — assign does not auto-assign blocked tasks", () => {
             },
           ],
         })
+        const tasks = result.tasks
 
         const engineers = [makeEngineer("1"), makeEngineer("2")]
         const assigned = yield* lead.assign({ teamId: TEAM_ID, engineers })
@@ -451,7 +464,7 @@ describe("Task DAG — assign does not auto-assign blocked tasks", () => {
       Effect.gen(function* () {
         const lead = yield* LeadCoordinatorService
 
-        const tasks = yield* lead.decompose({
+        const result = yield* lead.decompose({
           teamId: TEAM_ID,
           request: "test",
           subtasks: [
@@ -471,6 +484,7 @@ describe("Task DAG — assign does not auto-assign blocked tasks", () => {
             },
           ],
         })
+        const tasks = result.tasks
 
         // Mark Blocker as in-progress (claimed by someone), so only Task B is unclaimed/pending
         const blocker = tasks.find((t) => t.title === "Blocker")!

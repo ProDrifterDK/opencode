@@ -62,6 +62,24 @@ export interface RetaskInput {
   fileScope?: string[]
 }
 
+export interface FileScopeWarning {
+  task: string
+  conflictsWith: string
+  taskFiles: string[]
+  conflictingFiles: string[]
+  message: string
+}
+
+export interface DecomposeResult {
+  tasks: Task[]
+  warnings: FileScopeWarning[]
+}
+
+export interface TaskWithWarningsResult {
+  task: Task
+  warnings: FileScopeWarning[]
+}
+
 export interface EngineerSummary {
   id: EngineerID
   state: EngineerStateRecord["state"]
@@ -92,12 +110,50 @@ const decodeFiles = (raw: string | null): string[] => {
   }
 }
 
+const makeFileScopeWarning = (input: {
+  task: string
+  conflictsWith: string
+  taskFiles: string[]
+  conflictingFiles: string[]
+}): FileScopeWarning => ({
+  ...input,
+  message: `Coordinate before editing overlapping file scopes: "${input.task}" overlaps with "${input.conflictsWith}".`,
+})
+
+const hasFileScopeOverlap = (aFiles: string[], bFiles: string[]) =>
+  aFiles.length > 0 &&
+  bFiles.length > 0 &&
+  aFiles.some((af) => bFiles.some((bf) => globOverlap(af, bf)))
+
+export const findFileScopeWarnings = (input: {
+  task: { id?: string; title: string; files: string[] }
+  others: Array<{ id?: string; title: string; files: string[] }>
+}): FileScopeWarning[] =>
+  input.others
+    .filter((other) => hasFileScopeOverlap(input.task.files, other.files))
+    .map((other) =>
+      makeFileScopeWarning({
+        task: input.task.id ?? input.task.title,
+        conflictsWith: other.id ?? other.title,
+        taskFiles: input.task.files,
+        conflictingFiles: other.files,
+      })
+    )
+
+const findPairwiseFileScopeWarnings = (tasks: Array<{ id?: string; title: string; files: string[] }>) =>
+  tasks.flatMap((task, index) =>
+    findFileScopeWarnings({
+      task,
+      others: tasks.slice(index + 1),
+    })
+  )
+
 type Err = LeadCoordinatorError | FileScopeConflictError | CyclicDependenciesError | TaskBoardRepoError
 
 export interface Interface {
   readonly decompose: (
     input: DecomposeInput,
-  ) => Effect.Effect<Task[], Err>
+  ) => Effect.Effect<DecomposeResult, Err>
   readonly assign: (
     input: AssignInput,
   ) => Effect.Effect<Task[], Err>
@@ -106,10 +162,10 @@ export interface Interface {
   ) => Effect.Effect<ProgressReport, Err>
   readonly reassign: (
     input: ReassignInput,
-  ) => Effect.Effect<Task, Err>
+  ) => Effect.Effect<TaskWithWarningsResult, Err>
   readonly retask: (
     input: RetaskInput,
-  ) => Effect.Effect<Task, Err>
+  ) => Effect.Effect<TaskWithWarningsResult, Err>
   readonly validateFileScopes: (
     tasks: Array<{ id: string; files: string[] }>,
   ) => Effect.Effect<boolean, never>
@@ -196,33 +252,7 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
           })
         }
 
-        // ── File scope overlap check (glob-aware, all-pairs) ──────────────
-        const overlaps: Array<{ a: string; b: string; aFiles: string[]; bFiles: string[] }> = []
-        for (let i = 0; i < specs.length; i++) {
-          for (let j = i + 1; j < specs.length; j++) {
-            const a = specs[i]
-            const b = specs[j]
-            if (a.files.length === 0 || b.files.length === 0) continue
-            const overlapping = a.files.some((af) => b.files.some((bf) => globOverlap(af, bf)))
-            if (overlapping) {
-              overlaps.push({
-                a: a.id ?? a.title,
-                b: b.id ?? b.title,
-                aFiles: a.files,
-                bFiles: b.files,
-              })
-            }
-          }
-        }
-        if (overlaps.length > 0) {
-          const lines = overlaps.map(
-            (o) => `  - "${o.a}" vs "${o.b}": [${o.aFiles.join(", ")}] / [${o.bFiles.join(", ")}]`,
-          )
-          yield* new FileScopeConflictError({
-            message: `Overlapping fileScopes detected. Re-decompose with disjoint scopes:\n${lines.join("\n")}`,
-            conflictingFiles: overlaps.flatMap((o) => [...o.aFiles, ...o.bFiles]),
-          })
-        }
+        const warnings = findPairwiseFileScopeWarnings(specs)
 
         const existing = yield* taskBoard.list({ team_id: input.teamId })
         if (existing.length + specs.length > TASK_BOARD_MAX_TASKS) {
@@ -270,7 +300,7 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
           }
         }
 
-        return updated
+        return { tasks: updated, warnings }
       },
     )
 
@@ -329,10 +359,8 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
 
           if (conflict) continue
 
-          const updated = yield* taskBoard.update(task.id, {
-            assigned_engineer_id: engineer.engineerID,
-            status: "in-progress",
-          })
+          const updated = yield* taskBoard.claim(task.id, engineer.engineerID)
+          if (!updated) continue
 
           for (const f of taskFiles) owned.add(f)
           engineerFiles.set(engineer.engineerID, owned)
@@ -341,7 +369,7 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
 
           void publishTeamEvent(Event.TaskAssigned, {
             teamID: input.teamId,
-            taskId: task.id,
+            taskId: updated.id,
             engineerID: engineer.engineerID,
           })
         }
@@ -436,22 +464,20 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
             t.status !== "failed",
         )
 
-        for (const active of targetActive) {
-          const activeFiles = decodeFiles(active.file_scope)
-          if (taskFiles.length === 0 || activeFiles.length === 0) continue
-          const conflicting = taskFiles.some((af) => activeFiles.some((bf) => globOverlap(af, bf)))
-          if (conflicting) {
-            yield* new FileScopeConflictError({
-              message: `Cannot reassign to engineer — file conflict with "${active.title}"`,
-              conflictingFiles: [...taskFiles, ...activeFiles],
-            })
-          }
-        }
+        const warnings = findFileScopeWarnings({
+          task: { id: task!.id, title: task!.title, files: taskFiles },
+          others: targetActive.map((active) => ({
+            id: active.id,
+            title: active.title,
+            files: decodeFiles(active.file_scope),
+          })),
+        })
 
-        return yield* taskBoard.update(task!.id, {
+        const updated = yield* taskBoard.update(task!.id, {
           assigned_engineer_id: input.toEngineer,
           status: "in-progress",
         })
+        return { task: updated, warnings }
       },
     )
 
@@ -484,33 +510,32 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
           })
         }
 
-        if (input.fileScope !== undefined) {
-          const allTasks = yield* taskBoard.list({ team_id: task.team_id })
-          const otherActive = allTasks.filter(
-            (t) =>
-              t.id !== task.id &&
-              (t.status === "pending" || t.status === "in-progress" || t.status === "blocked"),
-          )
-          const newFiles = input.fileScope
-          for (const active of otherActive) {
-            const activeFiles = decodeFiles(active.file_scope)
-            if (newFiles.length === 0 || activeFiles.length === 0) continue
-            const conflicting = newFiles.some((af) => activeFiles.some((bf) => globOverlap(af, bf)))
-            if (conflicting) {
-              return yield* new FileScopeConflictError({
-                message: `Cannot retask — file scope overlaps with "${active.title}"`,
-                conflictingFiles: [...newFiles, ...activeFiles],
+        const warnings = input.fileScope === undefined
+          ? []
+          : yield* Effect.gen(function* () {
+              const allTasks = yield* taskBoard.list({ team_id: task.team_id })
+              const otherActive = allTasks.filter(
+                (t) =>
+                  t.id !== task.id &&
+                  (t.status === "pending" || t.status === "in-progress" || t.status === "blocked"),
+              )
+              return findFileScopeWarnings({
+                task: { id: task.id, title: input.title ?? task.title, files: input.fileScope ?? [] },
+                others: otherActive.map((active) => ({
+                  id: active.id,
+                  title: active.title,
+                  files: decodeFiles(active.file_scope),
+                })),
               })
-            }
-          }
-        }
+            })
 
         const updateInput: import("./task-board.sql").UpdateTaskInput = {}
         if (input.title !== undefined) updateInput.title = input.title
         if (input.description !== undefined) updateInput.description = input.description
         if (input.fileScope !== undefined) updateInput.file_scope = encodeFiles(input.fileScope)
 
-        return yield* taskBoard.update(task.id, updateInput)
+        const updated = yield* taskBoard.update(task.id, updateInput)
+        return { task: updated, warnings }
       },
     )
 
