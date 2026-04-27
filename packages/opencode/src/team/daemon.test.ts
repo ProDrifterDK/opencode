@@ -7,6 +7,7 @@ import {
   deleteRunning,
   iterAllRunning,
   countAllRunning,
+  terminateRunningEngineersForShutdown,
 } from "./daemon-running"
 import { Service as ProcessManagerService } from "./engineer-process-manager"
 import type { EngineerID, TeamID } from "./types"
@@ -154,6 +155,25 @@ describe("Phase 3 (A3): RunningEngineer carries subprocess pid", () => {
     expect(a1).toBeDefined()
     expect(a2).toBeDefined()
     expect(a1!.pid).not.toBe(a2!.pid)
+  })
+})
+
+describe("graceful shutdown subprocess cleanup", () => {
+  test("terminates tracked engineers without clearing the running map first", () => {
+    setRunning(TEAM_A, ENG_A1, makeEntry(TEAM_A, ENG_A1))
+    setRunning(TEAM_A, ENG_A2, makeEntry(TEAM_A, ENG_A2))
+
+    const terminated: Array<{ engineerID: string; pid: number }> = []
+    const count = terminateRunningEngineersForShutdown((engineerID, pid) => {
+      terminated.push({ engineerID, pid })
+    })
+
+    expect(count).toBe(2)
+    expect(terminated).toHaveLength(2)
+    expect(terminated.map((entry) => entry.engineerID).sort()).toEqual([ENG_A1, ENG_A2].sort())
+    expect(countAllRunning()).toBe(2)
+    expect(getRunningEngineer(TEAM_A, ENG_A1)).toBeDefined()
+    expect(getRunningEngineer(TEAM_A, ENG_A2)).toBeDefined()
   })
 })
 

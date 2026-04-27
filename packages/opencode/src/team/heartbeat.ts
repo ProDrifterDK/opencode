@@ -7,6 +7,7 @@ import { iterAllRunning } from "./daemon-running"
 import { Log } from "@/util"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
+import type { TaskBoardID } from "./task-board.sql"
 
 const log = Log.create({ service: "team.heartbeat" })
 
@@ -139,6 +140,20 @@ export const layer = Layer.effect(
           health.lastHeartbeat = eng.lastHeartbeat
           const idleMs = now - eng.lastHeartbeat
 
+          // Only actively working engineers are heartbeat-managed. A
+          // completed engineer is stored as `idle` after team_report and
+          // its subprocess exits, so no running entry will refresh its
+          // lastHeartbeat anymore. Treating that stale idle timestamp as
+          // liveness failure reaped successful engineers and emitted
+          // spurious `all-engineers-failed` urgents.
+          if (eng.state !== "working") {
+            health.isStuck = false
+            health.stuckCount = 0
+            health.isDead = false
+            results.push(health)
+            continue
+          }
+
           if (health.backoffUntil && now < health.backoffUntil) {
             results.push(health)
             continue
@@ -195,6 +210,20 @@ export const layer = Layer.effect(
           const slot = yield* coordinator.getEngineer(engineerID).pipe(
             Effect.orElseSucceed(() => null),
           )
+          if (slot && slot.state !== "working") {
+            health.isStuck = false
+            health.stuckCount = 0
+            health.isDead = false
+            healthMap.delete(engineerID)
+            const result: DiagnosticResult = {
+              engineerID,
+              pingSucceeded: false,
+              action: "healthy",
+              taskReassignedTo: null,
+              timestamp: now,
+            }
+            return result
+          }
           const currentTask = slot?.currentTask
 
           log.warn("heartbeat runDiagnostic killing engineer (isDead)", {
@@ -218,7 +247,7 @@ export const layer = Layer.effect(
 
             if (available) {
               yield* lead.reassign({
-                taskId: currentTask as any,
+                taskId: currentTask as TaskBoardID,
                 toEngineer: available.engineerID,
               }).pipe(
                 Effect.catchCause(() => Effect.void),

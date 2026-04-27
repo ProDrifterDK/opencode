@@ -8,6 +8,7 @@ import { ENGINEER_MAX_IDLE } from "./constants"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
 import type { Task, TaskBoardID, CreateTaskInput, UpdateTaskInput, TaskBoardFilter } from "./task-board.sql"
+import type { MailboxID } from "./mailbox.sql"
 
 const ENG_A = "eng_a" as EngineerID
 const ENG_B = "eng_b" as EngineerID
@@ -44,12 +45,14 @@ let engineers: Map<EngineerID, EngineerSlot>
 let teams: Map<TeamID, TeamRecord>
 let mailboxMessages: Map<string, { recipient: SessionID; type: string; content: string; priority: string }>
 let mailboxUnread: Map<SessionID, boolean>
+let killEngineerCalls: Array<{ engineerID: EngineerID; teamID: TeamID }>
 
 const resetState = () => {
   engineers = new Map()
   teams = new Map()
   mailboxMessages = new Map()
   mailboxUnread = new Map()
+  killEngineerCalls = []
 }
 
 const memCoordinator = SessionCoordinatorService.of({
@@ -70,6 +73,7 @@ const memCoordinator = SessionCoordinatorService.of({
   resumeEngineer: () => Effect.sync(() => makeSlot()),
   killEngineer: (input: { engineerID: EngineerID; teamID: TeamID }) =>
     Effect.sync(() => {
+      killEngineerCalls.push(input)
       engineers.delete(input.engineerID)
       const team = teams.get(input.teamID)
       if (team) {
@@ -114,18 +118,18 @@ const memCoordinator = SessionCoordinatorService.of({
 })
 
 const memLead = LeadCoordinatorService.of({
-  decompose: () => Effect.succeed([]),
+  decompose: () => Effect.succeed({ tasks: [], warnings: [] }),
   assign: () => Effect.succeed([]),
   monitor: () => Effect.succeed({
     totalTasks: 0, pending: 0, inProgress: 0, completed: 0, failed: 0, blocked: 0, engineers: [], blockers: [],
   }),
   reassign: (input: { taskId: TaskBoardID; toEngineer: EngineerID }) =>
     Effect.sync(() => {
-      return { id: input.taskId, assigned_engineer_id: input.toEngineer } as Task
+      return { task: { id: input.taskId, assigned_engineer_id: input.toEngineer } as Task, warnings: [] }
     }),
   retask: (input) =>
     Effect.sync(() => {
-      return { id: input.taskId } as import("./task-board.sql").Task
+      return { task: { id: input.taskId } as import("./task-board.sql").Task, warnings: [] }
     }),
   validateFileScopes: () => Effect.succeed(true),
   formatStatus: () => "",
@@ -134,7 +138,7 @@ const memLead = LeadCoordinatorService.of({
 const memMailbox = MailboxService.of({
   send: (input) =>
     Effect.sync(() => {
-      const id = crypto.randomUUID() as any
+      const id = crypto.randomUUID() as MailboxID
       mailboxMessages.set(id, {
         recipient: input.recipientSessionID,
         type: input.type,
@@ -145,7 +149,7 @@ const memMailbox = MailboxService.of({
         id,
         recipient_session_id: input.recipientSessionID,
         sender_session_id: input.senderSessionID,
-        priority: input.priority as any,
+        priority: input.priority,
         type: input.type,
         content: input.content,
         created_at: Date.now(),
@@ -176,7 +180,7 @@ import { layer } from "./heartbeat"
 const resolvedLayer = layer.pipe(Layer.provide(testLayer))
 
 const runWith = <A>(
-  effect: Effect.Effect<A, any, HeartbeatService>,
+  effect: Effect.Effect<A, unknown, HeartbeatService>,
 ) =>
   Effect.provide(effect, resolvedLayer).pipe(Effect.runPromise)
 
@@ -203,7 +207,10 @@ describe("HeartbeatMonitor", () => {
     // Source of liveness is the engineer slot's `lastHeartbeat` in DB
     // (not the in-memory health record), so the test must age the slot
     // to trigger the stuck threshold.
-    engineers.set(ENG_A, makeSlot({ lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000 }))
+    engineers.set(ENG_A, makeSlot({
+      state: "working",
+      lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000,
+    }))
 
     const service = await runWith(Effect.gen(function* () {
       return yield* HeartbeatService
@@ -218,7 +225,10 @@ describe("HeartbeatMonitor", () => {
   })
 
   test("checkHealth marks engineer dead after 3 stuck cycles", async () => {
-    engineers.set(ENG_A, makeSlot({ lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000 }))
+    engineers.set(ENG_A, makeSlot({
+      state: "working",
+      lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000,
+    }))
 
     const service = await runWith(Effect.gen(function* () {
       return yield* HeartbeatService
@@ -226,8 +236,6 @@ describe("HeartbeatMonitor", () => {
 
     // Pre-seed stuckCount=2 in the in-memory health record; the next
     // checkHealth tick should bump to 3 (dead).
-    const health = service.getHealth(ENG_A) ?? { stuckCount: 0 } as any
-    health.stuckCount = 2
     // Some implementations create the health entry lazily on first
     // checkHealth — ensure a record exists by recording a heartbeat first.
     await runWith(service.recordHeartbeat(ENG_A))
@@ -241,8 +249,60 @@ describe("HeartbeatMonitor", () => {
     expect(results[0].isDead).toBe(true)
   })
 
+  test("checkHealth does not mark completed idle engineers stuck after heartbeat ages out", async () => {
+    engineers.set(ENG_A, makeSlot({
+      state: "idle",
+      currentTask: null,
+      lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000,
+    }))
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    await runWith(service.recordHeartbeat(ENG_A))
+    const health = service.getHealth(ENG_A)!
+    health.stuckCount = 2
+    health.isStuck = true
+    health.isDead = true
+
+    const results = await runWith(service.checkHealth(TEAM_ID))
+
+    expect(results).toHaveLength(1)
+    expect(results[0].isStuck).toBe(false)
+    expect(results[0].stuckCount).toBe(0)
+    expect(results[0].isDead).toBe(false)
+    expect(killEngineerCalls).toHaveLength(0)
+  })
+
+  test("runDiagnostic does not kill an idle engineer even if stale health was marked dead", async () => {
+    engineers.set(ENG_A, makeSlot({
+      state: "idle",
+      currentTask: null,
+      lastHeartbeat: Date.now() - ENGINEER_MAX_IDLE - 1000,
+    }))
+    teams.set(TEAM_ID, makeTeam({ engineerCount: 1 }))
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    await runWith(service.recordHeartbeat(ENG_A))
+    const health = service.getHealth(ENG_A)!
+    health.isDead = true
+    health.isStuck = true
+    health.stuckCount = 3
+
+    const result = await runWith(service.runDiagnostic(ENG_A, TEAM_ID))
+
+    expect(result.action).toBe("healthy")
+    expect(engineers.has(ENG_A)).toBe(true)
+    expect(killEngineerCalls).toHaveLength(0)
+    expect([...mailboxMessages.values()].some((m) => m.type === "all-engineers-failed")).toBe(false)
+  })
+
   test("runDiagnostic kills dead engineer and reassigns task", async () => {
-    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as any, state: "working" }))
+    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as TaskBoardID, state: "working" }))
     engineers.set(ENG_B, makeSlot({ engineerID: ENG_B, sessionID: "sess_eng_b" as SessionID, name: "engineer-b", state: "idle" }))
     teams.set(TEAM_ID, makeTeam({ engineerCount: 2 }))
 
@@ -265,7 +325,7 @@ describe("HeartbeatMonitor", () => {
   })
 
   test("runDiagnostic sends all-failed message when no engineers remain", async () => {
-    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as any }))
+    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as TaskBoardID, state: "working" }))
     teams.set(TEAM_ID, makeTeam({ engineerCount: 1 }))
 
     const service = await runWith(Effect.gen(function* () {
@@ -364,7 +424,7 @@ describe("HeartbeatMonitor", () => {
   })
 
   test("handleCrash marks engineer dead and triggers diagnostic", async () => {
-    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as any }))
+    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as TaskBoardID, state: "working" }))
     engineers.set(ENG_B, makeSlot({ engineerID: ENG_B, sessionID: "sess_eng_b" as SessionID, name: "engineer-b", state: "idle" }))
     teams.set(TEAM_ID, makeTeam({ engineerCount: 2 }))
 

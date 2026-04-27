@@ -84,3 +84,13 @@ export function countAllRunning(): number {
   for (const bucket of running.values()) total += bucket.size
   return total
 }
+
+export function terminateRunningEngineersForShutdown(
+  terminate: (engineerID: string, pid: number, sub: import("bun").Subprocess | undefined) => void,
+): number {
+  const engineers = [...iterAllRunning()]
+  for (const [, engineerID, engineer] of engineers) {
+    terminate(engineerID as string, engineer.pid, engineer.subprocess)
+  }
+  return engineers.length
+}
