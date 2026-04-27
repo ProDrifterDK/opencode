@@ -785,6 +785,7 @@ export const layer = Layer.effect(
             engineerName: event.properties.engineerName ?? engineer?.name ?? event.properties.engineerID,
             taskTitle: event.properties.taskTitle ?? task?.title ?? event.properties.taskId,
             summary: event.properties.summary ?? "Completed.",
+            reviewPacket: event.properties.reviewPacket,
           }),
           priority: "inbox",
         })

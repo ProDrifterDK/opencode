@@ -1,5 +1,6 @@
 import type { EngineerStateRecord } from "./types"
 import type { Task } from "./task-board.sql"
+import { formatReviewPacket, type ReviewPacket } from "./review-packet"
 
 export function isTeamWorkComplete(input: {
   tasks: readonly Pick<Task, "status">[]
@@ -26,11 +27,13 @@ export function buildEngineerReportMessage(input: {
   engineerName: string
   taskTitle: string
   summary: string
+  reviewPacket?: ReviewPacket
 }) {
   return [
     `✅ Engineer ${input.engineerName} reports: COMPLETED`,
     `Task: ${input.taskTitle}`,
     `Summary: ${input.summary}`,
+    ...(input.reviewPacket ? formatReviewPacket(input.reviewPacket) : []),
   ].join("\n")
 }
 

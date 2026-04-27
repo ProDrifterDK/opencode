@@ -4,6 +4,7 @@ import * as Bus from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import { Log } from "@/util"
 import { notifyPluginEvent } from "@/plugin"
+import { ReviewPacketSchema } from "./review-packet"
 
 const log = Log.create({ service: "team.events" })
 
@@ -57,6 +58,7 @@ export const Event = {
       taskTitle: Schema.optional(Schema.String),
       engineerName: Schema.optional(Schema.String),
       summary: Schema.optional(Schema.String),
+      reviewPacket: Schema.optional(ReviewPacketSchema),
     }),
   ),
 

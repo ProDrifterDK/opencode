@@ -9,10 +9,14 @@ describe("team completion detection", () => {
     })).toBe(true)
   })
 
-  test("not complete while any task is active or blocked", () => {
+  test("not complete while any task is active, pending, or blocked", () => {
     expect(isTeamWorkComplete({
       tasks: [{ status: "completed" }, { status: "in-progress" }],
       engineers: [{ state: "idle" }, { state: "working" }],
+    })).toBe(false)
+    expect(isTeamWorkComplete({
+      tasks: [{ status: "completed" }, { status: "pending" }],
+      engineers: [{ state: "idle" }, { state: "idle" }],
     })).toBe(false)
     expect(isTeamWorkComplete({
       tasks: [{ status: "completed" }, { status: "blocked" }],
@@ -38,10 +42,22 @@ describe("team completion detection", () => {
       engineerName: "engineer-frontend",
       taskTitle: "Frontend Review",
       summary: "Report written to .tmp/report.md",
+      reviewPacket: {
+        reportPath: ".tmp/report.md",
+        changedFiles: ["src/frontend.ts"],
+        verificationCommands: ["bun test src/frontend.test.ts"],
+        knownGaps: [],
+        confidence: "high",
+        warnings: [],
+      },
     })
 
     expect(message).toContain("Engineer engineer-frontend reports: COMPLETED")
     expect(message).toContain("Task: Frontend Review")
     expect(message).toContain("Summary: Report written to .tmp/report.md")
+    expect(message).toContain("Report: .tmp/report.md")
+    expect(message).toContain("Changed files: src/frontend.ts")
+    expect(message).toContain("Verification: bun test src/frontend.test.ts")
+    expect(message).toContain("Confidence: high")
   })
 })
