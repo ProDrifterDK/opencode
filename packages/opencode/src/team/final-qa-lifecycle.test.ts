@@ -403,7 +403,7 @@ const memLead = LeadCoordinatorService.of({
           description: spec.description,
           status: "pending",
           assigned_engineer_id: null,
-          file_scope: spec.files.length > 0 ? JSON.stringify(spec.files) : null,
+          file_scope: (spec.fileScope ?? spec.files ?? []).length > 0 ? JSON.stringify(spec.fileScope ?? spec.files ?? []) : null,
           blocked_by: null,
           parent_task_id: null,
           dependencies: [],

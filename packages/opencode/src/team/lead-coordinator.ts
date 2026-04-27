@@ -34,7 +34,8 @@ export interface SubtaskSpec {
   id?: string
   title: string
   description: string
-  files: string[]
+  files?: string[]
+  fileScope?: string[]
   dependencies?: string[]
   complexity?: "low" | "medium" | "high"
 }
@@ -100,11 +101,13 @@ export interface ProgressReport {
 
 const encodeFiles = (files: string[]): string => JSON.stringify(files)
 
+const subtaskFiles = (spec: SubtaskSpec) => spec.fileScope ?? spec.files ?? []
+
 const decodeFiles = (raw: string | null): string[] => {
   if (!raw) return []
   try {
     const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : []
+    return Array.isArray(parsed) ? parsed.filter((file): file is string => typeof file === "string") : []
   } catch {
     return []
   }
@@ -252,7 +255,11 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
           })
         }
 
-        const warnings = findPairwiseFileScopeWarnings(specs)
+        const warnings = findPairwiseFileScopeWarnings(specs.map((spec) => ({
+          id: spec.id,
+          title: spec.title,
+          files: subtaskFiles(spec),
+        })))
 
         const existing = yield* taskBoard.list({ team_id: input.teamId })
         if (existing.length + specs.length > TASK_BOARD_MAX_TASKS) {
@@ -268,11 +275,12 @@ export const layer: Layer.Layer<Service, never, TaskBoardRepo.Service | RateLimi
 
         // First pass: create tasks without dependencies (resolve after)
         for (const spec of specs) {
+          const files = subtaskFiles(spec)
           const task = yield* taskBoard.create({
             team_id: input.teamId,
             title: spec.title,
             description: spec.description,
-            file_scope: spec.files.length > 0 ? encodeFiles(spec.files) : null,
+            file_scope: files.length > 0 ? encodeFiles(files) : null,
             status: "pending",
             dependencies: [],
           })

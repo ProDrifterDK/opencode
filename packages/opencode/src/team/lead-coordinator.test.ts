@@ -3,6 +3,7 @@ import { Effect, Layer } from "effect"
 import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as TaskBoardRepoService } from "./task-board"
 import { Service as RateLimiterService } from "./rate-limiter"
+import { resolveSpawnTaskCandidate } from "./spawn-task"
 import type { RateLimiterStats } from "./rate-limiter"
 import type { Task, TaskBoardID, CreateTaskInput, UpdateTaskInput, TaskBoardFilter, TeamID, EngineerID } from "./task-board.sql"
 import type { EngineerStateRecord } from "./types"
@@ -188,6 +189,32 @@ describe("LeadCoordinator", () => {
     expect(tasks[2].title).toBe("Auth tests")
     expect(tasks.every((t) => t.status === "pending")).toBe(true)
     expect(tasks.every((t) => t.assigned_engineer_id === null)).toBe(true)
+  })
+
+  test("decompose accepts fileScope alias used by team_spawn", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const result = await runWith(
+      service.decompose({
+        teamId: TEAM_ID,
+        request: "spawn compatibility",
+        subtasks: [
+          { title: "Live task", description: "Same shape as team_spawn", fileScope: ["src/live.ts"] },
+        ],
+      }),
+    )
+
+    expect(result.tasks[0].file_scope).toBe('["src/live.ts"]')
+    expect(resolveSpawnTaskCandidate({
+      tasks: result.tasks,
+      task: {
+        title: "Live task",
+        description: "Same shape as team_spawn",
+        fileScope: '["src/live.ts"]',
+      },
+    })).toEqual({ kind: "claim", task: result.tasks[0] })
   })
 
   test("decompose allows overlapping file scopes with warnings", async () => {
@@ -575,6 +602,43 @@ describe("LeadCoordinator", () => {
     expect(result.task.assigned_engineer_id).toBe("eng_backup" as EngineerID)
     expect(result.warnings).toHaveLength(1)
     expect(result.warnings[0].conflictsWith).toBe("task_1")
+  })
+
+
+
+  test("filters malformed file scope entries before overlap warnings", async () => {
+    const service = await runWith(Effect.gen(function* () {
+      return yield* LeadCoordinatorService
+    }))
+
+    const taskToReassign = await runWithBoth(
+      Effect.gen(function* () {
+        const tb = yield* TaskBoardRepoService
+        yield* tb.create({
+          team_id: TEAM_ID,
+          title: "Malformed active task",
+          description: "contains legacy malformed scope",
+          file_scope: '[123,"src/auth.ts",null]',
+          status: "in-progress",
+          assigned_engineer_id: "eng_backup" as EngineerID,
+        })
+        return yield* tb.create({
+          team_id: TEAM_ID,
+          title: "To reassign",
+          description: "from failed eng",
+          file_scope: '["src/auth.ts"]',
+          status: "in-progress",
+          assigned_engineer_id: "eng_failed" as EngineerID,
+        })
+      }),
+    )
+
+    const result = await runWith(
+      service.reassign({ taskId: taskToReassign.id, toEngineer: "eng_backup" as EngineerID }),
+    )
+
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0].conflictingFiles).toEqual(["src/auth.ts"])
   })
 
   test("validateFileScopes returns true for exclusive scopes", async () => {
