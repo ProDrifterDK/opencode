@@ -48,6 +48,9 @@ export interface SpawnInput {
   taskID: string
   taskTitle: string
   taskDescription: string
+  fileScope?: readonly string[]
+  coordinationWarnings?: readonly string[]
+  teammates?: readonly { name: string; engineerID: string; task?: string }[]
   name: string
   providerID?: string
   modelID?: string
@@ -228,6 +231,11 @@ export const layer: Layer.Layer<Service> = Layer.succeed(
             input.taskDescription,
             "--dangerously-skip-permissions",
           ]
+          if (input.fileScope && input.fileScope.length > 0) args.push("--file-scope", JSON.stringify(input.fileScope))
+          if (input.coordinationWarnings && input.coordinationWarnings.length > 0) {
+            args.push("--coordination-warnings", JSON.stringify(input.coordinationWarnings))
+          }
+          if (input.teammates && input.teammates.length > 0) args.push("--teammates", JSON.stringify(input.teammates))
           if (input.providerID) args.push("--provider-id", input.providerID)
           if (input.modelID) args.push("--model-id", input.modelID)
           if (input.fallbackProviderID) args.push("--fallback-provider-id", input.fallbackProviderID)

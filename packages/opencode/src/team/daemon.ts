@@ -26,6 +26,7 @@ import { RateLimiter } from "./rate-limiter"
 import { Service as HeartbeatMonitorService, layer as heartbeatLayer } from "./heartbeat"
 import { LeadCoordinator } from "./lead-coordinator"
 import { GitManager } from "./git-manager"
+import { buildEngineerReportMessage, buildTeamCompleteMessage, isTeamWorkComplete } from "./completion"
 import {
   Service as EngineerProcessManager,
   layer as engineerProcessManagerLayer,
@@ -34,6 +35,7 @@ import {
 } from "./engineer-process-manager"
 import type { EngineerID, TeamID } from "./types"
 import type { TaskBoardID } from "./task-board.sql"
+import { buildReplyInstruction, formatTeamMessageLabel, type SenderIdentity } from "./message-routing"
 import {
   type RunningEngineer,
   running,
@@ -42,6 +44,7 @@ import {
   deleteRunning,
   iterAllRunning,
   countAllRunning,
+  terminateRunningEngineersForShutdown,
 } from "./daemon-running"
 
 const log = Log.create({ service: "team.daemon" })
@@ -64,6 +67,15 @@ const killEngineerSubprocess = (
     log.warn("terminateSubprocess threw", { engineerID, pid, error: String(err) })
   })
 }
+
+const terminateRunningEngineers = (): number =>
+  terminateRunningEngineersForShutdown((engineerID, pid, sub) => {
+    log.info("killing engineer subprocess on graceful shutdown", {
+      engineerID,
+      pid,
+    })
+    killEngineerSubprocess(engineerID, pid, sub)
+  })
 
 // Heartbeat constants are defined in ./constants and imported above.
 // The daemon's setInterval sweep acts as a backstop for teams that
@@ -89,6 +101,8 @@ let sigintHandlerRegistered = false
  */
 export function gracefulShutdown(): void {
   log.info("graceful shutdown initiated", { runningEngineers: countAllRunning() })
+
+  terminateRunningEngineers()
 
   if (heartbeatUpdateInterval) {
     clearInterval(heartbeatUpdateInterval)
@@ -157,8 +171,9 @@ export function gracefulShutdown(): void {
     log.error("graceful shutdown failed", { error: String(err) })
   }
 
-  // Clear running map
-  running.clear()
+  // Do not clear the running map here. The tracked subprocess handles are
+  // still needed by the async `.exited` handlers and by TeamDaemon.stop()
+  // if the normal Effect finalizer path runs after this signal handler.
 }
 
 // Engineer loop body lives in `./engineer-loop.ts`. It is no longer
@@ -177,6 +192,8 @@ const startEngineerInBackground = (
     taskId: string
     taskTitle: string
     taskDescription: string
+    fileScope?: readonly string[]
+    coordinationWarnings?: readonly string[]
     providerID?: string
     modelID?: string
     fallbackProviderID?: string
@@ -222,6 +239,9 @@ const startEngineerInBackground = (
       taskID: input.taskId,
       taskTitle: input.taskTitle,
       taskDescription: input.taskDescription,
+      fileScope: input.fileScope,
+      coordinationWarnings: input.coordinationWarnings,
+      teammates: input.teammates,
       name: input.name,
       providerID: input.providerID,
       modelID: input.modelID,
@@ -544,13 +564,13 @@ export const layer = Layer.effect(
           recipientSessionID: event.properties.recipientSessionID as SessionID,
         })
 
-        const label = event.properties.priority === "urgent"
-          ? "[URGENT MESSAGE FROM ENGINEER]"
-          : event.properties.priority === "inbox"
-            ? "[MESSAGE FROM ENGINEER]"
-            : "[LOW PRIORITY MESSAGE]"
+        const senderEngineer = yield* coordinator.getEngineerBySession(event.properties.senderSessionID as SessionID)
+        const sender: SenderIdentity = senderEngineer
+          ? { type: "engineer", name: senderEngineer.name, engineerID: senderEngineer.engineerID }
+          : { type: "unknown" }
+        const label = formatTeamMessageLabel({ sender, priority: event.properties.priority })
 
-        const notificationText = `${label}\n${msg.content}\n\nRespond to acknowledge and take action.`
+        const notificationText = `${label}\n${msg.content}\n\n${buildReplyInstruction(sender)} Respond to acknowledge and take action.`
 
         log.info("injecting notification into lead session", {
           leadSessionID: event.properties.recipientSessionID,
@@ -620,9 +640,16 @@ export const layer = Layer.effect(
           return
         }
 
+        const recipientEngineer = yield* coordinator.getEngineerBySession(event.properties.recipientSessionID as SessionID)
+        const team = recipientEngineer ? yield* coordinator.getTeam(recipientEngineer.teamID) : null
+
         // Get sender info for a better label
         const senderEngineer = yield* coordinator.getEngineerBySession(event.properties.senderSessionID as SessionID)
-        const senderName = senderEngineer?.name ?? "teammate"
+        const sender: SenderIdentity = team?.leadSessionID === event.properties.senderSessionID
+          ? { type: "lead" }
+          : senderEngineer
+            ? { type: "engineer", name: senderEngineer.name, engineerID: senderEngineer.engineerID }
+            : { type: "unknown" }
 
         // Fetch the message from mailbox
         const messages = yield* mailbox.receiveByPriority({
@@ -641,15 +668,13 @@ export const layer = Layer.effect(
           recipientSessionID: event.properties.recipientSessionID as SessionID,
         })
 
-        const label = event.properties.priority === "urgent"
-          ? `[URGENT MESSAGE FROM ${senderName.toUpperCase()}]`
-          : `[MESSAGE FROM ${senderName}]`
+        const label = formatTeamMessageLabel({ sender, priority: event.properties.priority })
 
-        const notificationText = `${label}\n${msg.content}\n\nYou can reply using team_message.`
+        const notificationText = `${label}\n${msg.content}\n\n${buildReplyInstruction(sender)}`
 
         log.info("injecting notification into engineer session", {
           recipientSessionID: event.properties.recipientSessionID,
-          senderName,
+          senderName: sender.type === "engineer" ? sender.name : sender.type,
           contentLength: notificationText.length,
         })
 
@@ -695,6 +720,8 @@ export const layer = Layer.effect(
             taskId: event.properties.taskID,
             taskTitle: event.properties.taskTitle,
             taskDescription: event.properties.taskDescription,
+            fileScope: event.properties.fileScope,
+            coordinationWarnings: event.properties.coordinationWarnings,
             providerID: event.properties.providerID,
             modelID: event.properties.modelID,
             fallbackProviderID: event.properties.fallbackProviderID,
@@ -736,6 +763,49 @@ export const layer = Layer.effect(
           }),
         ),
       ))
+    }
+
+    const handleEngineerCompleted = (event: {
+      type: typeof Event.EngineerCompleted.type
+      properties: Schema.Schema.Type<typeof Event.EngineerCompleted.properties>
+    }) => {
+      AppRuntime.runFork(Effect.gen(function* () {
+        const teamID = event.properties.teamID as TeamID
+        const team = yield* coordinator.getTeam(teamID)
+        if (!team) return
+
+        const engineer = yield* coordinator.getEngineer(event.properties.engineerID as EngineerID)
+        const task = yield* taskBoard.get(event.properties.taskId as TaskBoardID)
+
+        yield* mailbox.send({
+          senderSessionID: engineer?.sessionID ?? team.leadSessionID,
+          recipientSessionID: team.leadSessionID,
+          type: "team_report",
+          content: buildEngineerReportMessage({
+            engineerName: event.properties.engineerName ?? engineer?.name ?? event.properties.engineerID,
+            taskTitle: event.properties.taskTitle ?? task?.title ?? event.properties.taskId,
+            summary: event.properties.summary ?? "Completed.",
+          }),
+          priority: "inbox",
+        })
+
+        const tasks = yield* taskBoard.list({ team_id: teamID })
+        const engineers = yield* coordinator.listTeamEngineers(teamID)
+        if (!isTeamWorkComplete({ tasks, engineers })) return
+
+        yield* mailbox.send({
+          senderSessionID: engineer?.sessionID ?? team.leadSessionID,
+          recipientSessionID: team.leadSessionID,
+          type: "team_complete",
+          content: buildTeamCompleteMessage({
+            teamID,
+            completedTasks: tasks.length,
+          }),
+          priority: "urgent",
+        })
+      }).pipe(Effect.catchCause((cause) =>
+        Effect.sync(() => log.error("team completion check failed", { cause: Cause.pretty(cause) })),
+      )))
     }
 
     // Track last emitted tool per engineer to avoid duplicate progress updates
@@ -925,6 +995,9 @@ export const layer = Layer.effect(
 
       const unsubSpawned = yield* bus.subscribeCallback(Event.EngineerSpawned, handleEngineerSpawned)
       unsubscribers.push(unsubSpawned)
+
+      const unsubCompleted = yield* bus.subscribeCallback(Event.EngineerCompleted, handleEngineerCompleted)
+      unsubscribers.push(unsubCompleted)
 
       const unsubMailbox = yield* bus.subscribeCallback(MailboxEvent.Received, handleMailboxReceived)
       unsubscribers.push(unsubMailbox)

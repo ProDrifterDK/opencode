@@ -27,6 +27,24 @@ import { Server } from "@/server/server"
 
 const log = Log.create({ service: "cli.team-engineer-run" })
 
+const parseStringArrayArg = (raw: unknown): string[] => {
+  if (!raw) return []
+  const parsed = JSON.parse(String(raw))
+  return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []
+}
+
+const parseTeammatesArg = (raw: unknown): Array<{ name: string; engineerID: string; task?: string }> => {
+  if (!raw) return []
+  const parsed = JSON.parse(String(raw))
+  if (!Array.isArray(parsed)) return []
+  return parsed.flatMap((item) => {
+    if (!item || typeof item !== "object") return []
+    const value = item as Record<string, unknown>
+    if (typeof value.name !== "string" || typeof value.engineerID !== "string") return []
+    return [{ name: value.name, engineerID: value.engineerID, task: typeof value.task === "string" ? value.task : undefined }]
+  })
+}
+
 export const TeamEngineerRunCommand = cmd({
   command: "team-engineer-run",
   describe: false, // hidden — internal helper, not for end users
@@ -72,6 +90,18 @@ export const TeamEngineerRunCommand = cmd({
         describe: "task description",
         demandOption: true,
       })
+      .option("file-scope", {
+        type: "string",
+        describe: "JSON-encoded file scope for the assigned task",
+      })
+      .option("coordination-warnings", {
+        type: "string",
+        describe: "JSON-encoded coordination warnings for overlapping file scopes",
+      })
+      .option("teammates", {
+        type: "string",
+        describe: "JSON-encoded teammate names and engineer IDs",
+      })
       .option("provider-id", {
         type: "string",
         describe: "LLM provider id (optional, falls back to session default)",
@@ -102,6 +132,9 @@ export const TeamEngineerRunCommand = cmd({
     const taskID = String(args["task-id"])
     const taskTitle = String(args["task-title"])
     const taskDescription = String(args["task-description"])
+    const fileScope = parseStringArrayArg(args["file-scope"])
+    const coordinationWarnings = parseStringArrayArg(args["coordination-warnings"])
+    const teammates = parseTeammatesArg(args["teammates"])
     const providerID = args["provider-id"] ? String(args["provider-id"]) : undefined
     const modelID = args["model-id"] ? String(args["model-id"]) : undefined
     const fallbackProviderID = args["fallback-provider-id"] ? String(args["fallback-provider-id"]) : undefined
@@ -158,14 +191,13 @@ export const TeamEngineerRunCommand = cmd({
             taskId: taskID,
             taskTitle,
             taskDescription,
+            fileScope,
+            coordinationWarnings,
             providerID,
             modelID,
             fallbackProviderID,
             fallbackModelID,
-            // Engineer runs without peer awareness; `teammates: []` is a
-            // known gap (backlog: A3-followup teammate hydration). The
-            // value is used to address mailbox messages between engineers.
-            teammates: [],
+            teammates,
           }),
         )
 

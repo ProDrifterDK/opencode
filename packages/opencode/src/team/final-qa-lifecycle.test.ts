@@ -357,6 +357,14 @@ const memTaskBoard = TaskBoardRepoService.of({
     Effect.sync(() => tasks.get(taskId) ?? null),
   delete: (taskId: TaskBoardID) =>
     Effect.sync(() => { tasks.delete(taskId) }),
+  claim: (taskId: TaskBoardID, engineerId: EngineerID) =>
+    Effect.sync(() => {
+      const existing = tasks.get(taskId)
+      if (!existing || existing.status !== "pending" || existing.assigned_engineer_id) return null
+      const updated: Task = { ...existing, status: "in-progress", assigned_engineer_id: engineerId, time_updated: Date.now() }
+      tasks.set(taskId, updated)
+      return updated
+    }),
   listReadyTasks: (teamId: TeamID) =>
     Effect.sync(() => {
       const all = [...tasks.values()].filter((t) => t.team_id === teamId)
@@ -407,7 +415,7 @@ const memLead = LeadCoordinatorService.of({
         tasks.set(id, task)
         results.push(task)
       }
-      return results
+      return { tasks: results, warnings: [] }
     }),
   assign: (input) =>
     Effect.sync(() => {
@@ -462,7 +470,7 @@ const memLead = LeadCoordinatorService.of({
       if (!task) throw new Error(`Task not found: ${input.taskId}`)
       const updated: Task = { ...task, assigned_engineer_id: input.toEngineer, status: "in-progress", time_updated: Date.now() }
       tasks.set(task.id, updated)
-      return updated
+      return { task: updated, warnings: [] }
     }),
   retask: (input) =>
     Effect.sync(() => {
@@ -476,7 +484,7 @@ const memLead = LeadCoordinatorService.of({
         time_updated: Date.now(),
       }
       tasks.set(task.id, updated)
-      return updated
+      return { task: updated, warnings: [] }
     }),
   validateFileScopes: () => Effect.succeed(true),
   formatStatus: (report: any) => {
@@ -641,9 +649,10 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     teams.set(TEAM_ID, makeTeam({ state: "idle", engineerCount: 0 }))
 
     const specs = makeSubtaskSpecs()
-    const subtasks = await Effect.runPromise(
+    const decomposeResult = await Effect.runPromise(
       memLead.decompose({ teamId: TEAM_ID, request: "create a hello world endpoint", subtasks: specs }),
     )
+    const subtasks = decomposeResult.tasks
     expect(subtasks.length).toBeGreaterThanOrEqual(1)
     expect(subtasks.every((s) => s.title.length > 0)).toBe(true)
     expect(subtasks.every((s) => s.file_scope !== null)).toBe(true)

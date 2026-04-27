@@ -374,6 +374,15 @@ const memTaskBoard = TaskBoardRepoService.of({
   delete: (taskId: TaskBoardID) =>
     Effect.sync(() => { tasks.delete(taskId) }),
 
+  claim: (taskId: TaskBoardID, engineerId: EngineerID) =>
+    Effect.sync(() => {
+      const existing = tasks.get(taskId)
+      if (!existing || existing.status !== "pending" || existing.assigned_engineer_id) return null
+      const updated: Task = { ...existing, status: "in-progress", assigned_engineer_id: engineerId, time_updated: Date.now() }
+      tasks.set(taskId, updated)
+      return updated
+    }),
+
   listReadyTasks: (teamId: TeamID) =>
     Effect.sync(() => {
       const all = [...tasks.values()].filter((t) => t.team_id === teamId)
@@ -391,7 +400,7 @@ const memTaskBoard = TaskBoardRepoService.of({
 })
 
 const memLead = LeadCoordinatorService.of({
-  decompose: () => Effect.succeed([]),
+  decompose: () => Effect.succeed({ tasks: [], warnings: [] }),
   assign: () => Effect.succeed([]),
   monitor: () => Effect.succeed({
     totalTasks: 0, pending: 0, inProgress: 0, completed: 0, failed: 0, blocked: 0, engineers: [], blockers: [],
@@ -402,7 +411,7 @@ const memLead = LeadCoordinatorService.of({
       if (!task) throw new Error(`Task not found: ${input.taskId}`)
       const updated = { ...task, assigned_engineer_id: input.toEngineer, status: "in-progress" as const }
       tasks.set(task.id, updated)
-      return updated
+      return { task: updated, warnings: [] }
     }),
   retask: (input) =>
     Effect.sync(() => {
@@ -415,7 +424,7 @@ const memLead = LeadCoordinatorService.of({
         ...(input.fileScope !== undefined ? { file_scope: JSON.stringify(input.fileScope) } : {}),
       }
       tasks.set(task.id, updated)
-      return updated
+      return { task: updated, warnings: [] }
     }),
   validateFileScopes: () => Effect.succeed(true),
   formatStatus: () => "",
@@ -1169,11 +1178,16 @@ describe("Team Lifecycle Integration", () => {
         }),
       )
       // Backdate exactly to the cutoff boundary (created_at === now - maxAgeMs)
+      const now = Date.now()
       const stored = mailboxStore.get(msg.id)!
-      mailboxStore.set(msg.id, { ...stored, created_at: Date.now() - MAILBOX_MAX_AGE_MS })
+      mailboxStore.set(msg.id, { ...stored, created_at: now - MAILBOX_MAX_AGE_MS })
 
       // lt is strict — message exactly at boundary should survive
-      const purged = await Effect.runPromise(memMailbox.purgeOlderThan(MAILBOX_MAX_AGE_MS))
+      const originalNow = Date.now
+      Date.now = () => now
+      const purged = await Effect.runPromise(memMailbox.purgeOlderThan(MAILBOX_MAX_AGE_MS)).finally(() => {
+        Date.now = originalNow
+      })
       expect(purged).toBe(0)
 
       const remaining = await Effect.runPromise(memMailbox.peek(recipient))
@@ -1564,9 +1578,9 @@ describe("Team Lifecycle Integration", () => {
       const before = mailboxStore.size
       const result = await runHeartbeat(service.runDiagnostic(ENG_A, TEAM_ID))
 
-      // No task to reassign and idle peers are alive → killed action,
-      // not all-failed; no urgent mail.
-      expect(result.action).toBe("killed")
+      // No task to reassign and the dead-health slot is already idle →
+      // do not kill it, and do not fire all-failed urgent mail.
+      expect(result.action).toBe("healthy")
       const allFailedMsgs = [...mailboxStore.values()].filter(
         (m) => m.type === "all-engineers-failed",
       )
