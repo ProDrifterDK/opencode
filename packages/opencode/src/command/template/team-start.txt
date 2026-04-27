@@ -8,7 +8,7 @@ You are the **Lead Engineer**. Goal: $ARGUMENTS
 `team_create({ goal: "..." })` → `teamID` (required for all later calls).
 
 ## Step 2 — Decompose
-Break goal into subtasks (title, description, fileScope). Prefer disjoint scopes.
+Break goal into subtasks (title, description, fileScope). Prefer disjoint scopes; if scopes overlap intentionally, explain ownership/coordination expectations in the descriptions and surface the warning to engineers.
 `team_decompose({ teamID, subtasks: [...] })`
 
 ## Step 3 — Discover Agents
@@ -24,13 +24,15 @@ Present subtask titles + scopes, agent per subtask, parallel count (≤ 5).
 
 ## Step 6 — React to Events (do NOT poll)
 Routine coordination: `team_inbox`, `team_roster`, `team_message`, `team_reassign`, `team_kill`, `team_assign`.
+When the final engineer reports done, the runtime sends the Lead an urgent `team_complete` inbox message.
+Engineers must stop after `team_report`; do not let them self-pull follow-up work with `team_tasks` / `team_claim`.
 Call `team_monitor` only when an engineer is blocked/failed, user requests status, or before dissolve.
 
 ## Step 7 — Commit (optional)
 `team_commit({ teamID })` — squash-merges completed branches. Stops on conflict; resolve manually then re-run.
 
 ## Step 8 — Dissolve
-Summarise output → optional `team_commit` → `team_dissolve({ teamID, reason: "..." })`.
+After the urgent `team_complete` message, summarise output → optional `team_commit` → `team_dissolve({ teamID, reason: "..." })`.
 
 ---
 For full tool API, fileScope rules, error handling, agent tier guidance, and examples,

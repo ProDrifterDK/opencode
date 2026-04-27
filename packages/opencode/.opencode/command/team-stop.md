@@ -46,7 +46,7 @@ dissolve the whole team.
    - If no team ID is available, tell the user: "No team to stop. Pass
      a team ID: `/team-stop <tm_...>`."
 
-2. Check for in-progress work before destructively dissolving. You can
+2. Check for in-progress work before dissolving. You can
    call `team_monitor({ teamID })` to get task counts. If `inProgress`
    or `blocked` counts are non-zero, ask the user to confirm before
    proceeding.
@@ -54,17 +54,17 @@ dissolve the whole team.
 3. Call:
 
 ```
-team_dissolve({ teamID, force: <true_if_user_confirmed_destructive> })
+team_dissolve({ teamID, reason: "<why the team is being stopped>" })
 ```
 
 `team_dissolve` sets state to `dissolving`, kills all engineers, purges
-their mailboxes, deletes task board entries, and cleans up team git
-branches (via `GitManager.cleanupBranches`). This replaces the older
-`dissolveTeam({ teamID })` service call.
+their mailboxes, archives task board entries for later summaries, and cleans
+up team git branches (via `GitManager.cleanupBranches`). This replaces the
+older `dissolveTeam({ teamID })` service call.
 
-Without `force: true` the tool refuses when in-progress tasks exist.
-Use the tool's error message verbatim — do not try to batch-kill
-engineers manually as a workaround.
+If the tool refuses because tasks are still in progress, use the tool's error
+message verbatim and either wait for completion or explicitly stop engineers
+first. Do not try to batch-kill engineers manually as a workaround.
 
 Display confirmation based on the tool's output, e.g.:
 
@@ -80,11 +80,11 @@ Branches cleaned: <yes|no>
   tell the user and stop.
 - `Only the lead can …`: this session is not the Lead — tell the user.
 - `Cannot dissolve: N tasks in progress`: tell the user the count and
-  offer to re-run with `force`.
+  either wait for completion or stop specific engineers first.
 
 ## Safety
 
-Dissolving a team is destructive. When in-progress tasks exist, always
-confirm with the user before passing `force: true` — their
-in-progress work will be marked `failed` and the engineers terminated
+Dissolving a team terminates live engineer processes and archives the board.
+When in-progress tasks exist, confirm with the user before killing engineers —
+their in-progress work will be marked `failed` and the engineers terminated
 mid-execution.

@@ -30,11 +30,13 @@ Break the goal into independent subtasks. For each, specify:
 - A detailed description
 - A `fileScope`: list of files or directories the subtask will touch
 
-Prefer **disjoint** scopes. Each engineer runs in an isolated worktree
+Prefer **disjoint** scopes. Intentional overlaps are allowed, but you must
+explain ownership/coordination expectations in the subtask descriptions and
+surface any coordination warnings to engineers. Each engineer runs in an isolated worktree
 at `<repoRoot>/.tmp/team/<teamID>/<engineerID>/` on branch
 `team/<teamID>/engineer-<engineerID>`. The lead's main tree is never
-switched. `fileScope` is still useful as documentation of intent and as
-input to PermissionGuard, but overlapping scopes no longer cause silent
+switched. `fileScope` is useful as documentation of intent and as
+coordination metadata, but overlapping scopes no longer cause silent
 overwrites — conflicts surface at `team_commit` time and require manual
 resolution.
 
@@ -93,6 +95,13 @@ Coordination tools:
 - `team_reassign` — move a task from one engineer to another
 - `team_kill` + fresh `team_spawn` — replace a failed engineer
 - `team_assign` — auto-pair any pending tasks with idle engineers
+
+When the final engineer reports completion and every task is `completed`,
+the runtime sends the Lead an urgent `team_complete` inbox message. Treat it
+as the terminal coordination signal.
+
+Engineers must stop after `team_report` and wait for Lead instructions; they
+must not self-pull follow-up work with `team_tasks` / `team_claim`.
 
 ## Step 7: Checkpoint Progress (optional, recommended)
 
