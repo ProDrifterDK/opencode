@@ -22,6 +22,7 @@ import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
 import { isTeamVisibleAgent } from "../team/agent-source"
 import { resolveEngineerRecipient } from "../team/message-routing"
+import { buildReviewPacket, decodeReviewPacket, encodeReviewPacket } from "../team/review-packet"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { execSync } from "node:child_process"
@@ -584,7 +585,8 @@ const teamDecomposeParams = Schema.Struct({
       files: Schema.Array(Schema.String).pipe(
         Schema.optional,
         Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>)),
-      ),
+      ).annotate({ description: "Files this subtask may modify; use fileScope as an accepted alias" }),
+      fileScope: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Alias for files, matching team_spawn task.fileScope" }),
       dependencies: Schema.optional(Schema.Array(Schema.String)).annotate({
         description: "IDs of subtasks (from `id` field) that must complete before this one can start",
       }),
@@ -620,7 +622,8 @@ export const TeamDecomposeTool = Tool.define(
               id: s.id,
               title: s.title,
               description: s.description,
-              files: s.files ? [...s.files] : [],
+              fileScope: s.fileScope ? [...s.fileScope] : undefined,
+              files: s.fileScope ? undefined : [...(s.files ?? [])],
               dependencies: s.dependencies ? [...s.dependencies] : undefined,
               complexity: s.complexity,
             })),
@@ -1349,6 +1352,20 @@ export const TeamCommitTool = Tool.define(
 const teamReportParams = Schema.Struct({
   status: Schema.Literals(["completed", "blocked", "failed"]).annotate({ description: "Task completion status" }),
   summary: Schema.String.annotate({ description: "Brief summary of work done or reason for failure/block" }),
+  reportPath: Schema.optional(Schema.String).annotate({ description: "Path to the detailed report file, typically .tmp/report-<engineer>.md" }),
+  changedFiles: Schema.Array(Schema.String).pipe(
+    Schema.optional,
+    Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>)),
+  ).annotate({ description: "Files changed or inspected as final evidence" }),
+  verificationCommands: Schema.Array(Schema.String).pipe(
+    Schema.optional,
+    Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>)),
+  ).annotate({ description: "Exact verification commands run" }),
+  knownGaps: Schema.Array(Schema.String).pipe(
+    Schema.optional,
+    Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>)),
+  ).annotate({ description: "Known gaps, skipped checks, weak tests, or assumptions" }),
+  confidence: Schema.optional(Schema.Literals(["low", "medium", "high"])).annotate({ description: "Engineer confidence in the result" }),
 })
 
 export const TeamReportTool = Tool.define(
@@ -1379,9 +1396,20 @@ export const TeamReportTool = Tool.define(
           const taskID = engineer.currentTask as import("../team/task-board.sql").TaskBoardID
           const task = yield* taskBoard.get(taskID)
           const taskTitle = task?.title ?? taskID
+          const reviewPacket = buildReviewPacket({
+            status: params.status,
+            summary: params.summary,
+            reportPath: params.reportPath,
+            changedFiles: params.changedFiles,
+            verificationCommands: params.verificationCommands,
+            knownGaps: params.knownGaps,
+            confidence: params.confidence,
+          })
 
           yield* taskBoard.update(taskID, {
             status: params.status,
+            completed_at: params.status === "completed" ? Date.now() : undefined,
+            review_packet: encodeReviewPacket(reviewPacket),
           })
 
           const newState = params.status === "completed" ? "idle" : params.status === "blocked" ? "blocked" : "failed"
@@ -1408,6 +1436,7 @@ export const TeamReportTool = Tool.define(
               taskTitle,
               engineerName: engineer.name,
               summary: params.summary,
+              reviewPacket,
             })
           } else if (params.status === "failed") {
             publishTeamEvent(Event.EngineerFailed, {
@@ -1426,6 +1455,12 @@ export const TeamReportTool = Tool.define(
             `Task reported as ${params.status}.`,
             `Task ID: ${taskID}`,
             `Summary: ${params.summary}`,
+            params.reportPath ? `Report: ${params.reportPath}` : null,
+            reviewPacket.changedFiles.length > 0 ? `Changed files: ${reviewPacket.changedFiles.join(", ")}` : null,
+            reviewPacket.verificationCommands.length > 0 ? `Verification: ${reviewPacket.verificationCommands.join(" && ")}` : null,
+            reviewPacket.knownGaps.length > 0 ? `Known gaps: ${reviewPacket.knownGaps.join("; ")}` : null,
+            params.confidence ? `Confidence: ${params.confidence}` : null,
+            reviewPacket.warnings.length > 0 ? `Review warnings: ${reviewPacket.warnings.join("; ")}` : null,
             ``,
             `Lead has been notified. You can now stand by for further instructions.`,
           ].join("\n")
@@ -1437,6 +1472,7 @@ export const TeamReportTool = Tool.define(
               taskID,
               status: params.status,
               engineerID: engineer.engineerID,
+              reviewPacket,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -1638,6 +1674,15 @@ export const TeamTasksTool = Tool.define(
             if (task.description) {
               lines.push(`   ${task.description.slice(0, 60)}${task.description.length > 60 ? "..." : ""}`)
             }
+            const reviewPacket = decodeReviewPacket(task.review_packet)
+            if (reviewPacket) {
+              if (reviewPacket.reportPath) lines.push(`   Report: ${reviewPacket.reportPath}`)
+              if (reviewPacket.changedFiles.length > 0) lines.push(`   Changed files: ${reviewPacket.changedFiles.join(", ")}`)
+              if (reviewPacket.verificationCommands.length > 0) lines.push(`   Verification: ${reviewPacket.verificationCommands.join(" && ")}`)
+              if (reviewPacket.knownGaps.length > 0) lines.push(`   Known gaps: ${reviewPacket.knownGaps.join("; ")}`)
+              if (reviewPacket.confidence) lines.push(`   Confidence: ${reviewPacket.confidence}`)
+              if (reviewPacket.warnings.length > 0) lines.push(`   Review warnings: ${reviewPacket.warnings.join("; ")}`)
+            }
           }
 
           lines.push("")
@@ -1653,6 +1698,7 @@ export const TeamTasksTool = Tool.define(
                 title: t.title,
                 status: t.status,
                 assignedTo: t.assigned_engineer_id,
+                reviewPacket: decodeReviewPacket(t.review_packet),
               })),
             },
           }
