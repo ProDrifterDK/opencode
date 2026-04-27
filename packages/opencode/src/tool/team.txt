@@ -9,7 +9,8 @@ WORKFLOW FOR LEAD:
 3. team_agents — list configured agents (read their descriptions)
 4. Present plan to the user and wait for explicit confirmation
 5. team_spawn — create an engineer per subtask with an agent + task
-6. Wait for engineer messages via team_inbox (DO NOT poll team_monitor)
+6. Wait for engineer messages via team_inbox (DO NOT poll team_monitor); the
+   final all-done state arrives as an urgent team_complete inbox message
 7. team_commit — squash-merge each completed engineer's branch into the
    lead's current branch using the engineer's task title as the commit
    message; conflicts are surfaced and require manual resolution
@@ -20,7 +21,7 @@ Call it only on demand (blocked engineer, user-requested status, final
 pre-dissolve summary). Routine coordination happens through team_inbox and
 team_message.
 
-Available tools (17 total):
+Available tools (20 total):
 
 Lead-only:
 - team_create: Initialize a new team for a goal
@@ -32,21 +33,28 @@ Lead-only:
 - team_retask: Edit a pending/blocked task's title, description, or fileScope
 - team_kill: Terminate a single engineer session
 - team_dissolve: Gracefully shut down a team
+- team_resume: Resume a terminated team after daemon restart
 - team_commit: Squash-merge each completed engineer's branch into the
   lead's current branch using the engineer's task title as the commit
   message. Conflicts are surfaced and require manual resolution.
+- team_share: Share all team session transcripts for review or handoff
 
 Engineer-only:
 - team_status: Report state and progress
 - team_report: Report task completion/failure/blocked status
-- team_claim: Claim an unassigned task to work on
+  (final completed report can trigger urgent team_complete to the lead)
+- team_claim: Claim an unassigned task to work on only when the Lead explicitly asks
+
+Engineers must stop after `team_report` and wait for Lead instructions. Do not
+self-pull more work after reporting completion; `team_claim` rejects engineers
+that already completed their assigned task.
 
 Both roles:
 - team_monitor: Get progress report (on-demand only, not for polling)
 - team_inbox: Read unread messages addressed to you
 - team_roster: List all teammates with IDs and status
 - team_tasks: List pending / unassigned tasks
-- team_message: Send a message to another session (use engineer ID or "lead")
+- team_message: Send a message to another session (use engineer ID, unique engineer name, or "lead")
 
 Agent Selection for Engineers (REQUIRED):
 You MUST specify an agent when spawning engineers. First call team_agents,
