@@ -29,6 +29,7 @@ import { RateLimiter } from "./rate-limiter"
 import type { EngineerID, TeamID } from "./types"
 import { deleteRunning } from "./daemon-running"
 import { ProviderID, ModelID } from "@/provider/schema"
+import { buildEngineerPrompt } from "./engineer-prompt"
 
 const log = Log.create({ service: "team.engineer-loop" })
 
@@ -125,6 +126,8 @@ export interface EngineerLoopInput {
   taskId: string
   taskTitle: string
   taskDescription: string
+  fileScope?: readonly string[]
+  coordinationWarnings?: readonly string[]
   providerID?: string
   modelID?: string
   /**
@@ -190,54 +193,7 @@ const attemptTask = (
           timestamp: Date.now(),
         })
 
-        // Build teammates section if we have teammates
-        const teammatesSection = input.teammates && input.teammates.length > 0
-          ? [
-              ``,
-              `Your teammates:`,
-              ...input.teammates.map((t) => `- ${t.name} (ID: ${t.engineerID})${t.task ? ` - working on: ${t.task}` : ""}`),
-              `Use team_message with recipientID to collaborate with them.`,
-            ]
-          : []
-
-        const retryNote = attemptLabel === "fallback"
-          ? [
-              `NOTE: Your previous attempt was interrupted because the primary provider hit a sustained 429 burst. You are now running on the fallback provider; pick up the task and complete it.`,
-              ``,
-            ]
-          : []
-
-        const engineerPrompt = [
-          `You are an engineer on team ${input.teamID}. Your name is ${input.name}.`,
-          ...teammatesSection,
-          ``,
-          ...retryNote,
-          `Your assigned task:`,
-          `Title: ${input.taskTitle}`,
-          `Description: ${input.taskDescription}`,
-          ``,
-          `Instructions:`,
-          `1. Analyze the task and plan your approach`,
-          `2. Execute the work using available tools (Read, Write, Edit, Bash, etc.)`,
-          `3. Test your changes`,
-          `4. Write your findings/report to a file: .tmp/report-${input.name}.md`,
-          `5. IMPORTANT: When finished, call team_report with:`,
-          `   - status: "completed" (or "blocked"/"failed" if issues)`,
-          `   - summary: ONE sentence + path to report file (e.g., "Completed review. Report: .tmp/report-${input.name}.md")`,
-          `   - DO NOT send full report content via team_report — keep summary under 200 chars`,
-          `6. After reporting, you may check team_tasks for NEW unassigned work.`,
-          `   - team_tasks only shows pending, unassigned tasks (NOT your completed task)`,
-          `   - If NEW tasks are available, use team_claim to claim one and work on it.`,
-          `   - If NO NEW tasks are available, STOP. Do not reclaim your completed task.`,
-          ``,
-          `Collaboration tools:`,
-          `- team_message: Send message to a teammate or lead`,
-          `- team_roster: See all teammates and their IDs`,
-          `- team_tasks: List available tasks (only shows pending, unassigned tasks)`,
-          `- team_claim: Claim an unassigned task`,
-          ``,
-          `Start working on your assigned task now. Remember to call team_report when done.`,
-        ].join("\n")
+        const engineerPrompt = buildEngineerPrompt(input, attemptLabel)
 
         yield* promptService.prompt({
           sessionID: input.sessionID,

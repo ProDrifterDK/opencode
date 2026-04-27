@@ -21,6 +21,7 @@ import {
   layer as rateLimiterLayer,
   CircuitBreakerOpenError,
 } from "./rate-limiter"
+import { buildEngineerPrompt } from "./engineer-prompt"
 import type { EngineerID, TeamID } from "./types"
 
 const ENGINEER_TOKEN_ESTIMATE = 8000
@@ -186,6 +187,59 @@ describe("engineer-loop fallback failover (O1)", () => {
   test("CircuitBreakerOpenError tag string is stable", () => {
     const err = new CircuitBreakerOpenError({ engineerID: "x", remainingMs: 1 })
     expect(err._tag).toBe("CircuitBreakerOpenError")
+  })
+})
+
+describe("engineer prompt coordination context", () => {
+  test("includes assigned fileScope and coordination warnings", () => {
+    const prompt = buildEngineerPrompt({
+      teamID: "team_soft_scope",
+      name: "engineer-auth",
+      taskTitle: "Update auth middleware",
+      taskDescription: "Adjust auth behavior and tests.",
+      fileScope: ["src/auth/**", "src/middleware/auth.ts"],
+      coordinationWarnings: [
+        "Coordinate before editing overlapping file scopes: \"Update auth middleware\" overlaps with \"Write auth tests\".",
+      ],
+    }, "primary")
+
+    expect(prompt).toContain("Assigned fileScope:")
+    expect(prompt).toContain("- src/auth/**")
+    expect(prompt).toContain("Coordination warnings:")
+    expect(prompt).toContain("Before editing overlapping files")
+    expect(prompt).toContain("report status \"blocked\"")
+  })
+
+  test("omits coordination section when no warnings exist", () => {
+    const prompt = buildEngineerPrompt({
+      teamID: "team_soft_scope",
+      name: "engineer-docs",
+      taskTitle: "Update docs",
+      taskDescription: "Refresh docs.",
+      fileScope: ["README.md"],
+      coordinationWarnings: [],
+    }, "primary")
+
+    expect(prompt).toContain("Assigned fileScope:")
+    expect(prompt).not.toContain("Coordination warnings:")
+  })
+
+  test("includes teammate names and stable IDs for team_message targeting", () => {
+    const prompt = buildEngineerPrompt({
+      teamID: "team_message_ids",
+      name: "engineer-docs-reviewer",
+      taskTitle: "Review docs",
+      taskDescription: "Ask frontend before reviewing docs touched by UI work.",
+      teammates: [
+        { name: "engineer-frontend", engineerID: "eng_frontend", task: "Update UI docs" },
+        { name: "engineer-backend", engineerID: "eng_backend", task: "Update API" },
+      ],
+    }, "primary")
+
+    expect(prompt).toContain("Your teammates:")
+    expect(prompt).toContain("engineer-frontend (ID: eng_frontend)")
+    expect(prompt).toContain("engineer-backend (ID: eng_backend)")
+    expect(prompt).toContain("Use team_message with recipientID")
   })
 })
 
