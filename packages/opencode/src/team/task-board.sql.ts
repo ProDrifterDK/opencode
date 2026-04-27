@@ -65,6 +65,7 @@ export interface TaskBoardService {
   update(taskId: TaskBoardID, input: UpdateTaskInput): Task
   list(filter: TaskBoardFilter): Task[]
   get(taskId: TaskBoardID): Task | null
+  claim(taskId: TaskBoardID, engineerId: EngineerID): Task | null
   delete(taskId: TaskBoardID): void
 }
 

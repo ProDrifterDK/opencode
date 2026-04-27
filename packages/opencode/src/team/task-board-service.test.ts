@@ -76,6 +76,20 @@ const makeMemoryTaskBoard = () => {
     delete: (taskId: TaskBoardID) =>
       Effect.sync(() => { tasks.delete(taskId) }),
 
+    claim: (taskId: TaskBoardID, engineerId: EngineerID) =>
+      Effect.sync(() => {
+        const existing = tasks.get(taskId)
+        if (!existing || existing.status !== "pending" || existing.assigned_engineer_id || existing.archived_at !== null) return null
+        const updated: Task = {
+          ...existing,
+          status: "in-progress",
+          assigned_engineer_id: engineerId,
+          time_updated: Date.now(),
+        }
+        tasks.set(taskId, updated)
+        return updated
+      }),
+
     listReadyTasks: (teamId: TeamID) =>
       Effect.sync(() => {
         const all = [...tasks.values()].filter((t) => t.team_id === teamId && t.archived_at === null)

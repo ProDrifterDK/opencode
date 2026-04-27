@@ -56,6 +56,7 @@ const makeTaskBoardStub = (tasks: TaskRow[]) =>
     list: () => Effect.succeed(tasks as any),
     get: (id) => Effect.succeed(tasks.find((t) => t.id === id) ?? null as any),
     delete: () => Effect.die("not implemented"),
+    claim: () => Effect.die("not implemented"),
     listReadyTasks: () => Effect.succeed([] as any),
     archiveTeamBoard: () => Effect.void,
     listArchived: () => Effect.succeed([] as any),

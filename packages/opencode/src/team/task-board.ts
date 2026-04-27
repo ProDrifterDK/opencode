@@ -10,6 +10,7 @@ import {
   type TaskBoardFilter,
   type TaskBoardService,
   type TeamID,
+  type EngineerID,
 } from "./task-board.sql"
 
 const encodeDependencies = (deps: readonly TaskBoardID[]): string => JSON.stringify(deps)
@@ -56,6 +57,8 @@ export interface Interface {
   readonly list: (filter: TaskBoardFilter) => Effect.Effect<Task[], TaskBoardRepoError>
   readonly get: (taskId: TaskBoardID) => Effect.Effect<Task | null, TaskBoardRepoError>
   readonly delete: (taskId: TaskBoardID) => Effect.Effect<void, TaskBoardRepoError>
+  /** Atomically claims a pending, unassigned task. Returns null if it is no longer claimable. */
+  readonly claim: (taskId: TaskBoardID, engineerId: EngineerID) => Effect.Effect<Task | null, TaskBoardRepoError>
   /** Returns pending tasks whose every dependency is completed (or has no dependencies). */
   readonly listReadyTasks: (teamId: TeamID) => Effect.Effect<Task[], TaskBoardRepoError>
   /** Soft-deletes all non-archived tasks for a team by setting archived_at. */
@@ -186,6 +189,26 @@ export const layer: Layer.Layer<Service> = Layer.effect(
       })
     })
 
+    const claim = Effect.fn("TaskBoardRepo.claim")((taskId: TaskBoardID, engineerId: EngineerID) => {
+      return tx((db) => {
+        const row = db.update(TaskBoardTable)
+          .set({
+            status: "in-progress",
+            assigned_engineer_id: engineerId,
+            time_updated: Date.now(),
+          })
+          .where(and(
+            eq(TaskBoardTable.id, taskId),
+            eq(TaskBoardTable.status, "pending"),
+            isNull(TaskBoardTable.assigned_engineer_id),
+            isNull(TaskBoardTable.archived_at),
+          ))
+          .returning()
+          .get()
+        return row ? rowToTask(row) : null
+      })
+    })
+
     const remove = Effect.fn("TaskBoardRepo.delete")((taskId: TaskBoardID) => {
       return tx((db) => {
         db.delete(TaskBoardTable).where(eq(TaskBoardTable.id, taskId)).run()
@@ -219,6 +242,7 @@ export const layer: Layer.Layer<Service> = Layer.effect(
       list,
       get,
       delete: remove,
+      claim,
       listReadyTasks,
       archiveTeamBoard,
       listArchived,
