@@ -13,7 +13,29 @@ import { TEAM_AGENTS_CACHE_TTL_MS } from "../team/constants"
 
 // ─── Inline agent type (mirrors Agent.Info shape we care about) ──────────────
 
-type AgentItem = { name: string; hidden?: boolean; native?: boolean }
+type AgentItem = {
+  name: string
+  hidden?: boolean
+  native?: boolean
+  model?: { providerID: string; modelID: string }
+}
+
+type ModelLookup =
+  | { ok: true }
+  | { ok: false; suggestions?: string[] }
+
+const validateConfiguredModel = (
+  label: "Agent" | "Fallback agent",
+  name: string,
+  model: AgentItem["model"],
+  lookup: (providerID: string, modelID: string) => ModelLookup,
+) => {
+  if (!model) return null
+  const result = lookup(model.providerID, model.modelID)
+  if (result.ok) return null
+  const hint = result.suggestions?.length ? ` Did you mean: ${result.suggestions.join(", ")}?` : ""
+  return `${label} '${name}' references unavailable model ${model.providerID}/${model.modelID}.${hint}`
+}
 
 // ─── Inline cache + validation logic (mirrors TeamSpawnTool exactly) ─────────
 
@@ -222,5 +244,44 @@ describe("team_spawn fallback agent validation (O1)", () => {
     const r = lookupAgent("ENGINEER-FAST", "Fallback agent", agents)
     expect(r.ok).toBe(true)
     if (r.ok) expect(r.agent.name).toBe("engineer-fast")
+  })
+})
+
+describe("team_spawn agent model validation", () => {
+  test("valid agent model passes preflight", () => {
+    const error = validateConfiguredModel(
+      "Agent",
+      "engineer-deep",
+      { providerID: "openai", modelID: "gpt-5" },
+      () => ({ ok: true }),
+    )
+
+    expect(error).toBeNull()
+  })
+
+  test("invalid primary agent model is rejected before spawning", () => {
+    const error = validateConfiguredModel(
+      "Agent",
+      "oracle",
+      { providerID: "openai", modelID: "gpt-5.5-pro" },
+      () => ({ ok: false, suggestions: ["gpt-5", "gpt-5-pro"] }),
+    )
+
+    expect(error).toBe(
+      "Agent 'oracle' references unavailable model openai/gpt-5.5-pro. Did you mean: gpt-5, gpt-5-pro?",
+    )
+  })
+
+  test("invalid fallback agent model is labeled separately", () => {
+    const error = validateConfiguredModel(
+      "Fallback agent",
+      "fallback-deep",
+      { providerID: "anthropic", modelID: "missing-model" },
+      () => ({ ok: false }),
+    )
+
+    expect(error).toBe(
+      "Fallback agent 'fallback-deep' references unavailable model anthropic/missing-model.",
+    )
   })
 })

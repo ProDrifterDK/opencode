@@ -2,27 +2,75 @@ import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { SessionShare } from "../share"
 import { SessionCoordinator } from "../team/session-coordinator"
-import { LeadCoordinator } from "../team/lead-coordinator"
+import { LeadCoordinator, findFileScopeWarnings, type FileScopeWarning } from "../team/lead-coordinator"
 import { TaskBoardRepo } from "../team/task-board"
 import { Mailbox } from "../team/mailbox"
 import { TeamID } from "../team/types"
 import type { EngineerStateRecord } from "../team/types"
 import { Event, publishTeamEvent } from "../team/events"
 import { Provider } from "../provider"
+import { Config } from "../config"
 import { TeamDaemon } from "../team/daemon"
 import { HeartbeatMonitor } from "../team/heartbeat"
 import { GitManager } from "../team/git-manager"
 import { Agent } from "../agent/agent"
+import { hasCompletedAssignedTask } from "../team/claim-policy"
+import { resolveSpawnTaskCandidate } from "../team/spawn-task"
 import { TEAM_AGENTS_CACHE_TTL_MS } from "../team/constants"
 import { checkAndRecordMessage } from "../team/message-rate-limiter"
 import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
+import { isTeamVisibleAgent } from "../team/agent-source"
+import { resolveEngineerRecipient } from "../team/message-routing"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { execSync } from "node:child_process"
 import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "tool.team" })
+
+const decodeFileScope = (raw: string | null): string[] => {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []
+  } catch (err) {
+    log.warn("invalid task file_scope JSON", { error: String(err) })
+    return []
+  }
+}
+
+const formatCoordinationWarnings = (warnings: readonly FileScopeWarning[]) =>
+  warnings.length === 0
+    ? []
+    : [
+        "",
+        "Coordination warnings:",
+        ...warnings.map((warning) => `  - ${warning.message}`),
+      ]
+
+const computeTaskWarnings = (input: {
+  task: Pick<import("../team/task-board.sql").Task, "id" | "title" | "file_scope">
+  tasks: readonly Pick<import("../team/task-board.sql").Task, "id" | "title" | "file_scope" | "status">[]
+}) =>
+  findFileScopeWarnings({
+    task: {
+      id: input.task.id,
+      title: input.task.title,
+      files: decodeFileScope(input.task.file_scope),
+    },
+    others: input.tasks
+      .filter((task) =>
+        task.id !== input.task.id &&
+        task.status !== "completed" &&
+        task.status !== "failed"
+      )
+      .map((task) => ({
+        id: task.id,
+        title: task.title,
+        files: decodeFileScope(task.file_scope),
+      })),
+  })
 // Priority translation: 4-tier (tool) -> 3-tier (mailbox).
 // Note: `high` and `normal` both collapse to `inbox` — documented design;
 // the 4-tier surface is for caller clarity, not distinct delivery semantics.
@@ -90,11 +138,11 @@ const TOOL_DESCRIPTIONS = {
     "Aggregate progress report for a team. Call on-demand only — do NOT poll; engineers notify the lead through team_inbox.",
   team_inbox: "Read unread messages addressed to you (fast, no aggregate status).",
   team_message:
-    "Send a message to another session. Recipient is an engineer ID or 'lead'.",
+    "Send a message to another session. Recipient is an engineer ID, unique engineer name, or 'lead'.",
   team_roster:
     "List all teammates with IDs and current state. Use before team_message to resolve engineer IDs.",
-  team_tasks: "List pending, unassigned tasks that can be claimed.",
-  team_claim: "Claim an unassigned task to start working on it. Engineer-only.",
+  team_tasks: "List pending, unassigned tasks. Completed engineers are told to stand by unless the lead assigns more work.",
+  team_claim: "Claim an unassigned task only when the Lead explicitly asks. Engineers that completed assigned work are blocked. Engineer-only.",
   team_status: "Report current state and progress. Engineer-only.",
   team_report:
     "Report task completion, failure, or blocked status. Engineer-only; required at end of a task.",
@@ -253,6 +301,8 @@ export const TeamSpawnTool = Tool.define(
     const coordinator = yield* SessionCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
     const agentService = yield* Agent.Service
+    const providerService = yield* Provider.Service
+    const configService = yield* Config.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_spawn,
@@ -266,11 +316,11 @@ export const TeamSpawnTool = Tool.define(
 
           // Resolve agent (and optional fallback) to get model configuration and color.
           // Both validations consume the E4 _agentsCache so we never double-list().
-          let modelConfig: { providerID: string; modelID: string } | undefined
+          let modelConfig: Agent.Info["model"] | undefined
           let agentName: string | undefined
           let agentColor: string | undefined
           let fallbackAgentName: string | undefined
-          let fallbackModelConfig: { providerID: string; modelID: string } | undefined
+          let fallbackModelConfig: Agent.Info["model"] | undefined
 
           if (params.agent || params.fallbackAgent) {
             const now = Date.now()
@@ -282,12 +332,14 @@ export const TeamSpawnTool = Tool.define(
                     _agentsCache = { value: fresh, expiresAt: now + TEAM_AGENTS_CACHE_TTL_MS }
                     return fresh
                   })
+            const config = yield* configService.get()
+            const availableAgents = agents.filter((agent) =>
+              isTeamVisibleAgent(agent, config.agent_origins, { includeNative: true })
+            )
             const lookupAgent = (rawName: string, label: "Agent" | "Fallback agent") => {
-              const found = agents.find(a => a.name.toLowerCase() === rawName.toLowerCase())
+              const found = availableAgents.find(a => a.name.toLowerCase() === rawName.toLowerCase())
               if (!found) {
-                const available = agents
-                  .filter(a => !a.hidden && !a.native)
-                  .map(a => a.name)
+                const available = availableAgents.filter(a => !a.native).map(a => a.name)
                 const availableList = available.length > 0 ? available.join(", ") : "(none configured)"
                 return { ok: false as const, error: `${label} '${rawName}' not found. Available: ${availableList}` }
               }
@@ -319,7 +371,51 @@ export const TeamSpawnTool = Tool.define(
             }
           }
 
+          const validateModel = (
+            label: "Agent" | "Fallback agent",
+            name: string,
+            model: NonNullable<Agent.Info["model"]>,
+          ) =>
+            providerService.getModel(model.providerID, model.modelID).pipe(
+              Effect.catch((err: unknown) => {
+                const modelRef = `${model.providerID}/${model.modelID}`
+                const hint = Provider.ModelNotFoundError.isInstance(err) && err.data.suggestions?.length
+                  ? ` Did you mean: ${err.data.suggestions.join(", ")}?`
+                  : ""
+                return Effect.fail(new Error(`${label} '${name}' references unavailable model ${modelRef}.${hint}`))
+              }),
+            )
+
+          if (agentName && modelConfig) {
+            yield* validateModel("Agent", agentName, modelConfig)
+          }
+          if (fallbackAgentName && fallbackModelConfig) {
+            yield* validateModel("Fallback agent", fallbackAgentName, fallbackModelConfig)
+          }
+
           const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
+          const fileScope = params.task.fileScope
+            ? JSON.stringify(params.task.fileScope)
+            : null
+
+          const existingTasks = yield* taskBoard.list({ team_id: teamID })
+          const spawnTask = resolveSpawnTaskCandidate({
+            tasks: existingTasks,
+            task: {
+              title: params.task.title,
+              description: params.task.description,
+              fileScope,
+            },
+          })
+
+          if (spawnTask.kind === "ambiguous") {
+            return yield* Effect.fail(
+              new Error(
+                `Cannot spawn engineer: ${spawnTask.count} pending tasks match "${params.task.title}". Use team_assign or retask duplicates first.`,
+              ),
+            )
+          }
+
           const engineerSlot = yield* coordinator.spawnEngineer({
             teamID,
             leadSessionID: ctx.sessionID,
@@ -329,18 +425,30 @@ export const TeamSpawnTool = Tool.define(
             fallbackAgent: fallbackAgentName,
           })
 
-          const fileScope = params.task.fileScope
-            ? JSON.stringify(params.task.fileScope)
+          const claimed = spawnTask.kind === "claim"
+            ? yield* taskBoard.claim(
+              spawnTask.task.id as import("../team/task-board.sql").TaskBoardID,
+              engineerSlot.engineerID,
+            )
             : null
 
-          const task = yield* taskBoard.create({
+          if (spawnTask.kind === "claim" && !claimed) {
+            yield* coordinator.killEngineer({ teamID, engineerID: engineerSlot.engineerID }).pipe(Effect.ignore)
+            return yield* Effect.fail(new Error(`Cannot spawn engineer: task "${params.task.title}" was claimed concurrently.`))
+          }
+
+          const task = claimed ?? (yield* taskBoard.create({
             team_id: teamID,
             title: params.task.title,
             description: params.task.description,
             status: "in-progress",
             assigned_engineer_id: engineerSlot.engineerID,
             file_scope: fileScope,
-          })
+          }))
+          const allTasksAfterSpawn = spawnTask.kind === "claim"
+            ? existingTasks.map((existing) => existing.id === task.id ? task : existing)
+            : [...existingTasks, task]
+          const coordinationWarnings = computeTaskWarnings({ task, tasks: allTasksAfterSpawn })
 
           yield* coordinator.updateEngineer(engineerSlot.engineerID, {
             state: "working",
@@ -357,6 +465,8 @@ export const TeamSpawnTool = Tool.define(
             taskID: task.id,
             taskTitle: params.task.title,
             taskDescription: params.task.description,
+            fileScope: decodeFileScope(task.file_scope),
+            coordinationWarnings: coordinationWarnings.map((warning) => warning.message),
             providerID: modelConfig?.providerID,
             modelID: modelConfig?.modelID,
             agentName,
@@ -381,6 +491,7 @@ export const TeamSpawnTool = Tool.define(
             `Task: ${params.task.title}`,
             modelInfo,
             fallbackInfo,
+            ...formatCoordinationWarnings(coordinationWarnings),
             ``,
             `Note: Do NOT poll team_monitor. Engineer will notify you when done.`,
           ].filter(Boolean).join("\n")
@@ -392,6 +503,7 @@ export const TeamSpawnTool = Tool.define(
               engineerID: engineerSlot.engineerID,
               sessionID: engineerSlot.sessionID,
               taskID: task.id,
+              warnings: coordinationWarnings,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -502,7 +614,7 @@ export const TeamDecomposeTool = Tool.define(
           }
 
           const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
-          const tasks = yield* lead.decompose({
+          const { tasks, warnings } = yield* lead.decompose({
             teamId: teamID,
             subtasks: params.subtasks.map((s) => ({
               id: s.id,
@@ -518,6 +630,7 @@ export const TeamDecomposeTool = Tool.define(
           const output = [
             `Tasks created: ${tasks.length}`,
             ...tasks.map((t) => `  - ${t.title}`),
+            ...formatCoordinationWarnings(warnings),
           ].join("\n")
 
           return {
@@ -526,6 +639,7 @@ export const TeamDecomposeTool = Tool.define(
             metadata: {
               taskCount: tasks.length,
               tasks: tasks.map((t) => ({ taskID: t.id, title: t.title })),
+              warnings,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -554,7 +668,7 @@ export const TeamReassignTool = Tool.define(
             return yield* Effect.fail(new Error("Only the lead can reassign tasks"))
           }
 
-          const task = yield* lead.reassign({
+          const { task, warnings } = yield* lead.reassign({
             taskId: params.taskID as import("../team/task-board.sql").TaskBoardID,
             toEngineer: params.toEngineerID as import("../team/types").EngineerID,
           })
@@ -569,6 +683,7 @@ export const TeamReassignTool = Tool.define(
             `Task ID: ${task.id}`,
             `Task: ${task.title}`,
             `Assigned to engineer: ${params.toEngineerID}`,
+            ...formatCoordinationWarnings(warnings),
           ].join("\n")
 
           return {
@@ -578,6 +693,7 @@ export const TeamReassignTool = Tool.define(
               taskID: task.id,
               title: task.title,
               toEngineerID: params.toEngineerID,
+              warnings,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -605,7 +721,7 @@ export const TeamRetaskTool = Tool.define(
         Effect.gen(function* () {
           yield* requireLead(ctx, coordinator, "retask a task")
 
-          const task = yield* lead.retask({
+          const { task, warnings } = yield* lead.retask({
             taskId: params.taskID as import("../team/task-board.sql").TaskBoardID,
             title: params.title,
             description: params.description,
@@ -617,6 +733,7 @@ export const TeamRetaskTool = Tool.define(
             `Task ID: ${task.id}`,
             `Title: ${task.title}`,
             `Status: ${task.status}`,
+            ...formatCoordinationWarnings(warnings),
           ].join("\n")
 
           return {
@@ -626,6 +743,7 @@ export const TeamRetaskTool = Tool.define(
               taskID: task.id,
               title: task.title,
               status: task.status,
+              warnings,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -694,7 +812,7 @@ export const TeamKillTool = Tool.define(
 )
 
 const teamMessageParams = Schema.Struct({
-  recipientID: Schema.String.annotate({ description: "Engineer ID, or 'lead' to message the lead" }),
+  recipientID: Schema.String.annotate({ description: "Engineer ID, unique engineer name, or 'lead' to message the lead" }),
   content: Schema.String.annotate({ description: "Message content" }),
   priority: Schema.Literals(["low", "normal", "high", "urgent"]).pipe(
     Schema.optional,
@@ -719,24 +837,26 @@ export const TeamMessageTool = Tool.define(
           }
 
           let recipientSessionID: import("../session/schema").SessionID
+          let resolvedRecipientID = params.recipientID
+          let recipientName = params.recipientID
+          let inputWasAlias = false
           if (params.recipientID === "lead") {
             const team = yield* coordinator.getTeam(teamID)
             if (!team) {
               return yield* Effect.fail(new Error("Team not found"))
             }
             recipientSessionID = team.leadSessionID
+            recipientName = "Lead"
           } else {
-            const recipientEngineerID = params.recipientID as import("../team/types").EngineerID
-            const recipient = yield* coordinator.getEngineer(recipientEngineerID)
-            if (!recipient) {
-              return yield* Effect.fail(new Error(`Engineer ${params.recipientID} not found`))
-            }
-            if (recipient.teamID !== teamID) {
-              return yield* Effect.fail(
-                new Error(`Cannot message ${params.recipientID}: not in your team`),
-              )
-            }
-            recipientSessionID = recipient.sessionID
+            const recipient = resolveEngineerRecipient(
+              params.recipientID,
+              yield* coordinator.listTeamEngineers(teamID),
+            )
+            if (recipient.type === "error") return yield* Effect.fail(new Error(recipient.message))
+            recipientSessionID = recipient.recipientSessionID
+            resolvedRecipientID = recipient.resolvedRecipientID
+            recipientName = recipient.recipientName
+            inputWasAlias = recipient.inputWasAlias
           }
 
           const rateCheck = checkAndRecordMessage(ctx.sessionID)
@@ -744,7 +864,7 @@ export const TeamMessageTool = Tool.define(
             return {
               title: `Message to ${params.recipientID}`,
               output: `Rate limit exceeded: 10 messages/min per sender. Retry in ~${Math.ceil(rateCheck.retryAfterMs! / 1000)}s.`,
-              metadata: { rateLimited: true, messageID: "", recipientID: params.recipientID, priority: params.priority },
+              metadata: { rateLimited: true, messageID: "", recipientID: params.recipientID, resolvedRecipientID, recipientName, priority: params.priority },
             }
           }
 
@@ -760,7 +880,8 @@ export const TeamMessageTool = Tool.define(
           const output = [
             `Message sent successfully.`,
             `Message ID: ${message.id}`,
-            `Recipient: ${params.recipientID}`,
+            `Recipient: ${recipientName} (${resolvedRecipientID})`,
+            ...(inputWasAlias ? [`Resolved from alias: ${params.recipientID}`] : []),
             `Priority: ${params.priority}`,
           ].join("\n")
 
@@ -771,6 +892,8 @@ export const TeamMessageTool = Tool.define(
               rateLimited: false,
               messageID: message.id,
               recipientID: params.recipientID,
+              resolvedRecipientID,
+              recipientName,
               priority: params.priority,
             },
           }
@@ -1196,7 +1319,6 @@ export const TeamReportTool = Tool.define(
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
-    const mailbox = yield* Mailbox.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_report,
@@ -1246,6 +1368,9 @@ export const TeamReportTool = Tool.define(
               teamID: engineer.teamID,
               engineerID: engineer.engineerID,
               taskId: taskID,
+              taskTitle,
+              engineerName: engineer.name,
+              summary: params.summary,
             })
           } else if (params.status === "failed") {
             publishTeamEvent(Event.EngineerFailed, {
@@ -1256,24 +1381,9 @@ export const TeamReportTool = Tool.define(
             })
           }
 
-          // Send message to lead to notify them
-          const team = yield* coordinator.getTeam(engineer.teamID)
-          if (team) {
-            const statusEmoji = params.status === "completed" ? "✅" : params.status === "blocked" ? "🚧" : "❌"
-            const message = [
-              `${statusEmoji} Engineer ${engineer.name} reports: ${params.status.toUpperCase()}`,
-              `Task: ${taskTitle}`,
-              `Summary: ${params.summary}`,
-            ].join("\n")
-
-            yield* mailbox.send({
-              senderSessionID: ctx.sessionID,
-              recipientSessionID: team.leadSessionID,
-              type: "team_report",
-              content: message,
-              priority: params.status === "failed" ? "urgent" : "inbox",
-            })
-          }
+          // Lead notifications are sent by TeamDaemon in the lead process
+          // from bridged team events. Mailbox events emitted from engineer
+          // subprocesses are process-local and cannot wake the Lead daemon.
 
           const output = [
             `Task reported as ${params.status}.`,
@@ -1428,6 +1538,21 @@ export const TeamTasksTool = Tool.define(
             return yield* Effect.fail(new Error("Not part of a team"))
           }
 
+          const engineer = yield* coordinator.getEngineerBySession(ctx.sessionID)
+          if (engineer && !engineer.currentTask) {
+            const assignedHistory = yield* taskBoard.list({
+              team_id: engineer.teamID,
+              assigned_engineer_id: engineer.engineerID,
+            })
+            if (hasCompletedAssignedTask(assignedHistory)) {
+              return {
+                title: "Available tasks",
+                output: "You already completed your assigned task. Stand by for lead instructions instead of claiming more work.",
+                metadata: { taskCount: 0, tasks: [] },
+              }
+            }
+          }
+
           const allTasks = yield* taskBoard.list({ team_id: teamID })
           let tasks
           if (params.showAll) {
@@ -1532,6 +1657,16 @@ export const TeamClaimTool = Tool.define(
             )
           }
 
+          const assignedHistory = yield* taskBoard.list({
+            team_id: engineer.teamID,
+            assigned_engineer_id: engineer.engineerID,
+          })
+          if (hasCompletedAssignedTask(assignedHistory)) {
+            return yield* Effect.fail(
+              new Error("You already completed your assigned task. Stand by for lead instructions instead of claiming more work."),
+            )
+          }
+
           const taskID = params.taskID as import("../team/task-board.sql").TaskBoardID
           const task = yield* taskBoard.get(taskID)
           if (!task) {
@@ -1572,11 +1707,13 @@ export const TeamClaimTool = Tool.define(
             )
           }
 
-          // Claim the task
-          yield* taskBoard.update(taskID, {
-            status: "in-progress",
-            assigned_engineer_id: engineer.engineerID,
-          })
+          // Claim the task atomically. The read above gives good error messages;
+          // this conditional update closes races where two idle engineers claim
+          // the same task between the read and write.
+          const claimed = yield* taskBoard.claim(taskID, engineer.engineerID)
+          if (!claimed) {
+            return yield* Effect.fail(new Error("Task was claimed by another engineer before your claim completed."))
+          }
 
           yield* coordinator.updateEngineer(engineer.engineerID, {
             state: "working",
@@ -1638,6 +1775,7 @@ export const TeamAgentsTool = Tool.define(
   "team_agents",
   Effect.gen(function* () {
     const agentService = yield* Agent.Service
+    const configService = yield* Config.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_agents,
@@ -1654,12 +1792,11 @@ export const TeamAgentsTool = Tool.define(
                   return fresh
                 })
           const defaultAgent = yield* agentService.defaultAgent()
+          const config = yield* configService.get()
           const includeNative = params.includeNative ?? false
 
           const agents = allAgents.filter((agent) => {
-            if (agent.hidden) return false
-            if (!includeNative && agent.native) return false
-            return true
+            return isTeamVisibleAgent(agent, config.agent_origins, { includeNative })
           })
 
           if (agents.length === 0) {
