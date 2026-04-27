@@ -93,6 +93,7 @@ export const layer: Layer.Layer<Service> = Layer.effect(
             time_updated: now,
             completed_at: null,
             archived_at: null,
+            review_packet: input.review_packet ?? null,
           })
           .run()
         return {
@@ -110,6 +111,7 @@ export const layer: Layer.Layer<Service> = Layer.effect(
           time_updated: now,
           completed_at: null,
           archived_at: null,
+          review_packet: input.review_packet ?? null,
         } as Task
       })
     })
@@ -138,6 +140,7 @@ export const layer: Layer.Layer<Service> = Layer.effect(
           parent_task_id: input.parent_task_id !== undefined ? input.parent_task_id : existing.parent_task_id,
           completed_at: input.completed_at !== undefined ? input.completed_at : existing.completed_at,
           dependencies: newDeps,
+          review_packet: input.review_packet !== undefined ? input.review_packet : existing.review_packet,
           time_updated: Date.now(),
         }
 

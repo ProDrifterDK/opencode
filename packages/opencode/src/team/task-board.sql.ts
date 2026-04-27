@@ -28,6 +28,7 @@ export interface Task {
   time_updated: number
   completed_at: number | null
   archived_at: number | null
+  review_packet?: string | null
 }
 
 export interface CreateTaskInput {
@@ -40,6 +41,7 @@ export interface CreateTaskInput {
   blocked_by?: TaskBoardID | null
   parent_task_id?: TaskBoardID | null
   dependencies?: readonly TaskBoardID[]
+  review_packet?: string | null
 }
 
 export interface UpdateTaskInput {
@@ -52,6 +54,7 @@ export interface UpdateTaskInput {
   parent_task_id?: TaskBoardID | null
   completed_at?: number | null
   dependencies?: readonly TaskBoardID[]
+  review_packet?: string | null
 }
 
 export interface TaskBoardFilter {
@@ -85,6 +88,7 @@ export const TaskBoardTable = sqliteTable(
     ...Timestamps,
     completed_at: integer(),
     archived_at: integer(),
+    review_packet: text(),
   },
   (table) => [
     index("task_board_team_id_idx").on(table.team_id),
