@@ -267,6 +267,10 @@ export type Info = DeepMutable<Schema.Schema.Type<typeof Info>> & {
   // plugin_origins is derived state, not a persisted config field. It keeps each winning plugin spec together
   // with the file and scope it came from so later runtime code can make location-sensitive decisions.
   plugin_origins?: ConfigPlugin.Origin[]
+  // agent_origins is derived state too. It lets tool surfaces distinguish agents declared in OpenCode config
+  // from compatibility imports or external agent directories that are merged into the same config object.
+  agent_origins?: Record<string, { source: string; scope: ConfigPlugin.Scope }>
+  mode_origins?: Record<string, { source: string; scope: ConfigPlugin.Scope }>
 }
 
 type State = {
@@ -317,7 +321,7 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
 }
 
 function writable(info: Info) {
-  const { plugin_origins: _plugin_origins, ...next } = info
+  const { plugin_origins: _plugin_origins, agent_origins: _agent_origins, mode_origins: _mode_origins, ...next } = info
   return next
 }
 
@@ -474,9 +478,32 @@ export const layer = Layer.effect(
           result.plugin_origins = plugins
         })
 
+        const recordAgentOrigins = Effect.fnUntraced(function* (
+          source: string,
+          next: Info,
+          kind?: ConfigPlugin.Scope,
+        ) {
+          const scope = kind ?? (yield* pluginScopeForSource(source))
+          if (next.agent) {
+            result.agent_origins ??= {}
+            for (const name of Object.keys(next.agent)) {
+              result.agent_origins[name] = { source, scope }
+            }
+          }
+          if (next.mode) {
+            result.mode_origins ??= {}
+            for (const name of Object.keys(next.mode)) {
+              result.mode_origins[name] = { source, scope }
+            }
+          }
+        })
+
         const merge = (source: string, next: Info, kind?: ConfigPlugin.Scope) => {
           result = mergeConfigConcatArrays(result, next)
-          return mergePluginOrigins(source, next.plugin, kind)
+          return Effect.gen(function* () {
+            yield* recordAgentOrigins(source, next, kind)
+            yield* mergePluginOrigins(source, next.plugin, kind)
+          })
         }
 
         for (const [key, value] of Object.entries(auth)) {
@@ -565,8 +592,12 @@ export const layer = Layer.effect(
           deps.push(dep)
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          const loadedAgents = yield* Effect.promise(() => ConfigAgent.load(dir))
+          result.agent = mergeDeep(result.agent ?? {}, loadedAgents)
+          yield* recordAgentOrigins(dir, { agent: loadedAgents })
+          const loadedModes = yield* Effect.promise(() => ConfigAgent.loadMode(dir))
+          result.agent = mergeDeep(result.agent ?? {}, loadedModes)
+          yield* recordAgentOrigins(dir, { agent: loadedModes })
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
@@ -633,13 +664,11 @@ export const layer = Layer.effect(
         // macOS managed preferences (.mobileconfig deployed via MDM) override everything
         const managed = yield* Effect.promise(() => ConfigManaged.readManagedPreferences())
         if (managed) {
-          result = mergeConfigConcatArrays(
-            result,
-            yield* loadConfig(managed.text, {
-              dir: path.dirname(managed.source),
-              source: managed.source,
-            }),
-          )
+          const next = yield* loadConfig(managed.text, {
+            dir: path.dirname(managed.source),
+            source: managed.source,
+          })
+          yield* merge(managed.source, next, "global")
         }
 
         for (const [name, mode] of Object.entries(result.mode ?? {})) {
@@ -649,6 +678,10 @@ export const layer = Layer.effect(
               mode: "primary" as const,
             },
           })
+          if (result.mode_origins?.[name]) {
+            result.agent_origins ??= {}
+            result.agent_origins[name] = result.mode_origins[name]
+          }
         }
 
         if (Flag.OPENCODE_PERMISSION) {
