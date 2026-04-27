@@ -29,10 +29,10 @@ Engineers must stop after `team_report`; do not let them self-pull follow-up wor
 Call `team_monitor` only when an engineer is blocked/failed, user requests status, or before dissolve.
 
 ## Step 7 — Commit (optional)
-`team_commit({ teamID })` — squash-merges completed branches. Stops on conflict; resolve manually then re-run.
+`team_commit({ teamID, reviewedTaskIDs })` — squash-merges only the completed task IDs the Lead explicitly reviewed. Unlisted completed tasks are skipped and can be merged later. Stops on conflict; hand the resolution back to the responsible engineer, review their completed resolution, then re-run with remaining reviewedTaskIDs.
 
 ## Step 8 — Dissolve
-After the urgent `team_complete` message, summarise output → optional `team_commit` → `team_dissolve({ teamID, reason: "..." })`.
+After the urgent `team_complete` message, call `team_tasks({ showAll: true })` for completed task IDs → review engineer reports + changed files → optional `team_commit({ teamID, reviewedTaskIDs })` for approved tasks → `team_dissolve({ teamID, reason: "..." })`.
 
 ---
 For full tool API, fileScope rules, error handling, agent tier guidance, and examples,

@@ -37,8 +37,8 @@ at `<repoRoot>/.tmp/team/<teamID>/<engineerID>/` on branch
 `team/<teamID>/engineer-<engineerID>`. The lead's main tree is never
 switched. `fileScope` is useful as documentation of intent and as
 coordination metadata, but overlapping scopes no longer cause silent
-overwrites — conflicts surface at `team_commit` time and require manual
-resolution.
+overwrites — conflicts surface at `team_commit` time and should be handed
+back to the responsible engineer for resolution.
 
 Call `team_decompose({ teamID, subtasks: [...] })`.
 
@@ -106,19 +106,26 @@ must not self-pull follow-up work with `team_tasks` / `team_claim`.
 ## Step 7: Checkpoint Progress (optional, recommended)
 
 Each engineer works in its own git worktree on a dedicated branch. When
-engineers report `completed`, call `team_commit` to squash-merge their
+engineers report `completed`, call `team_tasks({ showAll: true })` to collect
+completed task IDs, then review their reports and changed files. Then call
+`team_commit` with the completed task IDs you approved to squash-merge those
 branches into the lead's current branch:
 
 ```
-team_commit({ teamID })
+team_commit({ teamID, reviewedTaskIDs: ["<taskID>", "<taskID>"] })
 ```
 
-`team_commit` iterates every engineer whose task has `status: completed`
-and calls `git merge --squash <engineer-branch>` using the engineer's
-task title as the commit message. Engineers still working, blocked, or
-failed are reported as skipped. If a merge conflict is detected, the tool
-stops immediately, reports which files conflict, and waits for you to
-resolve them manually before re-running. Lead-only.
+`team_commit` refuses unknown IDs and refuses an empty `reviewedTaskIDs` list
+when completed tasks exist. It merges only the reviewed completed task IDs;
+unlisted completed tasks are reported as not reviewed and can be merged in a
+later call. After that gate passes, it calls `git merge --squash
+<engineer-branch>` using each engineer's task title as the commit message.
+Engineers still working, blocked, or failed are reported as skipped. If a
+merge conflict is detected, the tool stops immediately and reports an
+engineer-owned handoff recipe with the task, branch, files, and coordination
+instructions. Assign that conflict-resolution work to the responsible engineer,
+review the completed resolution, then re-run with the remaining reviewedTaskIDs.
+Lead-only.
 
 ## Step 8: Complete
 

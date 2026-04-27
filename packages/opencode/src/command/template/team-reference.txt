@@ -36,7 +36,7 @@ Each engineer runs in an isolated git worktree at `<repoRoot>/.tmp/team/<teamID>
 **Multi-provider failover (`fallbackAgent`):** Optional. When the team's circuit breaker opens because the primary provider returned 3 consecutive 429s, the engineer swaps to this agent and retries the task ONCE. Use a different provider for true cross-provider failover (e.g. `agent: "engineer-anthropic", fallbackAgent: "engineer-openai"`). If the fallback also trips the breaker, the engineer fails and the task is released. If `fallbackAgent` is omitted, the engineer fails on the first breaker-open without retry.
 
 ### team_commit
-`team_commit({ teamID })` — squash-merges every `completed` engineer's branch into the lead's current branch using the engineer's task title as the commit message. Engineers still working, blocked, or failed are skipped. Stops immediately on merge conflict and reports conflicting files; re-run after manual resolution.
+`team_commit({ teamID, reviewedTaskIDs: ["<taskID>", ...] })` — squash-merges reviewed `completed` engineer branches into the lead's current branch using the engineer's task title as the commit message. Only IDs listed in `reviewedTaskIDs` are merged; unreviewed completed tasks are skipped and can be merged in a later call. Unknown IDs block the merge. Engineers still working, blocked, or failed are skipped. Stops immediately on merge conflict and reports an engineer-owned handoff recipe with conflicting files, branch, task context, and coordination instructions; re-run after the responsible engineer reports the resolution completed and the Lead reviews it.
 
 ### team_dissolve
 `team_dissolve({ teamID, reason: "..." })` — gracefully shuts down the team.
@@ -50,7 +50,7 @@ Writes a structured markdown summary of the team's run (tasks completed/failed/p
 `team_message({ teamID, to: "<engineerID>|lead", message: "..." })` — send a reply or unblock an engineer.
 **Rate limit:** 10 messages/min per sender (engineer or lead). The 11th message in a 60s sliding window is rejected with a `retryAfterMs` hint.
 
-When all tasks are `completed` and all engineers are `idle`, the runtime sends the Lead an urgent `team_complete` inbox message. Treat that as the terminal coordination signal: summarize the run, optionally call `team_commit`, then dissolve the team.
+When all tasks are `completed` and all engineers are `idle`, the runtime sends the Lead an urgent `team_complete` inbox message. Treat that as the terminal coordination signal: call `team_tasks({ showAll: true })` to get completed task IDs, review engineer reports and changed files, call `team_commit` with the reviewed task IDs you approve if merging, then dissolve the team.
 
 ### team_report
 `team_report({ teamID, status, progress, taskID?, ... })` — engineer progress/completion report. A final successful report can trigger the Lead's urgent `team_complete` message after state is persisted.
@@ -83,7 +83,7 @@ Do **not** call `team_monitor` as a polling mechanism — use `team_inbox` for r
 1. **Documentation of intent** — makes the plan readable at a glance.
 2. **Overlap detection at planning time** — lets you spot likely conflicts before spawning.
 
-Overlapping scopes no longer cause silent overwrites because each engineer works in an isolated worktree. Conflicts surface at `team_commit` time and require manual resolution.
+Overlapping scopes no longer cause silent overwrites because each engineer works in an isolated worktree. Conflicts surface at `team_commit` time and should be handed back to the responsible engineer for resolution.
 
 Prefer **disjoint** scopes. When overlap is unavoidable, keep the overlap intentional, read the coordination warnings returned by `team_decompose` / `team_retask` / `team_reassign`, and note the ownership expectation in the subtask description so engineers coordinate via `team_message` before editing shared files.
 
@@ -96,7 +96,7 @@ Prefer **disjoint** scopes. When overlap is unavoidable, keep the overlap intent
 
 **Engineer failed:** Same recovery path as blocked. Check `team_roster` for current state.
 
-**Merge conflict at team_commit:** The tool reports conflicting files and stops. Resolve conflicts manually in the lead's working tree, commit the resolution, then call `team_commit` again.
+**Merge conflict at team_commit:** The tool reports conflicting files and stops with a handoff recipe. Create or assign a conflict-resolution task to the original engineer, have them coordinate with overlapping engineers via `team_message`, review their completed resolution, then call `team_commit` again with the remaining reviewed task IDs.
 
 **Agent not found at team_spawn:** If the `agent` parameter does not match any configured agent, `team_spawn` returns an immediate error listing available agent names: `Agent '<name>' not found. Available: <comma-separated list>`. Call `team_agents` to see the full list with descriptions.
 

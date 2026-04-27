@@ -11,9 +11,10 @@ WORKFLOW FOR LEAD:
 5. team_spawn — create an engineer per subtask with an agent + task
 6. Wait for engineer messages via team_inbox (DO NOT poll team_monitor); the
    final all-done state arrives as an urgent team_complete inbox message
-7. team_commit — squash-merge each completed engineer's branch into the
-   lead's current branch using the engineer's task title as the commit
-   message; conflicts are surfaced and require manual resolution
+7. Call team_tasks(showAll: true) for completed task IDs, review engineer
+   reports and changed files, then team_commit with reviewedTaskIDs —
+   squash-merge approved completed branches; conflicts are surfaced with
+   an engineer handoff recipe
 8. team_dissolve — shut down when all tasks are done
 
 IMPORTANT: team_monitor is an aggregate roll-up, not a notification channel.
@@ -34,9 +35,9 @@ Lead-only:
 - team_kill: Terminate a single engineer session
 - team_dissolve: Gracefully shut down a team
 - team_resume: Resume a terminated team after daemon restart
-- team_commit: Squash-merge each completed engineer's branch into the
-  lead's current branch using the engineer's task title as the commit
-  message. Conflicts are surfaced and require manual resolution.
+- team_commit: Squash-merge reviewed completed engineer branches into the
+  lead's current branch. Only reviewedTaskIDs are merged; unreviewed completed
+  tasks are skipped and can be merged later. Conflicts return an engineer-owned resolution handoff.
 - team_share: Share all team session transcripts for review or handoff
 
 Engineer-only:
