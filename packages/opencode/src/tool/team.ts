@@ -22,6 +22,7 @@ import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
 import { isTeamVisibleAgent } from "../team/agent-source"
 import { resolveEngineerRecipient } from "../team/message-routing"
+import { buildEngineerReportMessage } from "../team/completion"
 import { buildReviewPacket, encodeReviewPacket } from "../team/review-packet"
 import { computeTaskWarnings, decodeTaskFileScope, renderTaskList } from "../team/task-list"
 import * as fs from "node:fs"
@@ -733,6 +734,7 @@ export const TeamKillTool = Tool.define(
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
+    const mailbox = yield* Mailbox.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_kill,
@@ -1343,6 +1345,7 @@ export const TeamReportTool = Tool.define(
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
+    const mailbox = yield* Mailbox.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_report,
@@ -1366,6 +1369,7 @@ export const TeamReportTool = Tool.define(
           const taskID = engineer.currentTask as import("../team/task-board.sql").TaskBoardID
           const task = yield* taskBoard.get(taskID)
           const taskTitle = task?.title ?? taskID
+          const team = yield* coordinator.getTeam(engineer.teamID)
           const reviewPacket = buildReviewPacket({
             status: params.status,
             summary: params.summary,
@@ -1387,6 +1391,23 @@ export const TeamReportTool = Tool.define(
             state: newState,
             currentTask: null,
           })
+
+          if (params.status === "completed" && team) {
+            yield* mailbox.send({
+              senderSessionID: engineer.sessionID,
+              recipientSessionID: team.leadSessionID,
+              type: "team_report",
+              content: buildEngineerReportMessage({
+                engineerName: engineer.name,
+                taskTitle,
+                summary: params.summary,
+                reviewPacket,
+              }),
+              priority: "inbox",
+            }).pipe(Effect.catch((error) =>
+              Effect.sync(() => log.warn("durable team report mailbox send failed", { error: String(error) })),
+            ))
+          }
 
           // Publish progress event with status summary for sidebar
           const statusEmoji = params.status === "completed" ? "✅" : params.status === "blocked" ? "🚧" : "❌"

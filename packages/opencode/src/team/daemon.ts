@@ -29,6 +29,7 @@ import { GitManager } from "./git-manager"
 import { buildEngineerReportMessage, buildTeamCompleteMessage, isTeamWorkComplete } from "./completion"
 import { encodeReviewPacket } from "./review-packet"
 import { rememberCompletion } from "./completion-deduper"
+import { findTeamReportNotification, hasTeamCompleteNotification, resolveLeadNotificationSender, selectUnreadMessageForEvent, teamCompleteSenderSessionID } from "./mailbox-notification"
 import {
   Service as EngineerProcessManager,
   layer as engineerProcessManagerLayer,
@@ -37,6 +38,7 @@ import {
 } from "./engineer-process-manager"
 import type { EngineerID, TeamID } from "./types"
 import type { TaskBoardID } from "./task-board.sql"
+import type { MailboxID } from "./mailbox.sql"
 import { buildReplyInstruction, formatTeamMessageLabel, type SenderIdentity } from "./message-routing"
 import {
   type RunningEngineer,
@@ -467,6 +469,27 @@ export const layer = Layer.effect(
         }
       })
 
+    const maybeSendTeamComplete = Effect.fn("TeamDaemon.maybeSendTeamComplete")(function* (teamID: TeamID) {
+      const team = yield* coordinator.getTeam(teamID)
+      if (!team) return
+      const tasks = yield* taskBoard.list({ team_id: teamID })
+      const engineers = yield* coordinator.listTeamEngineers(teamID)
+      if (!isTeamWorkComplete({ tasks, engineers })) return
+      const messages = yield* mailbox.peek(team.leadSessionID)
+      if (hasTeamCompleteNotification(messages, { recipientSessionID: team.leadSessionID, teamID })) return
+
+      yield* mailbox.send({
+        senderSessionID: teamCompleteSenderSessionID(team),
+        recipientSessionID: team.leadSessionID,
+        type: "team_complete",
+        content: buildTeamCompleteMessage({
+          teamID,
+          completedTasks: tasks.length,
+        }),
+        priority: "urgent",
+      })
+    })
+
     // Sweep for engineers whose heartbeat has gone silent or whose
     // total runtime has passed ENGINEER_MAX_RUNTIME, and terminate
     // them. Driven by the setInterval registered in `start()` below.
@@ -475,6 +498,7 @@ export const layer = Layer.effect(
       AppRuntime.runFork(Effect.gen(function* () {
         const now = Date.now()
         const allEngineers = yield* coordinator.listAllEngineers()
+        const teamIDs = new Set(allEngineers.map((engineer) => engineer.teamID as TeamID))
 
         for (const engineer of allEngineers) {
           if (engineer.state !== "working") continue
@@ -511,6 +535,10 @@ export const layer = Layer.effect(
               "❌ Max runtime exceeded",
             )
           }
+        }
+
+        for (const teamID of teamIDs) {
+          yield* maybeSendTeamComplete(teamID)
         }
       }))
     }
@@ -550,27 +578,32 @@ export const layer = Layer.effect(
 
       // Inject notification into lead's session
       const injectNotification = Effect.gen(function* () {
-        // Fetch the message from mailbox
-        const messages = yield* mailbox.receiveByPriority({
-          recipientSessionID: event.properties.recipientSessionID as SessionID,
-          priority: event.properties.priority,
+        const recipientSessionID = event.properties.recipientSessionID as SessionID
+        const messages = yield* mailbox.peek(recipientSessionID)
+        const msg = selectUnreadMessageForEvent(messages, {
+          messageID: event.properties.messageID as MailboxID,
+          recipientSessionID,
         })
 
-        if (messages.length === 0) {
-          log.info("no messages found in mailbox")
+        if (!msg) {
+          log.info("mailbox event message already handled or missing", {
+            messageID: event.properties.messageID,
+            recipientSessionID: event.properties.recipientSessionID,
+          })
           return
         }
 
-        const msg = messages[0]
         yield* mailbox.markRead({
           messageID: msg.id,
-          recipientSessionID: event.properties.recipientSessionID as SessionID,
+          recipientSessionID,
         })
 
-        const senderEngineer = yield* coordinator.getEngineerBySession(event.properties.senderSessionID as SessionID)
-        const sender: SenderIdentity = senderEngineer
-          ? { type: "engineer", name: senderEngineer.name, engineerID: senderEngineer.engineerID }
-          : { type: "unknown" }
+        const senderEngineer = yield* coordinator.getEngineerBySession(msg.sender_session_id)
+        const sender = resolveLeadNotificationSender({
+          senderSessionID: msg.sender_session_id,
+          leadSessionID: recipientSessionID,
+          senderEngineer,
+        })
         const label = formatTeamMessageLabel({ sender, priority: event.properties.priority })
 
         const notificationText = `${label}\n${msg.content}\n\n${buildReplyInstruction(sender)} Respond to acknowledge and take action.`
@@ -582,7 +615,7 @@ export const layer = Layer.effect(
 
         // Inject as a new prompt to wake up the lead
         yield* promptService.prompt({
-          sessionID: event.properties.recipientSessionID as SessionID,
+          sessionID: recipientSessionID,
           parts: [{ type: "text", text: notificationText }],
         })
 
@@ -643,33 +676,35 @@ export const layer = Layer.effect(
           return
         }
 
-        const recipientEngineer = yield* coordinator.getEngineerBySession(event.properties.recipientSessionID as SessionID)
+        const recipientSessionID = event.properties.recipientSessionID as SessionID
+        const recipientEngineer = yield* coordinator.getEngineerBySession(recipientSessionID)
         const team = recipientEngineer ? yield* coordinator.getTeam(recipientEngineer.teamID) : null
 
-        // Get sender info for a better label
-        const senderEngineer = yield* coordinator.getEngineerBySession(event.properties.senderSessionID as SessionID)
-        const sender: SenderIdentity = team?.leadSessionID === event.properties.senderSessionID
+        const messages = yield* mailbox.peek(recipientSessionID)
+        const msg = selectUnreadMessageForEvent(messages, {
+          messageID: event.properties.messageID as MailboxID,
+          recipientSessionID,
+        })
+
+        if (!msg) {
+          log.info("mailbox event message for engineer already handled or missing", {
+            messageID: event.properties.messageID,
+            recipientSessionID: event.properties.recipientSessionID,
+          })
+          return
+        }
+
+        yield* mailbox.markRead({
+          messageID: msg.id,
+          recipientSessionID,
+        })
+
+        const senderEngineer = yield* coordinator.getEngineerBySession(msg.sender_session_id)
+        const sender: SenderIdentity = team?.leadSessionID === msg.sender_session_id
           ? { type: "lead" }
           : senderEngineer
             ? { type: "engineer", name: senderEngineer.name, engineerID: senderEngineer.engineerID }
             : { type: "unknown" }
-
-        // Fetch the message from mailbox
-        const messages = yield* mailbox.receiveByPriority({
-          recipientSessionID: event.properties.recipientSessionID as SessionID,
-          priority: event.properties.priority,
-        })
-
-        if (messages.length === 0) {
-          log.info("no messages found in mailbox for engineer")
-          return
-        }
-
-        const msg = messages[0]
-        yield* mailbox.markRead({
-          messageID: msg.id,
-          recipientSessionID: event.properties.recipientSessionID as SessionID,
-        })
 
         const label = formatTeamMessageLabel({ sender, priority: event.properties.priority })
 
@@ -813,33 +848,39 @@ export const layer = Layer.effect(
           currentTask: null,
         }).pipe(Effect.ignore)
 
-        yield* mailbox.send({
-          senderSessionID: engineer?.sessionID ?? team.leadSessionID,
-          recipientSessionID: team.leadSessionID,
-          type: "team_report",
-          content: buildEngineerReportMessage({
-            engineerName: event.properties.engineerName ?? engineer?.name ?? event.properties.engineerID,
-            taskTitle: event.properties.taskTitle ?? task?.title ?? event.properties.taskId,
-            summary: event.properties.summary ?? "Completed.",
-            reviewPacket: event.properties.reviewPacket,
-          }),
-          priority: "inbox",
+        const reportSenderSessionID = engineer?.sessionID ?? team.leadSessionID
+        const reportContent = buildEngineerReportMessage({
+          engineerName: event.properties.engineerName ?? engineer?.name ?? event.properties.engineerID,
+          taskTitle: event.properties.taskTitle ?? task?.title ?? event.properties.taskId,
+          summary: event.properties.summary ?? "Completed.",
+          reviewPacket: event.properties.reviewPacket,
         })
-
-        const tasks = yield* taskBoard.list({ team_id: teamID })
-        const engineers = yield* coordinator.listTeamEngineers(teamID)
-        if (!isTeamWorkComplete({ tasks, engineers })) return
-
-        yield* mailbox.send({
-          senderSessionID: engineer?.sessionID ?? team.leadSessionID,
+        const existingReport = findTeamReportNotification(yield* mailbox.peek(team.leadSessionID), {
           recipientSessionID: team.leadSessionID,
-          type: "team_complete",
-          content: buildTeamCompleteMessage({
-            teamID,
-            completedTasks: tasks.length,
-          }),
-          priority: "urgent",
+          senderSessionID: reportSenderSessionID,
+          content: reportContent,
         })
+        if (existingReport) {
+          handleLeadMessageReceived({
+            type: MailboxEvent.Received.type,
+            properties: {
+              messageID: existingReport.id,
+              senderSessionID: existingReport.sender_session_id,
+              recipientSessionID: existingReport.recipient_session_id,
+              priority: existingReport.priority,
+            },
+          })
+        } else {
+          yield* mailbox.send({
+            senderSessionID: reportSenderSessionID,
+            recipientSessionID: team.leadSessionID,
+            type: "team_report",
+            content: reportContent,
+            priority: "inbox",
+          })
+        }
+
+        yield* maybeSendTeamComplete(teamID)
       }).pipe(Effect.catchCause((cause) =>
         Effect.sync(() => log.error("team completion check failed", { cause: Cause.pretty(cause) })),
       )))
