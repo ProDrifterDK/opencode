@@ -2,7 +2,7 @@ import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { SessionShare } from "../share"
 import { SessionCoordinator } from "../team/session-coordinator"
-import { LeadCoordinator, findFileScopeWarnings, type FileScopeWarning } from "../team/lead-coordinator"
+import { LeadCoordinator, type FileScopeWarning } from "../team/lead-coordinator"
 import { TaskBoardRepo } from "../team/task-board"
 import { Mailbox } from "../team/mailbox"
 import { TeamID } from "../team/types"
@@ -22,7 +22,8 @@ import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
 import { isTeamVisibleAgent } from "../team/agent-source"
 import { resolveEngineerRecipient } from "../team/message-routing"
-import { buildReviewPacket, decodeReviewPacket, encodeReviewPacket } from "../team/review-packet"
+import { buildReviewPacket, encodeReviewPacket } from "../team/review-packet"
+import { computeTaskWarnings, decodeTaskFileScope, renderTaskList } from "../team/task-list"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { execSync } from "node:child_process"
@@ -30,16 +31,7 @@ import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "tool.team" })
 
-const decodeFileScope = (raw: string | null): string[] => {
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []
-  } catch (err) {
-    log.warn("invalid task file_scope JSON", { error: String(err) })
-    return []
-  }
-}
+const decodeFileScope = decodeTaskFileScope
 
 const formatCoordinationWarnings = (warnings: readonly FileScopeWarning[]) =>
   warnings.length === 0
@@ -50,28 +42,6 @@ const formatCoordinationWarnings = (warnings: readonly FileScopeWarning[]) =>
         ...warnings.map((warning) => `  - ${warning.message}`),
       ]
 
-const computeTaskWarnings = (input: {
-  task: Pick<import("../team/task-board.sql").Task, "id" | "title" | "file_scope">
-  tasks: readonly Pick<import("../team/task-board.sql").Task, "id" | "title" | "file_scope" | "status">[]
-}) =>
-  findFileScopeWarnings({
-    task: {
-      id: input.task.id,
-      title: input.task.title,
-      files: decodeFileScope(input.task.file_scope),
-    },
-    others: input.tasks
-      .filter((task) =>
-        task.id !== input.task.id &&
-        task.status !== "completed" &&
-        task.status !== "failed"
-      )
-      .map((task) => ({
-        id: task.id,
-        title: task.title,
-        files: decodeFileScope(task.file_scope),
-      })),
-  })
 // Priority translation: 4-tier (tool) -> 3-tier (mailbox).
 // Note: `high` and `normal` both collapse to `inbox` — documented design;
 // the 4-tier surface is for caller clarity, not distinct delivery semantics.
@@ -1658,48 +1628,14 @@ export const TeamTasksTool = Tool.define(
             }
           }
 
-          const lines: string[] = [
-            params.showAll ? "All tasks:" : "Available tasks (pending, unassigned):",
-            "",
-          ]
-
-          for (const task of tasks) {
-            const statusEmoji =
-              task.status === "pending" ? "⏳" :
-              task.status === "in-progress" ? "🔨" :
-              task.status === "completed" ? "✅" :
-              task.status === "blocked" ? "🚧" : "❌"
-            const assignee = task.assigned_engineer_id ? ` [${task.assigned_engineer_id}]` : " [unclaimed]"
-            lines.push(`${statusEmoji} ${task.id}: ${task.title}${assignee}`)
-            if (task.description) {
-              lines.push(`   ${task.description.slice(0, 60)}${task.description.length > 60 ? "..." : ""}`)
-            }
-            const reviewPacket = decodeReviewPacket(task.review_packet)
-            if (reviewPacket) {
-              if (reviewPacket.reportPath) lines.push(`   Report: ${reviewPacket.reportPath}`)
-              if (reviewPacket.changedFiles.length > 0) lines.push(`   Changed files: ${reviewPacket.changedFiles.join(", ")}`)
-              if (reviewPacket.verificationCommands.length > 0) lines.push(`   Verification: ${reviewPacket.verificationCommands.join(" && ")}`)
-              if (reviewPacket.knownGaps.length > 0) lines.push(`   Known gaps: ${reviewPacket.knownGaps.join("; ")}`)
-              if (reviewPacket.confidence) lines.push(`   Confidence: ${reviewPacket.confidence}`)
-              if (reviewPacket.warnings.length > 0) lines.push(`   Review warnings: ${reviewPacket.warnings.join("; ")}`)
-            }
-          }
-
-          lines.push("")
-          lines.push("To claim a task: team_claim with taskID")
+          const rendered = renderTaskList({ tasks, allTasks, showAll: params.showAll })
 
           return {
             title: "Available tasks",
-            output: lines.join("\n"),
+            output: rendered.output,
             metadata: {
               taskCount: tasks.length,
-              tasks: tasks.map((t) => ({
-                taskID: t.id,
-                title: t.title,
-                status: t.status,
-                assignedTo: t.assigned_engineer_id,
-                reviewPacket: decodeReviewPacket(t.review_packet),
-              })),
+              tasks: rendered.metadataTasks,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
