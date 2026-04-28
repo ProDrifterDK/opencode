@@ -652,7 +652,7 @@ describe("F3: Final QA — Full Team Lifecycle", () => {
     const decomposeResult = await Effect.runPromise(
       memLead.decompose({ teamId: TEAM_ID, request: "create a hello world endpoint", subtasks: specs }),
     )
-    const subtasks = decomposeResult.tasks
+    const subtasks: Task[] = decomposeResult.tasks
     expect(subtasks.length).toBeGreaterThanOrEqual(1)
     expect(subtasks.every((s) => s.title.length > 0)).toBe(true)
     expect(subtasks.every((s) => s.file_scope !== null)).toBe(true)
