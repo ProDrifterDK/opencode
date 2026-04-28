@@ -10,6 +10,9 @@
  */
 import { describe, test, expect } from "bun:test"
 import { TEAM_AGENTS_CACHE_TTL_MS } from "../team/constants"
+import type { MissionContract } from "../team/mission-contract"
+import type { MissionContractID } from "../team/mission-contract.sql"
+import { missingMissionContractWarning, resolveMissionContractSpawnState } from "./team-contract-helpers"
 
 // ─── Inline agent type (mirrors Agent.Info shape we care about) ──────────────
 
@@ -23,6 +26,20 @@ type AgentItem = {
 type ModelLookup =
   | { ok: true }
   | { ok: false; suggestions?: string[] }
+
+const contractForSpawnValidation = (
+  contract: Pick<MissionContract, "id" | "status" | "currentPhase">,
+): MissionContract => ({
+  teamID: "team_contract_validation" as MissionContract["teamID"],
+  objective: "Ship contract validation",
+  successCriteria: ["Warnings are deterministic"],
+  constraints: [],
+  nonGoals: [],
+  humanGates: [],
+  timeCreated: 0,
+  timeUpdated: 0,
+  ...contract,
+})
 
 const validateConfiguredModel = (
   label: "Agent" | "Fallback agent",
@@ -283,5 +300,38 @@ describe("team_spawn agent model validation", () => {
     expect(error).toBe(
       "Fallback agent 'fallback-deep' references unavailable model anthropic/missing-model.",
     )
+  })
+})
+
+describe("team_spawn mission contract validation", () => {
+  test("missing contract warns but does not block", () => {
+    const result = resolveMissionContractSpawnState(null)
+
+    expect(result.warnings).toEqual([missingMissionContractWarning])
+    expect(result.shouldAdvanceToExecuting).toBeFalse()
+  })
+
+  test("unapproved contract warning includes status and currentPhase", () => {
+    const result = resolveMissionContractSpawnState(contractForSpawnValidation({
+      id: "contract_ready" as MissionContractID,
+      status: "ready",
+      currentPhase: "design",
+    }))
+
+    expect(result.warnings).toEqual([
+      "Mission Contract: not approved — status=ready, currentPhase=design. Call team_contract_approve before spawning engineers.",
+    ])
+    expect(result.shouldAdvanceToExecuting).toBeFalse()
+  })
+
+  test("approved contract skips warning and advances to executing/implementation", () => {
+    const result = resolveMissionContractSpawnState(contractForSpawnValidation({
+      id: "contract_approved" as MissionContractID,
+      status: "approved",
+      currentPhase: "design",
+    }))
+
+    expect(result.warnings).toEqual([])
+    expect(result.shouldAdvanceToExecuting).toBeTrue()
   })
 })
