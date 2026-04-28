@@ -28,6 +28,7 @@ import { LeadCoordinator } from "./lead-coordinator"
 import { GitManager } from "./git-manager"
 import { buildEngineerReportMessage, buildTeamCompleteMessage, isTeamWorkComplete } from "./completion"
 import { encodeReviewPacket } from "./review-packet"
+import { rememberCompletion } from "./completion-deduper"
 import {
   Service as EngineerProcessManager,
   layer as engineerProcessManagerLayer,
@@ -767,20 +768,36 @@ export const layer = Layer.effect(
       ))
     }
 
+    const reportedCompletions = new Set<string>()
+
     const handleEngineerCompleted = (event: {
       type: typeof Event.EngineerCompleted.type
       properties: Schema.Schema.Type<typeof Event.EngineerCompleted.properties>
     }) => {
       const teamID = event.properties.teamID as TeamID
       const engineerID = event.properties.engineerID as EngineerID
+      const taskID = event.properties.taskId as TaskBoardID
+      const completion = rememberCompletion(reportedCompletions, {
+        teamID,
+        engineerID,
+        taskID,
+      })
+
       const slot = getRunningEngineer(teamID, engineerID)
-      if (slot) slot.completedAt = Date.now()
+      if (slot && slot.completedAt === undefined) slot.completedAt = Date.now()
 
       AppRuntime.runFork(Effect.gen(function* () {
+        if (completion.kind === "duplicate") {
+          log.warn("duplicate EngineerCompleted ignored", {
+            teamID,
+            engineerID,
+            taskID,
+          })
+          return
+        }
         const team = yield* coordinator.getTeam(teamID)
         if (!team) return
 
-        const taskID = event.properties.taskId as TaskBoardID
         const engineer = yield* coordinator.getEngineer(engineerID)
         const task = yield* taskBoard.get(taskID)
 
