@@ -49,6 +49,7 @@ import { SessionShare } from "@/share"
 import { SessionCoordinator } from "@/team/session-coordinator"
 import { LeadCoordinator } from "@/team/lead-coordinator"
 import { TaskBoardRepo } from "@/team/task-board"
+import { MissionContractRepo } from "@/team/mission-contract"
 import { Mailbox } from "@/team/mailbox"
 import { TeamDaemon } from "@/team/daemon"
 import { GitManager } from "@/team/git-manager"
@@ -108,6 +109,7 @@ type AppServices =
   | ShareNext.Service
   | SessionShare.Service
   | TaskBoardRepo.Service
+  | MissionContractRepo.Service
   | Mailbox.Service
   | LeadCoordinator.Service
   | SessionCoordinator.Service
@@ -167,6 +169,7 @@ const baseLayer = Layer.mergeAll(
   RateLimiter.layer,
   engineerProcessManagerLayer,
   TaskBoardRepo.layer,
+  MissionContractRepo.layer,
   Mailbox.defaultLayer,
 )
 
