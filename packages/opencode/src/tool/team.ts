@@ -4,6 +4,7 @@ import { SessionShare } from "../share"
 import { SessionCoordinator } from "../team/session-coordinator"
 import { LeadCoordinator, type FileScopeWarning } from "../team/lead-coordinator"
 import { TaskBoardRepo } from "../team/task-board"
+import { MissionContractRepo, type HumanGate } from "../team/mission-contract"
 import { Mailbox } from "../team/mailbox"
 import { TeamID } from "../team/types"
 import type { EngineerStateRecord } from "../team/types"
@@ -18,6 +19,7 @@ import { hasCompletedAssignedTask } from "../team/claim-policy"
 import { resolveSpawnTaskCandidate } from "../team/spawn-task"
 import { TEAM_AGENTS_CACHE_TTL_MS } from "../team/constants"
 import { checkAndRecordMessage } from "../team/message-rate-limiter"
+import { formatMissionContractMonitorBlock, resolveMissionContractSpawnState } from "./team-contract-helpers"
 import { Log } from "@/util"
 import { buildDissolveSummary } from "../team/dissolve-summary"
 import { isTeamVisibleAgent } from "../team/agent-source"
@@ -124,7 +126,254 @@ const TOOL_DESCRIPTIONS = {
     "Re-attach a team that was left in `terminated` state (daemon shut down before dissolve). Re-spawns engineer subprocesses for active tasks and resets any in-progress tasks back to pending. Lead-only.",
   team_commit:
     "Squash-merge reviewed completed engineer branches into the lead's current branch. Only reviewedTaskIDs are merged; unreviewed completed tasks are skipped. Lead-only.",
+  team_contract_create:
+    "Create the team's Mission Contract before spawning engineers. Lead-only.",
+  team_contract_update:
+    "Update the team's Mission Contract with a required revision reason. Lead-only.",
+  team_contract_approve:
+    "Approve the team's Mission Contract so implementation can begin. Lead-only.",
+  team_contract_export:
+    "Export the team's Mission Contract markdown artifact to .tmp/team/<teamID>/mission.md. Lead-only.",
 } as const
+
+const humanGateSchema = Schema.Struct({
+  id: Schema.String,
+  kind: Schema.Literals(["visual", "manual-e2e", "product-approval", "risk-approval"]),
+  description: Schema.String,
+  requiredBeforePhase: Schema.Literals(["implementation", "delivery"]),
+  status: Schema.Literals(["pending", "satisfied", "waived"]),
+})
+
+const teamContractCreateParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID from team_create" }),
+  objective: Schema.String.annotate({ description: "Mission objective for the team" }),
+  successCriteria: Schema.Array(Schema.String).annotate({ description: "Ordered success criteria for the mission" }),
+  constraints: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Ordered constraints the team must respect" }),
+  nonGoals: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Explicit non-goals for this mission" }),
+  humanGates: Schema.optional(Schema.Array(humanGateSchema)).annotate({ description: "Human approval gates required before later phases" }),
+})
+
+const teamContractUpdateParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID from team_create" }),
+  objective: Schema.optional(Schema.String).annotate({ description: "Updated mission objective" }),
+  successCriteria: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Replacement ordered success criteria" }),
+  constraints: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Replacement ordered constraints" }),
+  nonGoals: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Replacement ordered non-goals" }),
+  humanGates: Schema.optional(Schema.Array(humanGateSchema)).annotate({ description: "Replacement human gates" }),
+  reason: Schema.String.annotate({ description: "Required revision reason for this mission contract update" }),
+})
+
+const teamContractTargetParams = Schema.Struct({
+  teamID: Schema.String.annotate({ description: "Team ID from team_create" }),
+})
+
+const getMissionContractForTeam = (repo: MissionContractRepo.Interface, teamID: ReturnType<typeof TeamID.ascending>) =>
+  repo.getByTeam(teamID).pipe(
+    Effect.flatMap((contract) =>
+      contract
+        ? Effect.succeed(contract)
+        : Effect.fail(new Error(`Mission contract not found for team ${teamID}`)),
+    ),
+  )
+
+export const TeamContractCreateTool = Tool.define(
+  "team_contract_create",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const missionContracts = yield* MissionContractRepo.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_contract_create,
+      parameters: teamContractCreateParams,
+      execute: (params: Schema.Schema.Type<typeof teamContractCreateParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* requireLead(ctx, coordinator, "create a mission contract")
+
+          const contract = yield* missionContracts.create({
+            teamID: params.teamID as ReturnType<typeof TeamID.ascending>,
+            objective: params.objective,
+            successCriteria: params.successCriteria,
+            constraints: params.constraints,
+            nonGoals: params.nonGoals,
+            humanGates: params.humanGates,
+            authorSessionID: ctx.sessionID,
+          })
+
+          const output = [
+            "Mission Contract created.",
+            `Contract ID: ${contract.id}`,
+            `Team ID: ${contract.teamID}`,
+            `Status: ${contract.status}`,
+            `Phase: ${contract.currentPhase}`,
+            `Objective: ${contract.objective}`,
+            `Success criteria: ${contract.successCriteria.length}`,
+            `Human gates: ${contract.humanGates.length}`,
+            "Next: refine with team_contract_update, then call team_contract_approve.",
+          ].join("\n")
+
+          return {
+            title: `Create mission contract for ${params.teamID}`,
+            output,
+            metadata: {
+              teamID: params.teamID,
+              contractID: contract.id,
+              status: contract.status,
+              phase: contract.currentPhase,
+              successCriteria: contract.successCriteria.length,
+              humanGates: contract.humanGates.length,
+            },
+          }
+        }).pipe(toolErrorBoundary, Effect.orDie),
+    }
+  }),
+)
+
+export const TeamContractUpdateTool = Tool.define(
+  "team_contract_update",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const missionContracts = yield* MissionContractRepo.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_contract_update,
+      parameters: teamContractUpdateParams,
+      execute: (params: Schema.Schema.Type<typeof teamContractUpdateParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* requireLead(ctx, coordinator, "update a mission contract")
+
+          if (
+            params.objective === undefined &&
+            params.successCriteria === undefined &&
+            params.constraints === undefined &&
+            params.nonGoals === undefined &&
+            params.humanGates === undefined
+          ) {
+            return yield* Effect.fail(new Error("Provide at least one mission contract field to update."))
+          }
+
+          const contract = yield* getMissionContractForTeam(
+            missionContracts,
+            params.teamID as ReturnType<typeof TeamID.ascending>,
+          )
+          const updated = yield* missionContracts.update({
+            contractID: contract.id,
+            patch: {
+              objective: params.objective,
+              successCriteria: params.successCriteria,
+              constraints: params.constraints,
+              nonGoals: params.nonGoals,
+              humanGates: params.humanGates,
+            },
+            reason: params.reason,
+            authorSessionID: ctx.sessionID,
+          })
+          const revisions = yield* missionContracts.listRevisions(updated.id)
+
+          const output = [
+            "Mission Contract updated.",
+            `Contract ID: ${updated.id}`,
+            `Status: ${updated.status}`,
+            `Phase: ${updated.currentPhase}`,
+            `Reason: ${params.reason}`,
+            `Revision count: ${revisions.length}`,
+          ].join("\n")
+
+          return {
+            title: `Update mission contract for ${params.teamID}`,
+            output,
+            metadata: {
+              teamID: params.teamID,
+              contractID: updated.id,
+              status: updated.status,
+              phase: updated.currentPhase,
+              revisionCount: revisions.length,
+            },
+          }
+        }).pipe(toolErrorBoundary, Effect.orDie),
+    }
+  }),
+)
+
+export const TeamContractApproveTool = Tool.define(
+  "team_contract_approve",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const missionContracts = yield* MissionContractRepo.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_contract_approve,
+      parameters: teamContractTargetParams,
+      execute: (params: Schema.Schema.Type<typeof teamContractTargetParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* requireLead(ctx, coordinator, "approve a mission contract")
+
+          const contract = yield* getMissionContractForTeam(
+            missionContracts,
+            params.teamID as ReturnType<typeof TeamID.ascending>,
+          )
+          const approved = yield* missionContracts.approve(contract.id, ctx.sessionID)
+
+          const output = [
+            "Mission Contract approved.",
+            `Contract ID: ${approved.id}`,
+            `Status: ${approved.status}`,
+            `Phase: ${approved.currentPhase}`,
+            "Next: call team_spawn to begin implementation.",
+          ].join("\n")
+
+          return {
+            title: `Approve mission contract for ${params.teamID}`,
+            output,
+            metadata: {
+              teamID: params.teamID,
+              contractID: approved.id,
+              status: approved.status,
+              phase: approved.currentPhase,
+            },
+          }
+        }).pipe(toolErrorBoundary, Effect.orDie),
+    }
+  }),
+)
+
+export const TeamContractExportTool = Tool.define(
+  "team_contract_export",
+  Effect.gen(function* () {
+    const coordinator = yield* SessionCoordinator.Service
+    const missionContracts = yield* MissionContractRepo.Service
+
+    return {
+      description: TOOL_DESCRIPTIONS.team_contract_export,
+      parameters: teamContractTargetParams,
+      execute: (params: Schema.Schema.Type<typeof teamContractTargetParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* requireLead(ctx, coordinator, "export a mission contract")
+
+          const contract = yield* getMissionContractForTeam(
+            missionContracts,
+            params.teamID as ReturnType<typeof TeamID.ascending>,
+          )
+          const exported = yield* missionContracts.exportMarkdown(contract.id)
+
+          const output = [
+            "Mission Contract exported.",
+            `Contract ID: ${contract.id}`,
+            `Export path: ${exported.exportPath}`,
+          ].join("\n")
+
+          return {
+            title: `Export mission contract for ${params.teamID}`,
+            output,
+            metadata: {
+              teamID: params.teamID,
+              contractID: contract.id,
+              exportPath: exported.exportPath,
+            },
+          }
+        }).pipe(toolErrorBoundary, Effect.orDie),
+    }
+  }),
+)
 
 export const TeamCreateTool = Tool.define(
   "team_create",
@@ -210,6 +459,7 @@ export const TeamMonitorTool = Tool.define(
   Effect.gen(function* () {
     const lead = yield* LeadCoordinator.Service
     const mailbox = yield* Mailbox.Service
+    const missionContracts = yield* MissionContractRepo.Service
 
     return {
       description: TOOL_DESCRIPTIONS.team_monitor,
@@ -221,10 +471,12 @@ export const TeamMonitorTool = Tool.define(
           const teamID = params.teamID as ReturnType<typeof TeamID.ascending>
           const report = yield* lead.monitor(teamID)
           const formatted = lead.formatStatus(report)
+          const contract = yield* missionContracts.getByTeam(teamID)
+          const contractSummary = formatMissionContractMonitorBlock(contract)
 
           // Fetch and consume unread messages for the lead
           const messages = yield* mailbox.receive(ctx.sessionID)
-          let output = formatted
+          let output = `${formatted}\n${contractSummary.lines.join("\n")}`
 
           if (messages.length > 0) {
             const msgLines: string[] = ["\n  📬 Inbox:"]
@@ -248,6 +500,7 @@ export const TeamMonitorTool = Tool.define(
               blocked: report.blocked,
               unreadMessages: messages.length,
               rateLimits: report.rateLimits ?? null,
+              contract: contractSummary.metadata,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -272,6 +525,7 @@ export const TeamSpawnTool = Tool.define(
   Effect.gen(function* () {
     const coordinator = yield* SessionCoordinator.Service
     const taskBoard = yield* TaskBoardRepo.Service
+    const missionContracts = yield* MissionContractRepo.Service
     const agentService = yield* Agent.Service
     const providerService = yield* Provider.Service
     const configService = yield* Config.Service
@@ -371,6 +625,8 @@ export const TeamSpawnTool = Tool.define(
             : null
 
           const existingTasks = yield* taskBoard.list({ team_id: teamID })
+          const contract = yield* missionContracts.getByTeam(teamID)
+          const contractState = resolveMissionContractSpawnState(contract)
           const spawnTask = resolveSpawnTaskCandidate({
             tasks: existingTasks,
             task: {
@@ -401,7 +657,12 @@ export const TeamSpawnTool = Tool.define(
             ? yield* taskBoard.claim(
               spawnTask.task.id as import("../team/task-board.sql").TaskBoardID,
               engineerSlot.engineerID,
-            )
+            ).pipe(Effect.catch((error) =>
+              Effect.gen(function* () {
+                yield* coordinator.killEngineer({ teamID, engineerID: engineerSlot.engineerID }).pipe(Effect.ignore)
+                return yield* Effect.fail(error)
+              })
+            ))
             : null
 
           if (spawnTask.kind === "claim" && !claimed) {
@@ -416,16 +677,44 @@ export const TeamSpawnTool = Tool.define(
             status: "in-progress",
             assigned_engineer_id: engineerSlot.engineerID,
             file_scope: fileScope,
-          }))
+          }).pipe(Effect.catch((error) =>
+            Effect.gen(function* () {
+              yield* coordinator.killEngineer({ teamID, engineerID: engineerSlot.engineerID }).pipe(Effect.ignore)
+              return yield* Effect.fail(error)
+            })
+          )))
+          const cleanupTaskAndEngineer = <E>(error: E) =>
+            Effect.gen(function* () {
+              if (spawnTask.kind === "claim") {
+                yield* taskBoard.update(task.id, { status: "pending", assigned_engineer_id: null }).pipe(Effect.ignore)
+              } else {
+                yield* taskBoard.delete(task.id).pipe(Effect.ignore)
+              }
+              yield* coordinator.killEngineer({ teamID, engineerID: engineerSlot.engineerID }).pipe(Effect.ignore)
+              return yield* Effect.fail(error)
+            })
+
+          yield* Effect.gen(function* () {
+            yield* coordinator.updateEngineer(engineerSlot.engineerID, {
+              state: "working",
+              currentTask: task.id,
+            })
+
+            if (contract && contractState.shouldAdvanceToExecuting) {
+              yield* missionContracts.setPhase({
+                contractID: contract.id,
+                phase: "implementation",
+                status: "executing",
+                reason: `team_spawn: ${params.name}`,
+                authorSessionID: ctx.sessionID,
+              })
+            }
+          }).pipe(Effect.catch(cleanupTaskAndEngineer))
+
           const allTasksAfterSpawn = spawnTask.kind === "claim"
             ? existingTasks.map((existing) => existing.id === task.id ? task : existing)
             : [...existingTasks, task]
           const coordinationWarnings = computeTaskWarnings({ task, tasks: allTasksAfterSpawn })
-
-          yield* coordinator.updateEngineer(engineerSlot.engineerID, {
-            state: "working",
-            currentTask: task.id,
-          })
 
           // Publish event to trigger the Team Daemon to start the engineer's loop
           publishTeamEvent(Event.EngineerSpawned, {
@@ -463,6 +752,7 @@ export const TeamSpawnTool = Tool.define(
             `Task: ${params.task.title}`,
             modelInfo,
             fallbackInfo,
+            ...contractState.warnings,
             ...formatCoordinationWarnings(coordinationWarnings),
             ``,
             `Note: Do NOT poll team_monitor. Engineer will notify you when done.`,
@@ -475,7 +765,8 @@ export const TeamSpawnTool = Tool.define(
               engineerID: engineerSlot.engineerID,
               sessionID: engineerSlot.sessionID,
               taskID: task.id,
-              warnings: coordinationWarnings,
+              warnings: [...contractState.warnings, ...coordinationWarnings.map((warning) => warning.message)],
+              coordinationWarnings,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
@@ -1955,6 +2246,10 @@ export const TeamShareTool = Tool.define(
 export const TeamTools = Effect.gen(function* () {
   const infos = (yield* Effect.all([
     TeamCreateTool,
+    TeamContractCreateTool,
+    TeamContractUpdateTool,
+    TeamContractApproveTool,
+    TeamContractExportTool,
     TeamSpawnTool,
     TeamDecomposeTool,
     TeamAssignTool,
