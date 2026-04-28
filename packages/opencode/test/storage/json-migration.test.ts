@@ -111,6 +111,46 @@ describe("JSON to SQLite migration", () => {
     await fs.rm(storageDir, { recursive: true, force: true })
   })
 
+  test("applies mission contract tables and indexes", () => {
+    const tables = sqlite.query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'table' and name in ('mission_contract', 'mission_contract_revision') order by name",
+    ).all().map((row) => row.name)
+
+    expect(tables).toEqual(["mission_contract", "mission_contract_revision"])
+
+    const contractColumns = sqlite.query<{ name: string; notnull: number; dflt_value: string | null }, []>(
+      "PRAGMA table_info('mission_contract')",
+    ).all()
+    const contractColumn = (name: string) => contractColumns.find((column) => column.name === name)
+
+    expect(contractColumn("success_criteria")?.notnull).toBe(1)
+    expect(contractColumn("success_criteria")?.dflt_value).toBe("'[]'")
+    expect(contractColumn("approved_at")?.notnull).toBe(0)
+    expect(contractColumn("approved_by_session_id")?.notnull).toBe(0)
+    expect(contractColumn("export_path")?.notnull).toBe(0)
+
+    const contractIndexes = sqlite.query<{ name: string; unique: number }, []>(
+      "PRAGMA index_list('mission_contract')",
+    ).all()
+    expect(contractIndexes.map((index) => index.name).sort()).toEqual([
+      "mission_contract_status_idx",
+      "mission_contract_team_id_idx",
+      "sqlite_autoindex_mission_contract_1",
+    ])
+
+    const revisionIndexes = sqlite.query<{ name: string; unique: number }, []>(
+      "PRAGMA index_list('mission_contract_revision')",
+    ).all()
+    expect(revisionIndexes.find((index) => index.name === "mission_contract_revision_contract_id_revision_idx")?.unique).toBe(1)
+    expect(revisionIndexes.map((index) => index.name)).toContain("mission_contract_revision_contract_id_idx")
+    expect(revisionIndexes.map((index) => index.name)).toContain("mission_contract_revision_team_id_idx")
+
+    const revisionUniqueColumns = sqlite.query<{ name: string }, []>(
+      "PRAGMA index_info('mission_contract_revision_contract_id_revision_idx')",
+    ).all().map((row) => row.name)
+    expect(revisionUniqueColumns).toEqual(["contract_id", "revision"])
+  })
+
   test("migrates project", async () => {
     await writeProject(storageDir, {
       id: "proj_test123abc",
