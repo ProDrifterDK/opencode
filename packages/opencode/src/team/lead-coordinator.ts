@@ -136,8 +136,8 @@ export const findFileScopeWarnings = (input: {
     .filter((other) => hasFileScopeOverlap(input.task.files, other.files))
     .map((other) =>
       makeFileScopeWarning({
-        task: input.task.id ?? input.task.title,
-        conflictsWith: other.id ?? other.title,
+        task: input.task.title,
+        conflictsWith: other.title,
         taskFiles: input.task.files,
         conflictingFiles: other.files,
       })

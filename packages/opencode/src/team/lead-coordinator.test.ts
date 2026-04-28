@@ -256,8 +256,10 @@ describe("LeadCoordinator", () => {
 
     expect(result.tasks).toHaveLength(2)
     expect(result.warnings).toHaveLength(1)
-    expect(result.warnings[0].task).toBe("a")
-    expect(result.warnings[0].conflictsWith).toBe("b")
+    expect(result.warnings[0].task).toBe("A")
+    expect(result.warnings[0].conflictsWith).toBe("B")
+    expect(result.warnings[0].message).toContain('"A" overlaps with "B"')
+    expect(result.warnings[0].message).not.toContain('"a" overlaps with "b"')
   })
 
   test("collects all overlap warnings when 3+ subtasks overlap", async () => {
@@ -279,8 +281,8 @@ describe("LeadCoordinator", () => {
 
     expect(result.tasks).toHaveLength(3)
     expect(result.warnings.map((warning) => [warning.task, warning.conflictsWith])).toEqual([
-      ["a", "b"],
-      ["a", "c"],
+      ["A", "B"],
+      ["A", "C"],
     ])
   })
 
@@ -601,7 +603,7 @@ describe("LeadCoordinator", () => {
 
     expect(result.task.assigned_engineer_id).toBe("eng_backup" as EngineerID)
     expect(result.warnings).toHaveLength(1)
-    expect(result.warnings[0].conflictsWith).toBe("task_1")
+    expect(result.warnings[0].conflictsWith).toBe("Active task on backup")
   })
 
 
@@ -1065,7 +1067,7 @@ describe("LeadCoordinator", () => {
 
     expect(result.task.file_scope).toBe(JSON.stringify(["src/auth.ts"]))
     expect(result.warnings).toHaveLength(1)
-    expect(result.warnings[0].conflictsWith).toBe("task_1")
+    expect(result.warnings[0].conflictsWith).toBe("Other active")
   })
 
   test("retask succeeds fileScope with no other active tasks", async () => {
