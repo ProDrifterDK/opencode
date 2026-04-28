@@ -27,6 +27,7 @@ import { Service as HeartbeatMonitorService, layer as heartbeatLayer } from "./h
 import { LeadCoordinator } from "./lead-coordinator"
 import { GitManager } from "./git-manager"
 import { buildEngineerReportMessage, buildTeamCompleteMessage, isTeamWorkComplete } from "./completion"
+import { encodeReviewPacket } from "./review-packet"
 import {
   Service as EngineerProcessManager,
   layer as engineerProcessManagerLayer,
@@ -374,6 +375,7 @@ export const layer = Layer.effect(
                 slot,
                 currentState: engineerSlot?.state,
                 code: code ?? null,
+                completedEventSeen: slot?.completedAt !== undefined,
               })
 
               if (action.kind === "noop") {
@@ -769,13 +771,30 @@ export const layer = Layer.effect(
       type: typeof Event.EngineerCompleted.type
       properties: Schema.Schema.Type<typeof Event.EngineerCompleted.properties>
     }) => {
+      const teamID = event.properties.teamID as TeamID
+      const engineerID = event.properties.engineerID as EngineerID
+      const slot = getRunningEngineer(teamID, engineerID)
+      if (slot) slot.completedAt = Date.now()
+
       AppRuntime.runFork(Effect.gen(function* () {
-        const teamID = event.properties.teamID as TeamID
         const team = yield* coordinator.getTeam(teamID)
         if (!team) return
 
-        const engineer = yield* coordinator.getEngineer(event.properties.engineerID as EngineerID)
-        const task = yield* taskBoard.get(event.properties.taskId as TaskBoardID)
+        const taskID = event.properties.taskId as TaskBoardID
+        const engineer = yield* coordinator.getEngineer(engineerID)
+        const task = yield* taskBoard.get(taskID)
+
+        if (task) {
+          yield* taskBoard.update(taskID, {
+            status: "completed",
+            completed_at: task.completed_at ?? Date.now(),
+            review_packet: event.properties.reviewPacket ? encodeReviewPacket(event.properties.reviewPacket) : undefined,
+          })
+        }
+        yield* coordinator.updateEngineer(engineerID, {
+          state: "idle",
+          currentTask: null,
+        }).pipe(Effect.ignore)
 
         yield* mailbox.send({
           senderSessionID: engineer?.sessionID ?? team.leadSessionID,

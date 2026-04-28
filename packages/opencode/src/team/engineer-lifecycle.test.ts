@@ -141,6 +141,16 @@ describe("reconcileExitedEngineer", () => {
     expect(action).toEqual({ kind: "delete" })
   })
 
+  test("slot present, completion event seen but state still working → delete", () => {
+    const action = reconcileExitedEngineer({
+      slot: fakeSlot,
+      currentState: "working",
+      code: 0,
+      completedEventSeen: true,
+    })
+    expect(action).toEqual({ kind: "delete" })
+  })
+
   test("slot present, state working, code 0 → delete-and-fail", () => {
     const action = reconcileExitedEngineer({ slot: fakeSlot, currentState: "working", code: 0 })
     expect(action).toEqual({ kind: "delete-and-fail", reason: "subprocess exited with code 0", code: 0 })

@@ -20,6 +20,8 @@ export type ReconcileAction =
  * decide what cleanup action is needed after the subprocess exits.
  *
  * - If the slot is absent the handler already ran (race), do nothing.
+ * - If the lead already observed EngineerCompleted for this slot, the
+ *   process finished cleanly even if coordinator state has not caught up.
  * - If state is not "working" the engineer loop finished cleanly before
  *   the exit promise resolved — just remove the slot.
  * - If state is still "working" the process crashed before the engineer
@@ -29,8 +31,10 @@ export function reconcileExitedEngineer(input: {
   slot: RunningEngineer | undefined
   currentState: EngineerState | undefined
   code: number | null
+  completedEventSeen?: boolean
 }): ReconcileAction {
   if (!input.slot) return { kind: "noop" }
+  if (input.completedEventSeen) return { kind: "delete" }
   if (input.currentState !== "working") return { kind: "delete" }
   return {
     kind: "delete-and-fail",

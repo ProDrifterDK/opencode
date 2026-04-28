@@ -39,6 +39,13 @@ export type RunningEngineer = {
    * Optional for tests.
    */
   eventReaderDone?: Promise<void>
+  /**
+   * Set by the lead daemon as soon as it observes an EngineerCompleted
+   * event from this subprocess. The exit handler checks this synchronous
+   * flag before consulting slower coordinator state so a clean
+   * completed→exit(0) race cannot be reclassified as failed.
+   */
+  completedAt?: number
 }
 
 export const running = new Map<TeamID, Map<EngineerID, RunningEngineer>>()
