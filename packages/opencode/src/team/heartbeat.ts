@@ -3,7 +3,7 @@ import { Service as SessionCoordinatorService, type EngineerSlot } from "./sessi
 import { Service as LeadCoordinatorService } from "./lead-coordinator"
 import { Service as MailboxService } from "./mailbox"
 import { HEARTBEAT_INTERVAL, ENGINEER_MAX_IDLE, HEARTBEAT_UPDATE_INTERVAL, HEARTBEAT_CHECK_INTERVAL, HEARTBEAT_TIMEOUT } from "./constants"
-import { iterAllRunning } from "./daemon-running"
+import { clearTerminating, getRunningEngineer, iterAllRunning, markTerminating } from "./daemon-running"
 import { Log } from "@/util"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
@@ -231,11 +231,29 @@ export const layer = Layer.effect(
             teamID,
             stuckCount: health.stuckCount,
           })
-          yield* coordinator.killEngineer({ engineerID, teamID }).pipe(
-            Effect.catchCause(() => Effect.void),
-          )
+          const ownsTermination = markTerminating(teamID, engineerID)
+          if (ownsTermination) {
+            yield* coordinator.killEngineer({
+              engineerID,
+              teamID,
+              failureReason: "heartbeat-dead",
+            }).pipe(
+              Effect.catchCause(() => Effect.sync(() => clearTerminating(teamID, engineerID))),
+            )
+            if (!getRunningEngineer(teamID, engineerID)) clearTerminating(teamID, engineerID)
+          }
 
           healthMap.delete(engineerID)
+          if (!ownsTermination) {
+            const result: DiagnosticResult = {
+              engineerID,
+              pingSucceeded: false,
+              action: "killed",
+              taskReassignedTo: null,
+              timestamp: now,
+            }
+            return result
+          }
 
           if (currentTask) {
             const teamEngineers = yield* coordinator.listTeamEngineers(teamID).pipe(
@@ -427,11 +445,18 @@ export const layer = Layer.effect(
         })
         for (const eng of engineers) {
           log.warn("detectOrphans killing engineer", { engineerID: eng.engineerID, teamID })
-          yield* coordinator.killEngineer({ engineerID: eng.engineerID, teamID }).pipe(
-            Effect.catchCause(() => Effect.void),
-          )
-          healthMap.delete(eng.engineerID)
-          terminated.push(eng.engineerID)
+          if (markTerminating(teamID, eng.engineerID)) {
+            yield* coordinator.killEngineer({
+              engineerID: eng.engineerID,
+              teamID,
+              failureReason: "lead-orphaned",
+            }).pipe(
+              Effect.catchCause(() => Effect.sync(() => clearTerminating(teamID, eng.engineerID))),
+            )
+            if (!getRunningEngineer(teamID, eng.engineerID)) clearTerminating(teamID, eng.engineerID)
+            healthMap.delete(eng.engineerID)
+            terminated.push(eng.engineerID)
+          }
         }
 
         leadAliveMap.delete(teamID)

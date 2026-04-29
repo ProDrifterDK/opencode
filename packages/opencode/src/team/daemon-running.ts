@@ -5,6 +5,7 @@
  */
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "@/session/schema"
+import type { KillableSubprocess } from "./engineer-process-manager"
 
 export type RunningEngineer = {
   engineerID: string
@@ -26,7 +27,7 @@ export type RunningEngineer = {
    * this handle to forward engineer events back to the lead's bus;
    * Phase 3 wired `.exited` into crash detection via `attachExitHandler` in daemon.ts.
    */
-  subprocess?: import("bun").Subprocess
+  subprocess?: KillableSubprocess
   /**
    * Promise that resolves when the engineer's stdout JSONL reader has
    * fully drained. The exit handler awaits this BEFORE reconciling DB
@@ -49,6 +50,9 @@ export type RunningEngineer = {
 }
 
 export const running = new Map<TeamID, Map<EngineerID, RunningEngineer>>()
+const terminating = new Set<string>()
+
+const terminatingKey = (teamID: TeamID, engineerID: EngineerID) => `${teamID}:${engineerID}`
 
 export function getTeamBucket(teamID: TeamID): Map<EngineerID, RunningEngineer> {
   return running.get(teamID) ?? new Map()
@@ -92,8 +96,27 @@ export function countAllRunning(): number {
   return total
 }
 
+export function markTerminating(teamID: TeamID, engineerID: EngineerID): boolean {
+  const key = terminatingKey(teamID, engineerID)
+  if (terminating.has(key)) return false
+  terminating.add(key)
+  return true
+}
+
+export function isTerminating(teamID: TeamID, engineerID: EngineerID): boolean {
+  return terminating.has(terminatingKey(teamID, engineerID))
+}
+
+export function clearTerminating(teamID: TeamID, engineerID: EngineerID): void {
+  terminating.delete(terminatingKey(teamID, engineerID))
+}
+
+export function clearAllTerminating(): void {
+  terminating.clear()
+}
+
 export function terminateRunningEngineersForShutdown(
-  terminate: (engineerID: string, pid: number, sub: import("bun").Subprocess | undefined) => void,
+  terminate: (engineerID: string, pid: number, sub: KillableSubprocess | undefined) => void,
 ): number {
   const engineers = [...iterAllRunning()]
   for (const [, engineerID, engineer] of engineers) {

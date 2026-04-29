@@ -64,6 +64,8 @@ export interface Interface {
   readonly killEngineer: (input: {
     engineerID: EngineerID
     teamID: TeamID
+    failureReason?: string
+    publishFailureEvent?: boolean
   }) => Effect.Effect<void, CoordinatorError>
   readonly dissolveTeam: (input: {
     teamID: TeamID
@@ -312,6 +314,8 @@ export const layer = Layer.effect(
     const killEngineer = Effect.fn("SessionCoordinator.killEngineer")(function* (input: {
       engineerID: EngineerID
       teamID: TeamID
+      failureReason?: string
+      publishFailureEvent?: boolean
     }) {
       const slot = yield* fetchEngineer(input.engineerID)
       if (!slot) {
@@ -363,12 +367,14 @@ export const layer = Layer.effect(
           .run()
       })
 
-      void publishTeamEvent(Event.EngineerFailed, {
-        teamID: input.teamID,
-        engineerID: input.engineerID,
-        taskId: slot.currentTask ?? "unknown",
-        error: "killed by coordinator",
-      })
+      if (input.publishFailureEvent ?? true) {
+        void publishTeamEvent(Event.EngineerFailed, {
+          teamID: input.teamID,
+          engineerID: input.engineerID,
+          taskId: slot.currentTask ?? "unknown",
+          error: input.failureReason ?? "killed by coordinator",
+        })
+      }
     })
 
     const dissolveTeam = Effect.fn("SessionCoordinator.dissolveTeam")(function* (input: {

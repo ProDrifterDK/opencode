@@ -9,6 +9,7 @@ import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "../session/schema"
 import type { Task, TaskBoardID, CreateTaskInput, UpdateTaskInput, TaskBoardFilter } from "./task-board.sql"
 import type { MailboxID } from "./mailbox.sql"
+import { clearAllTerminating, markTerminating } from "./daemon-running"
 
 const ENG_A = "eng_a" as EngineerID
 const ENG_B = "eng_b" as EngineerID
@@ -45,7 +46,7 @@ let engineers: Map<EngineerID, EngineerSlot>
 let teams: Map<TeamID, TeamRecord>
 let mailboxMessages: Map<string, { recipient: SessionID; type: string; content: string; priority: string }>
 let mailboxUnread: Map<SessionID, boolean>
-let killEngineerCalls: Array<{ engineerID: EngineerID; teamID: TeamID }>
+let killEngineerCalls: Array<{ engineerID: EngineerID; teamID: TeamID; failureReason?: string }>
 
 const resetState = () => {
   engineers = new Map()
@@ -53,6 +54,7 @@ const resetState = () => {
   mailboxMessages = new Map()
   mailboxUnread = new Map()
   killEngineerCalls = []
+  clearAllTerminating()
 }
 
 const memCoordinator = SessionCoordinatorService.of({
@@ -71,7 +73,7 @@ const memCoordinator = SessionCoordinatorService.of({
     }),
   spawnEngineer: () => Effect.sync(() => makeSlot()),
   resumeEngineer: () => Effect.sync(() => makeSlot()),
-  killEngineer: (input: { engineerID: EngineerID; teamID: TeamID }) =>
+  killEngineer: (input: { engineerID: EngineerID; teamID: TeamID; failureReason?: string }) =>
     Effect.sync(() => {
       killEngineerCalls.push(input)
       engineers.delete(input.engineerID)
@@ -322,6 +324,30 @@ describe("HeartbeatMonitor", () => {
     expect(result.action).toBe("reassigned")
     expect(result.taskReassignedTo).toBe(ENG_B)
     expect(engineers.has(ENG_A)).toBe(false)
+    expect(killEngineerCalls[0]?.failureReason).toBe("heartbeat-dead")
+  })
+
+  test("runDiagnostic skips kill when daemon already owns termination", async () => {
+    engineers.set(ENG_A, makeSlot({ currentTask: "task_1" as TaskBoardID, state: "working" }))
+    teams.set(TEAM_ID, makeTeam({ engineerCount: 1 }))
+    markTerminating(TEAM_ID, ENG_A)
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    await runWith(service.recordHeartbeat(ENG_A))
+
+    const health = service.getHealth(ENG_A)!
+    health.isDead = true
+    health.isStuck = true
+    health.stuckCount = 3
+
+    const result = await runWith(service.runDiagnostic(ENG_A, TEAM_ID))
+
+    expect(result.action).toBe("killed")
+    expect(killEngineerCalls).toHaveLength(0)
+    expect(engineers.has(ENG_A)).toBe(true)
   })
 
   test("runDiagnostic sends all-failed message when no engineers remain", async () => {
@@ -472,6 +498,26 @@ describe("HeartbeatMonitor", () => {
     expect(result.engineersTerminated).toHaveLength(2)
     expect(result.engineersTerminated).toContain(ENG_A)
     expect(result.engineersTerminated).toContain(ENG_B)
+    expect(killEngineerCalls.map((call) => call.failureReason)).toEqual(["lead-orphaned", "lead-orphaned"])
+  })
+
+  test("detectOrphans skips engineers already terminating", async () => {
+    teams.set(TEAM_ID, makeTeam())
+    engineers.set(ENG_A, makeSlot())
+    engineers.set(ENG_B, makeSlot({ engineerID: ENG_B, sessionID: "sess_eng_b" as SessionID, name: "engineer-b" }))
+    markTerminating(TEAM_ID, ENG_A)
+
+    const service = await runWith(Effect.gen(function* () {
+      return yield* HeartbeatService
+    }))
+
+    teams.delete(TEAM_ID)
+
+    const result = await runWith(service.detectOrphans(TEAM_ID, LEAD_SESSION))
+
+    expect(result.leadAlive).toBe(false)
+    expect(result.engineersTerminated).toEqual([ENG_B])
+    expect(killEngineerCalls).toEqual([{ engineerID: ENG_B, teamID: TEAM_ID, failureReason: "lead-orphaned" }])
   })
 
   test("detectOrphans terminates engineers when team is dissolving", async () => {
