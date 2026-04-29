@@ -49,9 +49,15 @@ import {
   iterAllRunning,
   countAllRunning,
   terminateRunningEngineersForShutdown,
+  markTerminating,
+  isTerminating,
+  clearTerminating,
+  clearAllTerminating,
 } from "./daemon-running"
+import { EngineerMemoryWatchdog } from "./engineer-memory-watchdog"
 
 const log = Log.create({ service: "team.daemon" })
+const formatWatchdogBytes = (bytes: number) => `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`
 
 // Phase 3 of A3 — graceful kill with SIGTERM→SIGKILL escalation. Fire
 // and forget: callers don't await the exit (the centralized exit
@@ -60,12 +66,10 @@ const log = Log.create({ service: "team.daemon" })
 const killEngineerSubprocess = (
   engineerID: string,
   pid: number,
-  sub: import("bun").Subprocess | undefined,
+  sub: KillableSubprocess | undefined,
 ): void => {
   if (!sub) return
-  // Cast: the production handle is a Bun.Subprocess. The helper accepts
-  // a structural KillableSubprocess so tests can pass simpler fakes.
-  void terminateSubprocess(sub as unknown as KillableSubprocess, {
+  void terminateSubprocess(sub, {
     timeoutMs: ENGINEER_KILL_TIMEOUT_MS,
   }).catch((err) => {
     log.warn("terminateSubprocess threw", { engineerID, pid, error: String(err) })
@@ -79,6 +83,32 @@ const terminateRunningEngineers = (): number =>
       pid,
     })
     killEngineerSubprocess(engineerID, pid, sub)
+  })
+
+const forceKillRunningEngineersForProcessExit = (): number =>
+  terminateRunningEngineersForShutdown((engineerID, pid, sub) => {
+    log.warn("force killing engineer subprocess on process exit", {
+      engineerID,
+      pid,
+    })
+    if (!sub) {
+      try {
+        process.kill(pid, "SIGKILL")
+      } catch (err) {
+        log.warn("process-exit SIGKILL failed", { engineerID, pid, error: String(err) })
+      }
+      return
+    }
+    try {
+      sub.kill("SIGTERM")
+    } catch (err) {
+      log.warn("process-exit SIGTERM failed", { engineerID, pid, error: String(err) })
+    }
+    try {
+      sub.kill("SIGKILL")
+    } catch (err) {
+      log.warn("process-exit SIGKILL failed", { engineerID, pid, error: String(err) })
+    }
   })
 
 // Heartbeat constants are defined in ./constants and imported above.
@@ -97,7 +127,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Te
 
 let heartbeatUpdateInterval: ReturnType<typeof setInterval> | null = null
 let heartbeatCheckInterval: ReturnType<typeof setInterval> | null = null
-let sigintHandlerRegistered = false
+let shutdownHandlersRegistered = false
 
 /**
  * Graceful shutdown - called on SIGINT to clean up database state.
@@ -106,6 +136,8 @@ let sigintHandlerRegistered = false
 export function gracefulShutdown(): void {
   log.info("graceful shutdown initiated", { runningEngineers: countAllRunning() })
 
+  EngineerMemoryWatchdog.stopAll()
+  clearAllTerminating()
   terminateRunningEngineers()
 
   if (heartbeatUpdateInterval) {
@@ -208,11 +240,20 @@ const startEngineerInBackground = (
   // `attachExitHandler` closure so that `startEngineerInBackground` can
   // remain a module-level function while still capturing `coordinator`
   // from the layer scope. Tests may inject a stub here.
-  attachExitHandler: (params: {
-    teamID: TeamID
-    engineerID: EngineerID
-    subprocess: import("bun").Subprocess
-  }) => void,
+  handlers: {
+    attachExitHandler: (params: {
+      teamID: TeamID
+      engineerID: EngineerID
+    subprocess: KillableSubprocess
+    }) => void
+    startWatchdog: (params: {
+      teamID: TeamID
+      engineerID: EngineerID
+      rootPid: number
+      taskID: string
+      taskTitle: string
+    }) => Promise<void>
+  },
 ) =>
   Effect.gen(function* () {
     const gitManager = yield* GitManager.Service
@@ -270,7 +311,28 @@ const startEngineerInBackground = (
     // engineer exits cleanly, crashes, gets OOM-killed, or is killed
     // by `terminateSubprocess`, the handler observes one resolution of
     // `subprocess.exited` and runs `deleteRunning` exactly once.
-    attachExitHandler({
+    yield* Effect.tryPromise({
+      try: () => handlers.startWatchdog({
+        teamID: input.teamID as TeamID,
+        engineerID: input.engineerID as EngineerID,
+        rootPid: spawned.pid,
+        taskID: input.taskId,
+        taskTitle: input.taskTitle,
+      }),
+      catch: (error) => error,
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() =>
+          log.warn("failed to start engineer memory watchdog", {
+            engineerID: input.engineerID,
+            pid: spawned.pid,
+            error: String(error),
+          }),
+        ),
+      ),
+    )
+
+    handlers.attachExitHandler({
       teamID: input.teamID as TeamID,
       engineerID: input.engineerID as EngineerID,
       subprocess: spawned.subprocess,
@@ -337,7 +399,7 @@ export const layer = Layer.effect(
     const attachExitHandler = (params: {
       teamID: TeamID
       engineerID: EngineerID
-      subprocess: import("bun").Subprocess
+      subprocess: KillableSubprocess
     }) => {
       void params.subprocess.exited
         .then(async (code) => {
@@ -373,6 +435,7 @@ export const layer = Layer.effect(
 
           AppRuntime.runFork(
             Effect.gen(function* () {
+              const terminationOwnedByDaemon = isTerminating(params.teamID, params.engineerID)
               const engineerSlot = yield* coordinator.getEngineer(params.engineerID)
               const action = reconcileExitedEngineer({
                 slot,
@@ -389,7 +452,9 @@ export const layer = Layer.effect(
                 return
               }
 
+              EngineerMemoryWatchdog.stop(params.teamID, params.engineerID)
               deleteRunning(params.teamID, params.engineerID)
+              clearTerminating(params.teamID, params.engineerID)
 
               log.info("engineer subprocess exited", {
                 engineerID: params.engineerID,
@@ -398,6 +463,7 @@ export const layer = Layer.effect(
               })
 
               if (action.kind === "delete") return
+              if (terminationOwnedByDaemon) return
 
               // action.kind === "delete-and-fail": engineer crashed while working
               yield* coordinator
@@ -416,12 +482,21 @@ export const layer = Layer.effect(
         .catch((err) => log.error("exit handler failed", { err }))
     }
 
-    const terminateEngineer = (
+    const terminateRunningEngineer = (
       engineer: EngineerSlot,
       reason: string,
       progressText: string,
     ) =>
       Effect.gen(function* () {
+        if (!markTerminating(engineer.teamID as TeamID, engineer.engineerID as EngineerID)) {
+          log.debug("termination already in progress", {
+            engineerID: engineer.engineerID,
+            teamID: engineer.teamID,
+            reason,
+          })
+          return
+        }
+
         log.warn("terminating engineer", { engineerID: engineer.engineerID, reason })
 
         // Release task back to pending so another engineer can claim it.
@@ -436,12 +511,6 @@ export const layer = Layer.effect(
           })
         }
 
-        publishTeamEvent(Event.EngineerFailed, {
-          teamID: engineer.teamID,
-          engineerID: engineer.engineerID,
-          taskId: engineer.currentTask ?? "unknown",
-          error: reason,
-        })
         publishTeamEvent(Event.EngineerProgress, {
           teamID: engineer.teamID,
           engineerID: engineer.engineerID,
@@ -452,6 +521,7 @@ export const layer = Layer.effect(
         yield* coordinator.killEngineer({
           engineerID: engineer.engineerID,
           teamID: engineer.teamID,
+          failureReason: reason,
         })
 
         const runningEngineer = getRunningEngineer(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
@@ -466,8 +536,48 @@ export const layer = Layer.effect(
           // we don't call deleteRunning here — that would create two
           // racing cleanup paths. Fire and forget.
           killEngineerSubprocess(engineer.engineerID, runningEngineer.pid, runningEngineer.subprocess)
+          return
         }
+
+        clearTerminating(engineer.teamID as TeamID, engineer.engineerID as EngineerID)
       })
+
+    const startWatchdog = async (params: {
+      teamID: TeamID
+      engineerID: EngineerID
+      rootPid: number
+      taskID: string
+      taskTitle: string
+    }) => {
+      await EngineerMemoryWatchdog.start({
+        ...params,
+        onTerminate: (snapshot) =>
+          AppRuntime.runPromise(
+            Effect.gen(function* () {
+              const engineer = yield* coordinator.getEngineer(params.engineerID).pipe(
+                Effect.catchCause(() => Effect.succeed(null)),
+              )
+              if (!engineer) return
+
+              yield* terminateRunningEngineer(
+                engineer,
+                "memory-limit-exceeded",
+                `🚨 Memory limit exceeded: RSS ${formatWatchdogBytes(snapshot.rssBytes ?? 0)} / ${formatWatchdogBytes(snapshot.hardLimitBytes)}, peak ${formatWatchdogBytes(snapshot.peakRssBytes ?? snapshot.rssBytes ?? 0)}, pid ${snapshot.pid}, task ${snapshot.taskID} (${snapshot.taskTitle})`,
+              )
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.sync(() =>
+                  log.error("watchdog termination callback failed", {
+                    engineerID: params.engineerID,
+                    teamID: params.teamID,
+                    cause: Cause.pretty(cause),
+                  }),
+                ),
+              ),
+            ),
+          ),
+      })
+    }
 
     const maybeSendTeamComplete = Effect.fn("TeamDaemon.maybeSendTeamComplete")(function* (teamID: TeamID) {
       const team = yield* coordinator.getTeam(teamID)
@@ -514,7 +624,7 @@ export const layer = Layer.effect(
               lastHeartbeat: new Date(engineer.lastHeartbeat).toISOString(),
               timeSinceHeartbeat: Math.round(timeSinceHeartbeat / 1000) + "s",
             })
-            yield* terminateEngineer(
+            yield* terminateRunningEngineer(
               engineer,
               "Heartbeat timeout - engineer unresponsive",
               "❌ Timeout: unresponsive",
@@ -529,7 +639,7 @@ export const layer = Layer.effect(
               runtimeMin,
               limitMin: Math.round(ENGINEER_MAX_RUNTIME / 60000),
             })
-            yield* terminateEngineer(
+            yield* terminateRunningEngineer(
               engineer,
               `Max runtime exceeded (${runtimeMin} min)`,
               "❌ Max runtime exceeded",
@@ -766,7 +876,7 @@ export const layer = Layer.effect(
             fallbackModelID: event.properties.fallbackModelID,
             teammates: otherEngineers,
           },
-          attachExitHandler,
+          { attachExitHandler, startWatchdog },
         )
       })
 
@@ -1046,7 +1156,7 @@ export const layer = Layer.effect(
             taskTitle: task.title,
             taskDescription: task.description ?? "",
           },
-          attachExitHandler,
+          { attachExitHandler, startWatchdog },
         ).pipe(
           // Provide the captured services so the public method signature
           // doesn't require GitManager/EngineerProcessManager from callers.
@@ -1090,8 +1200,13 @@ export const layer = Layer.effect(
         purgeStaleMailboxMessages()
       }, HEARTBEAT_CHECK_INTERVAL)
 
-      if (!sigintHandlerRegistered) {
-        sigintHandlerRegistered = true
+      if (!shutdownHandlersRegistered) {
+        shutdownHandlersRegistered = true
+        process.on("exit", () => {
+          log.info("process exiting, initiating graceful shutdown")
+          forceKillRunningEngineersForProcessExit()
+          gracefulShutdown()
+        })
         process.on("SIGINT", () => {
           log.info("received SIGINT, initiating graceful shutdown")
           gracefulShutdown()
@@ -1111,6 +1226,9 @@ export const layer = Layer.effect(
 
     const stop = Effect.fn("TeamDaemon.stop")(function* () {
       log.info("stopping team daemon")
+
+      EngineerMemoryWatchdog.stopAll()
+      clearAllTerminating()
 
       if (heartbeatUpdateInterval) {
         clearInterval(heartbeatUpdateInterval)

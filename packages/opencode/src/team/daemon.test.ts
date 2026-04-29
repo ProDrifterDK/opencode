@@ -8,8 +8,12 @@ import {
   iterAllRunning,
   countAllRunning,
   terminateRunningEngineersForShutdown,
+  markTerminating,
+  isTerminating,
+  clearTerminating,
+  clearAllTerminating,
 } from "./daemon-running"
-import { Service as ProcessManagerService } from "./engineer-process-manager"
+import { Service as ProcessManagerService, type KillableSubprocess, type SpawnInput } from "./engineer-process-manager"
 import type { EngineerID, TeamID } from "./types"
 import type { SessionID } from "@/session/schema"
 
@@ -33,6 +37,7 @@ const makeEntry = (teamID: TeamID, engineerID: EngineerID) => ({
 
 beforeEach(() => {
   running.clear()
+  clearAllTerminating()
 })
 
 describe("nested running map helpers", () => {
@@ -177,6 +182,19 @@ describe("graceful shutdown subprocess cleanup", () => {
   })
 })
 
+describe("termination dedupe helpers", () => {
+  test("markTerminating only succeeds once per engineer until cleared", () => {
+    expect(markTerminating(TEAM_A, ENG_A1)).toBe(true)
+    expect(markTerminating(TEAM_A, ENG_A1)).toBe(false)
+    expect(isTerminating(TEAM_A, ENG_A1)).toBe(true)
+
+    clearTerminating(TEAM_A, ENG_A1)
+
+    expect(isTerminating(TEAM_A, ENG_A1)).toBe(false)
+    expect(markTerminating(TEAM_A, ENG_A1)).toBe(true)
+  })
+})
+
 describe("Phase 1 of A3: EngineerProcessManager spawn path", () => {
   // We exercise the spawn service through a fake layer so the test
   // doesn't actually fork bun. The real layer uses Bun.spawn; tests
@@ -184,13 +202,17 @@ describe("Phase 1 of A3: EngineerProcessManager spawn path", () => {
   // that callers receive a {pid, subprocess} pair.
 
   test("spawn is invoked with the lead's teamID/engineerID/worktreePath", async () => {
-    let captured: any = null
+    let captured: SpawnInput | undefined
+    const subprocess: KillableSubprocess = {
+      exited: Promise.resolve(0),
+      kill: () => {},
+    }
     const fakeProcessManager = ProcessManagerService.of({
-      spawn: (input: any) => {
+      spawn: (input) => {
         captured = input
         return Effect.succeed({
           pid: 4242,
-          subprocess: { pid: 4242, kill: () => {} } as any,
+          subprocess,
           eventReaderDone: Promise.resolve(),
         })
       },
@@ -214,7 +236,8 @@ describe("Phase 1 of A3: EngineerProcessManager spawn path", () => {
       }).pipe(Effect.provide(Layer.succeed(ProcessManagerService, fakeProcessManager))),
     )
 
-    expect(captured).not.toBeNull()
+    expect(captured).toBeDefined()
+    if (!captured) throw new Error("spawn input was not captured")
     expect(captured.teamID).toBe(TEAM_A)
     expect(captured.engineerID).toBe(ENG_A1)
     expect(captured.worktreePath).toBe("/tmp/wt/team_a/eng_a1")

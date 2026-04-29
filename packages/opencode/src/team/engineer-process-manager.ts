@@ -137,7 +137,7 @@ export interface SpawnedEngineer {
    * forwarding; Phase 3 wired `.exited` for crash detection — the lead
    * attaches a handler via `attachExitHandler` in daemon.ts after spawn returns.
    */
-  subprocess: import("bun").Subprocess
+  subprocess: KillableSubprocess
   /**
    * Promise that resolves when the stdout JSONL reader has finished
    * draining. The exit handler awaits this BEFORE reconciling DB state
