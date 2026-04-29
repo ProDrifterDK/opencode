@@ -27,6 +27,7 @@ import { resolveEngineerRecipient } from "../team/message-routing"
 import { buildEngineerReportMessage } from "../team/completion"
 import { buildReviewPacket, encodeReviewPacket } from "../team/review-packet"
 import { computeTaskWarnings, decodeTaskFileScope, renderTaskList } from "../team/task-list"
+import { EngineerMemoryWatchdog } from "../team/engineer-memory-watchdog"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { execSync } from "node:child_process"
@@ -473,10 +474,15 @@ export const TeamMonitorTool = Tool.define(
           const formatted = lead.formatStatus(report)
           const contract = yield* missionContracts.getByTeam(teamID)
           const contractSummary = formatMissionContractMonitorBlock(contract)
+          const watchdogSummary = EngineerMemoryWatchdog.formatMonitorBlock(
+            EngineerMemoryWatchdog.getSnapshot(teamID),
+          )
 
           // Fetch and consume unread messages for the lead
           const messages = yield* mailbox.receive(ctx.sessionID)
-          let output = `${formatted}\n${contractSummary.lines.join("\n")}`
+          const blocks = [formatted, contractSummary.lines.join("\n")]
+          if (watchdogSummary.lines.length > 0) blocks.push(watchdogSummary.lines.join("\n"))
+          let output = blocks.join("\n")
 
           if (messages.length > 0) {
             const msgLines: string[] = ["\n  📬 Inbox:"]
@@ -501,6 +507,7 @@ export const TeamMonitorTool = Tool.define(
               unreadMessages: messages.length,
               rateLimits: report.rateLimits ?? null,
               contract: contractSummary.metadata,
+              memoryWatchdog: watchdogSummary.metadata,
             },
           }
         }).pipe(toolErrorBoundary, Effect.orDie),
